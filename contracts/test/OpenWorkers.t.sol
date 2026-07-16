@@ -340,6 +340,39 @@ contract OpenWorkersTest {
         );
     }
 
+    function test_priceFeedRejectsNonMonotonicSnapshot() public {
+        WorkerTypes.PriceSnapshot memory first = WorkerTypes.PriceSnapshot({
+            dstGasPriceInSrcToken: 20 gwei,
+            dstDataFeePerByteInSrcToken: 0,
+            updatedAt: uint64(block.timestamp),
+            staleAfter: 30 minutes
+        });
+        setPriceSnapshot(priceFeed, DST_EID, first);
+
+        WorkerTypes.PriceSnapshot memory older = WorkerTypes.PriceSnapshot({
+            dstGasPriceInSrcToken: 10 gwei,
+            dstDataFeePerByteInSrcToken: 0,
+            updatedAt: uint64(block.timestamp - 1),
+            staleAfter: 30 minutes
+        });
+        expectRevert(
+            address(priceFeed),
+            abi.encodeCall(priceFeed.setPriceSnapshot, (singleUpdate(DST_EID, older))),
+            WorkerErrors.InvalidPriceSnapshot.selector
+        );
+
+        // A snapshot with an equal (non-decreasing) timestamp is still accepted.
+        WorkerTypes.PriceSnapshot memory same = WorkerTypes.PriceSnapshot({
+            dstGasPriceInSrcToken: 30 gwei,
+            dstDataFeePerByteInSrcToken: 0,
+            updatedAt: uint64(block.timestamp),
+            staleAfter: 30 minutes
+        });
+        setPriceSnapshot(priceFeed, DST_EID, same);
+        (uint256 dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(DST_EID);
+        require(dstGasPriceInSrcToken == 30 gwei, "equal-timestamp update was not stored");
+    }
+
     function test_sharedPriceFeedUpdateChangesExecutorAndDVNQuotes() public {
         WorkerTypes.PriceSnapshot memory snapshot = WorkerTypes.PriceSnapshot({
             dstGasPriceInSrcToken: 20 gwei,

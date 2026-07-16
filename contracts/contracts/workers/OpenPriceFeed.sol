@@ -49,6 +49,8 @@ contract OpenPriceFeed is Ownable {
     }
 
     /// @notice Stores shared market price inputs for destination endpoints.
+    /// @dev Each destination snapshot's `updatedAt` must be non-decreasing, so a
+    /// reordered or delayed submission cannot overwrite a newer price with an older one.
     /// @param updates Destination endpoint price snapshots to store.
     function setPriceSnapshot(WorkerTypes.PriceSnapshotUpdate[] calldata updates) external onlySubmitter {
         if (updates.length == 0) revert WorkerErrors.InvalidPriceSnapshotBatch();
@@ -58,6 +60,7 @@ contract OpenPriceFeed is Ownable {
             if (
                 snapshot.dstGasPriceInSrcToken == 0 || snapshot.updatedAt == 0 || snapshot.updatedAt > block.timestamp
                     || snapshot.staleAfter == 0 || snapshot.staleAfter > MAX_PRICE_SNAPSHOT_STALE_AFTER
+                    || snapshot.updatedAt < priceSnapshot[update.dstEid].updatedAt
             ) {
                 revert WorkerErrors.InvalidPriceSnapshot(update.dstEid);
             }

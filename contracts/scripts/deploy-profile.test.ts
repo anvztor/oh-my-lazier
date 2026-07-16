@@ -338,6 +338,61 @@ test("normalizeProfile rejects malformed market-data BaseURLs without echoing th
   assert.doesNotMatch(caught.message, /pricing-user|pricing-password|pricing-secret|private-api-key/);
 });
 
+test("normalizeProfile rejects base URLs that parse in JS but not in the Go worker", () => {
+  // Forms the WHATWG URL parser accepts (or silently repairs) but the Go
+  // worker's net/url validator rejects, so a rendered profile cannot pass here
+  // yet be refused at worker startup.
+  const rejected = [
+    "https:example.com",
+    "https:/example.com",
+    "https:\\\\example.com",
+    "https://exa\tmple.com/v1",
+    "https://example.com/v\n1",
+    "https://example.com\\foo",
+    "https://example.com/%zz",
+    "https://example.com/%",
+    "https://%65xample.com",
+    "https://example%2ecom",
+  ];
+  for (const baseURL of rejected) {
+    const input = baseProfile();
+    (input as Record<string, unknown>).pricing = {
+      coinGeckoBaseURL: baseURL,
+    };
+    assert.throws(
+      () => normalizeProfile(input),
+      /profile\.pricing\.coinGeckoBaseURL must be an absolute HTTPS URL without query or fragment/,
+      `expected ${JSON.stringify(baseURL)} to be rejected`,
+    );
+  }
+});
+
+test("normalizeProfile rejects enforced lzReceive gas outside [min, max]", () => {
+  const belowMin = baseProfile();
+  (belowMin.pathway as Record<string, unknown>).enforcedLzReceiveGas = "100000";
+  assert.throws(
+    () => normalizeProfile(belowMin),
+    /pathway\.enforcedLzReceiveGas must be within/,
+  );
+
+  const aboveMax = baseProfile();
+  (aboveMax.pathway as Record<string, unknown>).enforcedLzReceiveGas =
+    "2000000";
+  assert.throws(
+    () => normalizeProfile(aboveMax),
+    /pathway\.enforcedLzReceiveGas must be within/,
+  );
+
+  const zeroMax = baseProfile();
+  (zeroMax.pathway as Record<string, unknown>).minLzReceiveGas = "0";
+  (zeroMax.pathway as Record<string, unknown>).maxLzReceiveGas = "0";
+  (zeroMax.pathway as Record<string, unknown>).enforcedLzReceiveGas = "0";
+  assert.throws(
+    () => normalizeProfile(zeroMax),
+    /pathway\.maxLzReceiveGas must be positive/,
+  );
+});
+
 test("normalizeProfile rejects missing and unreferenced price source blocks", () => {
   const missing = baseProfile();
   (missing.chains[1] as Record<string, unknown>).nativeAssetId = "hoodi-eth";

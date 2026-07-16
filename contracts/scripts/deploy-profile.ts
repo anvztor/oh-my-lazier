@@ -1983,27 +1983,49 @@ function normalizePathway(value: unknown, pathLabel: string): PathwayProfile {
       `${pathLabel}.priceSnapshot.staleAfter must not exceed ${maxPriceSnapshotStaleAfter}`,
     );
   }
+  const enforcedLzReceiveGas = decimalField(
+    input,
+    "enforcedLzReceiveGas",
+    `${pathLabel}.enforcedLzReceiveGas`,
+  );
+  const minLzReceiveGas = decimalField(
+    input,
+    "minLzReceiveGas",
+    `${pathLabel}.minLzReceiveGas`,
+  );
+  const maxLzReceiveGas = decimalField(
+    input,
+    "maxLzReceiveGas",
+    `${pathLabel}.maxLzReceiveGas`,
+  );
+  if (BigInt(maxLzReceiveGas) === 0n) {
+    throw new Error(`${pathLabel}.maxLzReceiveGas must be positive`);
+  }
+  if (BigInt(minLzReceiveGas) > BigInt(maxLzReceiveGas)) {
+    throw new Error(
+      `${pathLabel}.minLzReceiveGas must not exceed ${pathLabel}.maxLzReceiveGas`,
+    );
+  }
+  // The enforced lzReceive gas is what the OApp actually sends; if it falls
+  // outside [min, max] the deployment still verifies green but OpenExecutor
+  // reverts InvalidGas on every quote/send, bricking the pathway.
+  if (
+    BigInt(enforcedLzReceiveGas) < BigInt(minLzReceiveGas) ||
+    BigInt(enforcedLzReceiveGas) > BigInt(maxLzReceiveGas)
+  ) {
+    throw new Error(
+      `${pathLabel}.enforcedLzReceiveGas must be within [${pathLabel}.minLzReceiveGas, ${pathLabel}.maxLzReceiveGas]`,
+    );
+  }
   return {
     maxMessageSize: integerField(
       input,
       "maxMessageSize",
       `${pathLabel}.maxMessageSize`,
     ),
-    enforcedLzReceiveGas: decimalField(
-      input,
-      "enforcedLzReceiveGas",
-      `${pathLabel}.enforcedLzReceiveGas`,
-    ),
-    minLzReceiveGas: decimalField(
-      input,
-      "minLzReceiveGas",
-      `${pathLabel}.minLzReceiveGas`,
-    ),
-    maxLzReceiveGas: decimalField(
-      input,
-      "maxLzReceiveGas",
-      `${pathLabel}.maxLzReceiveGas`,
-    ),
+    enforcedLzReceiveGas,
+    minLzReceiveGas,
+    maxLzReceiveGas,
     priceSnapshot: {
       dstGasPriceInSrcToken: decimalField(
         priceSnapshot,
@@ -2746,11 +2768,32 @@ function optionalMarketDataBaseURL(
   }
   if (
     baseURL.trim() !== baseURL ||
+    !/^https:\/\//i.test(baseURL) ||
     parsed.protocol !== "https:" ||
     parsed.hostname === "" ||
     baseURL.includes("?") ||
-    baseURL.includes("#")
+    baseURL.includes("#") ||
+    // WHATWG URL repairs several forms that Go's net/url rejects, and this
+    // function persists the raw string, so anything accepted here must also be
+    // accepted at worker startup. Reject the known divergences: control
+    // characters (silently stripped by WHATWG),
+    // eslint-disable-next-line no-control-regex
+    /[\u0000-\u001f\u007f]/.test(baseURL) ||
+    // backslashes (WHATWG maps them to "/"; Go rejects them in host/path),
+    baseURL.includes("\\") ||
+    // and invalid percent-escapes (a "%" not followed by two hex digits).
+    /%(?![0-9a-fA-F]{2})/.test(baseURL)
   ) {
+    throw new Error(
+      `${label} must be an absolute HTTPS URL without query or fragment`,
+    );
+  }
+  // Even a well-formed percent-escape is rejected by Go's net/url when it sits
+  // in the host/port (WHATWG decodes it, e.g. "%65" -> "e"). Userinfo may keep
+  // valid escapes, so only inspect the authority after the last "@".
+  const authority = baseURL.slice("https://".length).split(/[/?#]/)[0];
+  const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
+  if (hostPort.includes("%")) {
     throw new Error(
       `${label} must be an absolute HTTPS URL without query or fragment`,
     );
