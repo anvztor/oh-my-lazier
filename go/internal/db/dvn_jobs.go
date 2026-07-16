@@ -104,6 +104,13 @@ func (s *Store) ListDVNWork(ctx context.Context, status string, limit int) ([]DV
 		FROM dvn_jobs dj
 		JOIN packets p ON p.guid = dj.guid
 		WHERE dj.status = $1 AND (dj.next_retry_at IS NULL OR dj.next_retry_at <= now())
+			AND EXISTS (
+				SELECT 1 FROM pathways pw
+				WHERE pw.src_eid = p.src_eid AND pw.dst_eid = p.dst_eid
+					AND pw.src_oapp = p.sender AND pw.dst_oapp = p.receiver
+					AND pw.enabled AND NOT pw.paused
+			)
+			AND NOT EXISTS (SELECT 1 FROM chains c WHERE c.eid IN (p.src_eid, p.dst_eid) AND (NOT c.enabled OR c.paused))
 		ORDER BY dj.updated_at, dj.guid
 		LIMIT $2
 	`, status, limit)

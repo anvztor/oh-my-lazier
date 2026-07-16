@@ -2010,6 +2010,421 @@ func statusCount(counts []StatusCount, status string) int64 {
 	return 0
 }
 
+func TestRetryFailedTxParksLzReceiveAtRetryBudget(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00dd00d")
+	packet.SrcEID = 50241
+	packet.DstEID = 50242
+	packet.Status = string(packets.ExecutorExecutable)
+	syncDrainPathway(ctx, t, store, packet)
+	cleanPathwayRows(ctx, t, store, packet.SrcEID, packet.DstEID)
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(ctx, ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+
+	const signerID = "0x7777777777777777777777777777777777777777"
+	if _, err := store.BootstrapTxNonceCursor(ctx, packet.DstEID, signerID, 3); err != nil {
+		t.Fatalf("BootstrapTxNonceCursor() error = %v", err)
+	}
+	id, err := store.EnqueueExecutorTx(ctx, packet.GUID, string(packets.ExecutorExecutable), string(packets.ExecutorLzReceiveTxEnqueued), TxRequest{
+		ChainEID: packet.DstEID,
+		Purpose:  txPurposeExecutorLzReceive,
+		GUID:     packet.GUID.Bytes(),
+		To:       packet.Receiver,
+		Calldata: []byte{0x04, 0x05},
+		Value:    big.NewInt(0),
+		SignerID: signerID,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueExecutorTx() error = %v", err)
+	}
+	if _, err := store.ClaimNextNonce(ctx, packet.DstEID, signerID); err != nil {
+		t.Fatalf("ClaimNextNonce() error = %v", err)
+	}
+	txHash := common.HexToHash("0x3333333333333333333333333333333333333333333333333333333333333333")
+	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
+		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
+	}
+	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
+		t.Fatalf("MarkTxBroadcast() error = %v", err)
+	}
+	// The lzReceive reverted: mark the job failed (bumps retry_count) and the row receipt-failed.
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, txHash, "reverted"); err != nil {
+		t.Fatalf("MarkExecutorReceiveFailed() error = %v", err)
+	}
+	if err := store.MarkTxFailed(ctx, id, errors.New("receipt reverted"), TxFailureReceiptFailed); err != nil {
+		t.Fatalf("MarkTxFailed() error = %v", err)
+	}
+	// Simulate the budget already being exhausted and the auto-retry falling due.
+	if _, err := store.pool.Exec(ctx, "UPDATE executor_jobs SET retry_count = $1 WHERE guid = $2", MaxLzReceiveDeliveryAttempts, packet.GUID.Bytes()); err != nil {
+		t.Fatalf("bump retry_count: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE tx_outbox SET next_retry_at = now() - interval '1 minute' WHERE id = $1", id); err != nil {
+		t.Fatalf("force retry due: %v", err)
+	}
+
+	if _, err := store.RetryFailedTx(ctx, id); !errors.Is(err, ErrNoFailedTxRetry) {
+		t.Fatalf("RetryFailedTx() error = %v, want ErrNoFailedTxRetry (must not clone past the budget)", err)
+	}
+	job, err := store.GetPacket(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetPacket() error = %v", err)
+	}
+	if job.Status != string(packets.ExecutorManualReview) {
+		t.Fatalf("packet status = %q, want %q", job.Status, packets.ExecutorManualReview)
+	}
+	var failureKind *string
+	var nextRetryAt *time.Time
+	if err := store.pool.QueryRow(ctx, "SELECT failure_kind, next_retry_at FROM tx_outbox WHERE id = $1", id).Scan(&failureKind, &nextRetryAt); err != nil {
+		t.Fatalf("select finalized row: %v", err)
+	}
+	if failureKind != nil || nextRetryAt != nil {
+		t.Fatalf("failed row not finalized: failure_kind=%v next_retry_at=%v (would wedge the signer)", failureKind, nextRetryAt)
+	}
+}
+
+func TestRetryFailedTxDoesNotReactivateLzReceiveOnPausedPathway(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xfeed0000feed0000feed0000feed0000feed0000feed0000feed0000feed0000")
+	packet.SrcEID = 50251
+	packet.DstEID = 50252
+	packet.Status = string(packets.ExecutorExecutable)
+	syncDrainPathway(ctx, t, store, packet)
+	cleanPathwayRows(ctx, t, store, packet.SrcEID, packet.DstEID)
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(ctx, ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+
+	const signerID = "0x6666666666666666666666666666666666666666"
+	if _, err := store.BootstrapTxNonceCursor(ctx, packet.DstEID, signerID, 3); err != nil {
+		t.Fatalf("BootstrapTxNonceCursor() error = %v", err)
+	}
+	id, err := store.EnqueueExecutorTx(ctx, packet.GUID, string(packets.ExecutorExecutable), string(packets.ExecutorLzReceiveTxEnqueued), TxRequest{
+		ChainEID: packet.DstEID,
+		Purpose:  txPurposeExecutorLzReceive,
+		GUID:     packet.GUID.Bytes(),
+		To:       packet.Receiver,
+		Calldata: []byte{0x04, 0x05},
+		Value:    big.NewInt(0),
+		SignerID: signerID,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueExecutorTx() error = %v", err)
+	}
+	if _, err := store.ClaimNextNonce(ctx, packet.DstEID, signerID); err != nil {
+		t.Fatalf("ClaimNextNonce() error = %v", err)
+	}
+	txHash := common.HexToHash("0x5555555555555555555555555555555555555555555555555555555555555555")
+	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
+		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
+	}
+	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
+		t.Fatalf("MarkTxBroadcast() error = %v", err)
+	}
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, txHash, "reverted"); err != nil {
+		t.Fatalf("MarkExecutorReceiveFailed() error = %v", err)
+	}
+	if err := store.MarkTxFailed(ctx, id, errors.New("receipt reverted"), TxFailureReceiptFailed); err != nil {
+		t.Fatalf("MarkTxFailed() error = %v", err)
+	}
+	// The pathway is paused (retry_count is still well under the budget) and the
+	// auto-retry has fallen due.
+	if err := store.PausePathwayForPacket(ctx, packet.GUID); err != nil {
+		t.Fatalf("PausePathwayForPacket() error = %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE tx_outbox SET next_retry_at = now() - interval '1 minute' WHERE id = $1", id); err != nil {
+		t.Fatalf("force retry due: %v", err)
+	}
+
+	if _, err := store.RetryFailedTx(ctx, id); !errors.Is(err, ErrNoFailedTxRetry) {
+		t.Fatalf("RetryFailedTx() error = %v, want ErrNoFailedTxRetry (must not re-activate a paused pathway)", err)
+	}
+	job, err := store.GetPacket(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetPacket() error = %v", err)
+	}
+	if job.Status != string(packets.ExecutorLzReceiveFailed) {
+		t.Fatalf("packet status = %q, want %q (must stay failed for the deliverer to resume when unpaused)", job.Status, packets.ExecutorLzReceiveFailed)
+	}
+	var failureKind *string
+	var nextRetryAt *time.Time
+	if err := store.pool.QueryRow(ctx, "SELECT failure_kind, next_retry_at FROM tx_outbox WHERE id = $1", id).Scan(&failureKind, &nextRetryAt); err != nil {
+		t.Fatalf("select finalized row: %v", err)
+	}
+	if failureKind != nil || nextRetryAt != nil {
+		t.Fatalf("failed row not finalized: failure_kind=%v next_retry_at=%v", failureKind, nextRetryAt)
+	}
+}
+
+func TestListWorkExcludesPausedPathway(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xba5eba11ba5eba11ba5eba11ba5eba11ba5eba11ba5eba11ba5eba11ba5eba11")
+	packet.SrcEID = 50231
+	packet.DstEID = 50232
+	syncDrainPathway(ctx, t, store, packet)
+	cleanPathwayRows(ctx, t, store, packet.SrcEID, packet.DstEID)
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertDVNJob(ctx, DVNJobRecord{
+		GUID:                  packet.GUID,
+		AssignedFee:           big.NewInt(43),
+		ConfirmationsRequired: 12,
+		Status:                string(packets.DVNQuorumChecking),
+	}); err != nil {
+		t.Fatalf("UpsertDVNJob() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(ctx, ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+
+	hasDVN := func() bool {
+		work, err := store.ListDVNWork(ctx, string(packets.DVNQuorumChecking), 100)
+		if err != nil {
+			t.Fatalf("ListDVNWork() error = %v", err)
+		}
+		for _, item := range work {
+			if item.Packet.GUID == packet.GUID {
+				return true
+			}
+		}
+		return false
+	}
+	hasExecutor := func() bool {
+		work, err := store.ListExecutorWork(ctx, string(packets.ExecutorExecutable), 100)
+		if err != nil {
+			t.Fatalf("ListExecutorWork() error = %v", err)
+		}
+		for _, item := range work {
+			if item.Packet.GUID == packet.GUID {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasDVN() || !hasExecutor() {
+		t.Fatal("work not surfaced before pause")
+	}
+	if err := store.PausePathwayForPacket(ctx, packet.GUID); err != nil {
+		t.Fatalf("PausePathwayForPacket() error = %v", err)
+	}
+	if hasDVN() {
+		t.Fatal("ListDVNWork surfaced a paused pathway's work")
+	}
+	if hasExecutor() {
+		t.Fatal("ListExecutorWork surfaced a paused pathway's work")
+	}
+
+	// A pathway removed from config (disabled, not paused) must also be excluded.
+	if _, err := store.pool.Exec(ctx, "UPDATE pathways SET paused = false, enabled = false WHERE src_eid = $1 AND dst_eid = $2", packet.SrcEID, packet.DstEID); err != nil {
+		t.Fatalf("disable pathway: %v", err)
+	}
+	if hasDVN() || hasExecutor() {
+		t.Fatal("work surfaced for a disabled pathway")
+	}
+}
+
+func TestPrepareReplacementTxRejectsConfirmedRow(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	registry, err := chain.NewRegistry(testChains(), testPathways())
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, registry); err != nil {
+		t.Fatalf("SyncConfig() error = %v", err)
+	}
+
+	const signerID = "0x8889888888888888888888888888888888888888"
+	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE signer_id = $1", signerID); err != nil {
+		t.Fatalf("delete test rows: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_nonce_cursors WHERE signer_id = $1", signerID); err != nil {
+		t.Fatalf("delete test cursor: %v", err)
+	}
+	if _, err := store.BootstrapTxNonceCursor(ctx, 40161, signerID, 7); err != nil {
+		t.Fatalf("BootstrapTxNonceCursor() error = %v", err)
+	}
+	id, err := store.EnqueueTx(ctx, TxRequest{
+		ChainEID: 40161,
+		Purpose:  "replace-guard-test",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01},
+		Value:    big.NewInt(0),
+		SignerID: signerID,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := store.ClaimNextNonce(ctx, 40161, signerID); err != nil {
+		t.Fatalf("ClaimNextNonce() error = %v", err)
+	}
+	txHash := common.HexToHash("0x2222222222222222222222222222222222222222222222222222222222222222")
+	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
+		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
+	}
+	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
+		t.Fatalf("MarkTxBroadcast() error = %v", err)
+	}
+	if err := store.MarkTxConfirmed(ctx, id, txHash); err != nil {
+		t.Fatalf("MarkTxConfirmed() error = %v", err)
+	}
+
+	if err := store.PrepareReplacementTx(ctx, id); err == nil {
+		t.Fatal("PrepareReplacementTx(confirmed) error = nil, want not replaceable")
+	}
+	confirmed, err := store.GetOutboxTx(ctx, id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if confirmed.Status != TxStatusConfirmed {
+		t.Fatalf("status = %q, want %q (row must stay confirmed)", confirmed.Status, TxStatusConfirmed)
+	}
+	if confirmed.TxHash != txHash {
+		t.Fatalf("tx hash = %s, want %s (confirmed hash must not be cleared)", confirmed.TxHash, txHash)
+	}
+}
+
+func TestSyncConfigDisablesRemovedChainsAndPathways(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	full, err := chain.NewRegistry(testChains(), testPathways())
+	if err != nil {
+		t.Fatalf("NewRegistry(full) error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, full); err != nil {
+		t.Fatalf("SyncConfig(full) error = %v", err)
+	}
+
+	// Re-sync with the second chain and its pathway removed from config.
+	reduced, err := chain.NewRegistry(testChains()[:1], nil)
+	if err != nil {
+		t.Fatalf("NewRegistry(reduced) error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, reduced); err != nil {
+		t.Fatalf("SyncConfig(reduced) error = %v", err)
+	}
+
+	var keptChainEnabled, removedChainEnabled, pathwayEnabled bool
+	if err := store.pool.QueryRow(ctx, "SELECT enabled FROM chains WHERE eid = 40161").Scan(&keptChainEnabled); err != nil {
+		t.Fatalf("select kept chain: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT enabled FROM chains WHERE eid = 40449").Scan(&removedChainEnabled); err != nil {
+		t.Fatalf("select removed chain: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT enabled FROM pathways WHERE src_eid = 40161 AND dst_eid = 40449").Scan(&pathwayEnabled); err != nil {
+		t.Fatalf("select removed pathway: %v", err)
+	}
+	if !keptChainEnabled {
+		t.Fatal("kept chain 40161 enabled = false, want true")
+	}
+	if removedChainEnabled {
+		t.Fatal("removed chain 40449 enabled = true, want false")
+	}
+	if pathwayEnabled {
+		t.Fatal("removed pathway enabled = true, want false")
+	}
+}
+
 func testChains() []config.ChainConfig {
 	return []config.ChainConfig{
 		{

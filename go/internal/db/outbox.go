@@ -622,8 +622,8 @@ func (s *Store) PrepareReplacementTx(ctx context.Context, id int64) error {
 			next_retry_at = NULL,
 			last_error = NULL,
 			updated_at = now()
-		WHERE id = $2 AND nonce IS NOT NULL
-	`, TxStatusQueued, id)
+		WHERE id = $2 AND nonce IS NOT NULL AND status IN ($3, $4)
+	`, TxStatusQueued, id, TxStatusSigned, TxStatusBroadcast)
 	if err != nil {
 		return err
 	}
@@ -1049,6 +1049,31 @@ func cloneFailedTxRetry(ctx context.Context, tx pgx.Tx, id int64) (int64, error)
 	return retryID, nil
 }
 
+// lzReceiveJobPathwayActive reports whether the packet's pathway is enabled and
+// not paused and both endpoint chains are enabled and not paused. It mirrors the
+// work-selection gate so the receipt-retry re-activation path honors the same
+// pause/disable semantics.
+func lzReceiveJobPathwayActive(ctx context.Context, tx pgx.Tx, guidBytes []byte) (bool, error) {
+	var active bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM packets p
+			WHERE p.guid = $1
+				AND EXISTS (
+					SELECT 1 FROM pathways pw
+					WHERE pw.src_eid = p.src_eid AND pw.dst_eid = p.dst_eid
+						AND pw.src_oapp = p.sender AND pw.dst_oapp = p.receiver
+						AND pw.enabled AND NOT pw.paused
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM chains c
+					WHERE c.eid IN (p.src_eid, p.dst_eid) AND (NOT c.enabled OR c.paused)
+				)
+		)
+	`, guidBytes).Scan(&active)
+	return active, err
+}
+
 func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int64, purpose string, guidBytes *[]byte) (bool, error) {
 	if purpose != txPurposeExecutorLzReceive || guidBytes == nil {
 		return true, nil
@@ -1057,12 +1082,13 @@ func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int6
 		return false, fmt.Errorf("executor lzReceive retry guid has length %d", len(*guidBytes))
 	}
 	var status string
+	var retryCount int64
 	err := tx.QueryRow(ctx, `
-		SELECT status
+		SELECT status, retry_count
 		FROM executor_jobs
 		WHERE guid = $1
 		FOR UPDATE
-	`, *guidBytes).Scan(&status)
+	`, *guidBytes).Scan(&status, &retryCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, fmt.Errorf("executor job %s not found for lzReceive retry", common.BytesToHash(*guidBytes))
 	}
@@ -1071,7 +1097,10 @@ func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int6
 	}
 	switch status {
 	case string(packets.ExecutorLzReceiveFailed):
-	case string(packets.ExecutorLzReceiveTxEnqueued), string(packets.ExecutorDelivered):
+	case string(packets.ExecutorLzReceiveTxEnqueued), string(packets.ExecutorDelivered), string(packets.ExecutorManualReview):
+		// The job was already advanced or parked (e.g. the deliverer re-enqueued
+		// or the retry budget was exhausted). Finalize this failed row so the
+		// txmgr auto-retry loop stops re-selecting it and wedging the signer.
 		if _, err := tx.Exec(ctx, `
 			UPDATE tx_outbox
 			SET failure_kind = NULL, next_retry_at = NULL, updated_at = now()
@@ -1082,6 +1111,52 @@ func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int6
 		return false, nil
 	default:
 		return false, fmt.Errorf("executor job %s is in status %s, want %s", common.BytesToHash(*guidBytes), status, packets.ExecutorLzReceiveFailed)
+	}
+	// Enforce the retry budget atomically with the restore decision so that
+	// whichever driver wins the FOR UPDATE lock cannot exceed the cap.
+	if retryCount >= MaxLzReceiveDeliveryAttempts {
+		reason := fmt.Sprintf("lzReceive reverted %d times, exceeding the %d-attempt retry budget", retryCount, MaxLzReceiveDeliveryAttempts)
+		if _, err := tx.Exec(ctx, `
+			UPDATE executor_jobs
+			SET status = $1, last_error = $2, updated_at = now()
+			WHERE guid = $3 AND status = $4
+		`, string(packets.ExecutorManualReview), reason, *guidBytes, string(packets.ExecutorLzReceiveFailed)); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE packets
+			SET status = $1, updated_at = now()
+			WHERE guid = $2 AND status = $3
+		`, string(packets.ExecutorManualReview), *guidBytes, string(packets.ExecutorLzReceiveFailed)); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE tx_outbox
+			SET failure_kind = NULL, next_retry_at = NULL, updated_at = now()
+			WHERE id = $1 AND status = $2
+		`, failedTxID, TxStatusFailed); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	// Do not re-activate a job whose pathway or chain was paused or removed from
+	// config after the failure; that would broadcast a fresh paid tx on a halted
+	// pathway. Finalize the failed row and leave the job LZ_RECEIVE_FAILED so the
+	// deliverer resumes it once the pathway is active again (the retry_count cap
+	// carries across the pause).
+	active, err := lzReceiveJobPathwayActive(ctx, tx, *guidBytes)
+	if err != nil {
+		return false, err
+	}
+	if !active {
+		if _, err := tx.Exec(ctx, `
+			UPDATE tx_outbox
+			SET failure_kind = NULL, next_retry_at = NULL, updated_at = now()
+			WHERE id = $1 AND status = $2
+		`, failedTxID, TxStatusFailed); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE executor_jobs

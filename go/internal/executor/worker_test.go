@@ -357,6 +357,41 @@ func TestProcessDelivererOnceRetriesFailedLzReceive(t *testing.T) {
 	}
 }
 
+func TestProcessDelivererOnceParksLzReceiveAfterRetryBudget(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorLzReceiveFailed)
+	store := &fakeStore{
+		workByStatus: map[string][]db.ExecutorWorkItem{string(packets.ExecutorLzReceiveFailed): {{
+			Packet: packet,
+			Job: db.ExecutorJobRecord{
+				GUID:       packet.GUID,
+				Status:     string(packets.ExecutorLzReceiveFailed),
+				RetryCount: db.MaxLzReceiveDeliveryAttempts,
+			},
+		}}},
+	}
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeExecutableCaller{payloadHash: packet.PayloadHash, inboundNonce: 7}},
+		slog.Default(),
+	)
+
+	processed, err := worker.ProcessDelivererOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessDelivererOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.nextStatus != string(packets.ExecutorManualReview) {
+		t.Fatalf("next status = %q, want %q (retry budget exhausted must park, not re-enqueue)", store.nextStatus, packets.ExecutorManualReview)
+	}
+	if store.request.Purpose == TxPurposeLzReceive {
+		t.Fatal("a new lzReceive tx was enqueued after the retry budget was exhausted")
+	}
+}
+
 func TestProcessDelivererOnceMarksInvalidLzReceiveOptionsForManualReview(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorExecutable)

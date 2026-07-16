@@ -753,6 +753,50 @@ func TestProcessQuorumOnceMarksReorgWhenReceiptDisappears(t *testing.T) {
 	}
 }
 
+func TestProcessQuorumOnceMarksReorgWhenReceiptBlockMoved(t *testing.T) {
+	packet := testDVNPacket()
+	receipt := testSourceReceipt(t, packet)
+	// The source tx was re-included by a reorg at a later block. Re-inclusion at
+	// a different position also shifts the block-global log index, so the receipt
+	// block must be checked before the log-index lookup or the reorg is missed.
+	receipt.BlockNumber = new(big.Int).SetUint64(packet.SrcBlockNumber + 3)
+	receipt.Logs[0].BlockNumber = packet.SrcBlockNumber + 3
+	receipt.Logs[0].Index = packet.SrcLogIndex + 5
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNQuorumChecking),
+			},
+		}},
+	}
+	worker := NewWithClients(
+		store,
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]ReceiptReader{packet.SrcEID: fakeReceiptReader{receipt: receipt}},
+		discardLogger(),
+	)
+
+	processed, err := worker.ProcessQuorumOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessQuorumOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.reorgGUID != packet.GUID {
+		t.Fatalf("reorg guid = %s, want %s", store.reorgGUID, packet.GUID)
+	}
+	if store.readyGUID != (common.Hash{}) {
+		t.Fatalf("ready guid = %s, want zero (must not verify a moved receipt)", store.readyGUID)
+	}
+	if store.pausedPathwayGUID != (common.Hash{}) {
+		t.Fatalf("paused pathway guid = %s, want zero", store.pausedPathwayGUID)
+	}
+}
+
 func TestProcessQuorumOnceDefersReceiptReaderError(t *testing.T) {
 	packet := testDVNPacket()
 	store := &fakeStore{
@@ -1166,9 +1210,10 @@ func testSourceReceipt(t *testing.T, packet db.PacketRecord) *gethtypes.Receipt 
 		Index:       packet.SrcLogIndex,
 	}
 	return &gethtypes.Receipt{
-		TxHash: packet.SrcTxHash,
-		Status: gethtypes.ReceiptStatusSuccessful,
-		Logs:   []*gethtypes.Log{log},
+		TxHash:      packet.SrcTxHash,
+		Status:      gethtypes.ReceiptStatusSuccessful,
+		BlockNumber: new(big.Int).SetUint64(packet.SrcBlockNumber),
+		Logs:        []*gethtypes.Log{log},
 	}
 }
 

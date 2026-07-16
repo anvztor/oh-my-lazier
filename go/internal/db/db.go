@@ -73,13 +73,25 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// SyncConfig upserts chain and pathway metadata from validated startup config.
+// SyncConfig reconciles chain and pathway metadata from validated startup
+// config: records present in the config are upserted and enabled, and any
+// record no longer in the config is disabled so it is not treated as active.
 func (s *Store) SyncConfig(ctx context.Context, registry *chain.Registry) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Disable everything first, then re-enable only what the current validated
+	// config declares. The repository keeps no compatibility burden, so a chain
+	// or pathway removed from config must not linger as an active record that
+	// readiness and the durable loops still treat as live.
+	if _, err := tx.Exec(ctx, `UPDATE chains SET enabled = false`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE pathways SET enabled = false`); err != nil {
+		return err
+	}
 	for _, configuredChain := range registry.All() {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chains (eid, name, chain_id, endpoint_address, enabled)
@@ -87,7 +99,8 @@ func (s *Store) SyncConfig(ctx context.Context, registry *chain.Registry) error 
 			ON CONFLICT (eid) DO UPDATE SET
 				name = EXCLUDED.name,
 				chain_id = EXCLUDED.chain_id,
-				endpoint_address = EXCLUDED.endpoint_address
+				endpoint_address = EXCLUDED.endpoint_address,
+				enabled = true
 		`, configuredChain.EID, configuredChain.Name, configuredChain.ChainID.Int64(), addressBytes(configuredChain.EndpointAddress)); err != nil {
 			return err
 		}

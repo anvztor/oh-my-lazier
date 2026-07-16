@@ -274,6 +274,9 @@ func (w *Worker) ProcessQuorumOnce(ctx context.Context) (bool, error) {
 	}
 	report, err := verifySourceReceiptForEndpoint(item.Packet, receipt, endpoint)
 	if err != nil {
+		if errors.Is(err, errSourceReceiptReorg) {
+			return true, w.markReorgDetected(ctx, item.Packet, err)
+		}
 		return true, w.markQuorumConflict(ctx, item.Packet, err)
 	}
 	payload, err := json.Marshal(report)
@@ -708,6 +711,12 @@ type QuorumReport struct {
 	PayloadHash string `json:"payload_hash"`
 }
 
+// errSourceReceiptReorg marks a source receipt whose PacketSent log was mined at
+// a different block than the one the indexer recorded, i.e. the source tx was
+// re-included by a reorg. The confirmation gate must be re-evaluated for the new
+// block rather than treating the evidence as a quorum conflict.
+var errSourceReceiptReorg = errors.New("source receipt block does not match indexed block")
+
 func verifySourceReceiptForEndpoint(packet db.PacketRecord, receipt *gethtypes.Receipt, endpoint common.Address) (QuorumReport, error) {
 	if receipt == nil {
 		return QuorumReport{}, errors.New("source receipt is missing")
@@ -718,12 +727,22 @@ func verifySourceReceiptForEndpoint(packet db.PacketRecord, receipt *gethtypes.R
 	if receipt.Status != gethtypes.ReceiptStatusSuccessful {
 		return QuorumReport{}, fmt.Errorf("source tx receipt status is %d", receipt.Status)
 	}
+	// A reorg that re-includes the source tx at a different block also shifts the
+	// block-global log index, so the lookup below would miss it. Compare the
+	// receipt's own block first and route a mismatch to reorg re-evaluation
+	// instead of a quorum conflict.
+	if receipt.BlockNumber != nil && receipt.BlockNumber.IsUint64() && receipt.BlockNumber.Uint64() != packet.SrcBlockNumber {
+		return QuorumReport{}, fmt.Errorf("%w: source receipt block %d does not match indexed block %d", errSourceReceiptReorg, receipt.BlockNumber.Uint64(), packet.SrcBlockNumber)
+	}
 	for _, log := range receipt.Logs {
 		if log == nil || log.Index != packet.SrcLogIndex {
 			continue
 		}
 		if endpoint != (common.Address{}) && log.Address != endpoint {
 			return QuorumReport{}, fmt.Errorf("source receipt PacketSent address %s does not match endpoint %s", log.Address, endpoint)
+		}
+		if log.BlockNumber != packet.SrcBlockNumber {
+			return QuorumReport{}, fmt.Errorf("%w: source receipt block %d does not match indexed block %d", errSourceReceiptReorg, log.BlockNumber, packet.SrcBlockNumber)
 		}
 		record, err := indexer.PacketRecordFromSentLog(*log)
 		if err != nil {

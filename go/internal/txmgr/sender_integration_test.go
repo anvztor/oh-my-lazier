@@ -1603,6 +1603,83 @@ func TestProcessReceiptsMarksExecutorLzReceiveFailed(t *testing.T) {
 	)
 }
 
+func TestProcessReceiptsResolvesRevertedLzReceiveAfterThirdPartyDelivery(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce: 77,
+		receipts:     make(map[common.Hash]*types.Receipt),
+	}
+	manager := New(store, discardLogger())
+	packet := testExecutorPacket(t)
+	packet.Status = string(packets.ExecutorExecutable)
+	if err := store.UpsertPacket(t.Context(), packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(t.Context(), db.ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+	if _, err := store.EnqueueExecutorTx(
+		t.Context(),
+		packet.GUID,
+		string(packets.ExecutorExecutable),
+		string(packets.ExecutorLzReceiveTxEnqueued),
+		db.TxRequest{
+			ChainEID: packet.DstEID,
+			Purpose:  executorLzReceivePurpose,
+			GUID:     packet.GUID.Bytes(),
+			To:       packet.Receiver,
+			Calldata: []byte{0x04, 0x05},
+			Value:    big.NewInt(0),
+			SignerID: signer.Address().Hex(),
+		},
+	); err != nil {
+		t.Fatalf("EnqueueExecutorTx() error = %v", err)
+	}
+
+	id, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	outboxTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	// A third party delivered the packet while our lzReceive tx was in flight,
+	// so the job is already DELIVERED when our own tx mines reverted.
+	if err := store.MarkExecutorDelivered(t.Context(), packet.GUID, common.HexToHash("0xabc")); err != nil {
+		t.Fatalf("MarkExecutorDelivered() error = %v", err)
+	}
+	client.receipts[outboxTx.TxHash] = testReceipt(outboxTx.TxHash, types.ReceiptStatusFailed)
+
+	if _, err := manager.ProcessReceipts(t.Context(), Target{
+		ChainEID: packet.DstEID,
+		ChainID:  big.NewInt(560048),
+		Signer:   signer,
+		Client:   client,
+	}, 1); err != nil {
+		t.Fatalf("ProcessReceipts() error = %v", err)
+	}
+	delivered, err := store.GetPacket(t.Context(), packet.GUID)
+	if err != nil {
+		t.Fatalf("GetPacket() error = %v", err)
+	}
+	if delivered.Status != string(packets.ExecutorDelivered) {
+		t.Fatalf("packet status = %q, want %q", delivered.Status, packets.ExecutorDelivered)
+	}
+	resolvedTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() after receipt error = %v", err)
+	}
+	if resolvedTx.Status != db.TxStatusFailed {
+		t.Fatalf("tx status = %q, want %q (row must not stay a zombie broadcast)", resolvedTx.Status, db.TxStatusFailed)
+	}
+}
+
 func TestProcessFailedRetryClonesLzReceiveReceiptFailureAndRestoresWorkflow(t *testing.T) {
 	store := openTestStore(t)
 	signer := newTestKeystoreSigner(t)

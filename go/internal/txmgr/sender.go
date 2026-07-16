@@ -304,7 +304,7 @@ func (m *Manager) applyWorkflowReceipt(ctx context.Context, outboxTx db.OutboxTx
 		}
 		return m.markExecutorReceipt(ctx, guid, func() error {
 			return m.store.MarkExecutorReceiveFailed(ctx, guid, outboxTx.TxHash, "lzReceive transaction reverted")
-		}, packets.ExecutorLzReceiveFailed)
+		}, packets.ExecutorLzReceiveFailed, packets.ExecutorDelivered)
 	case dvnVerifyPurpose:
 		if success {
 			return m.markDVNReceipt(ctx, guid, func() error {

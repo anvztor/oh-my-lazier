@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"time"
@@ -258,6 +259,9 @@ func (w *Worker) processDelivererStatus(ctx context.Context, status string) (boo
 		}
 		w.logger.Debug("skipped executor delivery workflow", "reason", "delivery_not_executable", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", status, "delivery_state", deliveryStateLabel(state))
 		return true, nil
+	}
+	if status == string(packets.ExecutorLzReceiveFailed) && item.Job.RetryCount >= db.MaxLzReceiveDeliveryAttempts {
+		return w.markExecutorManualReview(ctx, item, status, fmt.Errorf("lzReceive reverted %d times, exceeding the %d-attempt retry budget", item.Job.RetryCount, db.MaxLzReceiveDeliveryAttempts))
 	}
 	request, err := BuildLzReceiveTx(item.Packet, dstChain.EndpointAddress, dstChain.TxRoles.Executor.SignerID)
 	if err != nil {
