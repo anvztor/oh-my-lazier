@@ -506,6 +506,39 @@ func TestProcessDelivererOnceMarksDeliveredWhenEndpointPayloadCleared(t *testing
 	}
 }
 
+func TestProcessDelivererOnceDefersDeliveryBelowConfirmationDepth(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorExecutable)
+	store := &fakeStore{
+		workByStatus: map[string][]db.ExecutorWorkItem{string(packets.ExecutorExecutable): {{
+			Packet: packet,
+			Job:    db.ExecutorJobRecord{GUID: packet.GUID, Status: string(packets.ExecutorExecutable)},
+		}}},
+	}
+	// The endpoint reports delivered at latest, but the head is below the chain's
+	// confirmation depth (12), so the terminal DELIVERED state must not be written.
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeExecutableCaller{payloadHash: common.Hash{}, inboundNonce: 7, lazyInboundNonce: 7, headBlock: 5}},
+		slog.Default(),
+	)
+
+	processed, err := worker.ProcessDelivererOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessDelivererOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.nextStatus == string(packets.ExecutorDelivered) {
+		t.Fatal("marked DELIVERED from a shallow (below-confirmation-depth) observation")
+	}
+	if store.deferredGUID != packet.GUID {
+		t.Fatalf("deferred guid = %s, want %s", store.deferredGUID, packet.GUID)
+	}
+}
+
 func TestProcessDelivererOnceDefersReadinessError(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorExecutable)
@@ -547,6 +580,7 @@ func TestCheckDeliveryStateKeepsPayloadExecutableWhenLazyNonceAdvanced(t *testin
 		fakeExecutableCaller{payloadHash: packet.PayloadHash, inboundNonce: packet.Nonce.Uint64(), lazyInboundNonce: packet.Nonce.Uint64()},
 		common.HexToAddress("0x4444444444444444444444444444444444444444"),
 		packet,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CheckDeliveryState() error = %v", err)
@@ -644,7 +678,13 @@ func (failingCaller) CallContract(context.Context, ethereum.CallMsg, *big.Int) (
 	return nil, fmt.Errorf("unexpected eth_call")
 }
 
+func (failingCaller) BlockNumber(context.Context) (uint64, error) {
+	return 0, fmt.Errorf("unexpected block number")
+}
+
 type fakeCommitReadyCaller struct{}
+
+func (fakeCommitReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
 
 func (fakeCommitReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -673,6 +713,10 @@ type fakeCommitAlreadyCommittedCaller struct {
 	payloadHash common.Hash
 }
 
+func (fakeCommitAlreadyCommittedCaller) BlockNumber(context.Context) (uint64, error) {
+	return 1_000_000, nil
+}
+
 func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
 	if err != nil {
@@ -687,6 +731,8 @@ func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call e
 }
 
 type fakeCommitNotReadyCaller struct{}
+
+func (fakeCommitNotReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
 
 func (fakeCommitNotReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -709,6 +755,14 @@ type fakeExecutableCaller struct {
 	payloadHash      common.Hash
 	inboundNonce     uint64
 	lazyInboundNonce uint64
+	headBlock        uint64
+}
+
+func (c fakeExecutableCaller) BlockNumber(context.Context) (uint64, error) {
+	if c.headBlock != 0 {
+		return c.headBlock, nil
+	}
+	return 1_000_000, nil
 }
 
 func (c fakeExecutableCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {

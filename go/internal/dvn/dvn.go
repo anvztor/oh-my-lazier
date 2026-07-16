@@ -317,7 +317,7 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 		}
 		w.logger.Info("dvn shadow job would verify", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "from_status", string(packets.DVNReadyToVerify), "to_status", string(packets.DVNWouldVerify))
 	case config.DVNModeActive:
-		complete, err := w.verificationAlreadyComplete(ctx, item.Packet, pathway, item.Job.ConfirmationsRequired)
+		complete, err := w.verificationAlreadyComplete(ctx, item.Packet, pathway, item.Job.ConfirmationsRequired, nil)
 		if err != nil {
 			if isDestinationVerificationConfigMismatch(err) {
 				return w.markDestinationConfigMismatch(ctx, item, string(packets.DVNReadyToVerify), err)
@@ -325,6 +325,20 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 			return w.deferDVNWorkError(ctx, item, string(packets.DVNReadyToVerify), "verification_reconcile_error", err)
 		}
 		if complete {
+			// Only write the terminal verified state once the on-chain verification
+			// is buried under the destination confirmation depth, so a shallow
+			// third-party verification cannot be reorged out after we stop verifying.
+			confirmed, err := w.verificationConfirmedOnChain(ctx, item.Packet, pathway, item.Job.ConfirmationsRequired)
+			if err != nil {
+				return w.deferDVNWorkError(ctx, item, string(packets.DVNReadyToVerify), "verification_reconcile_error", err)
+			}
+			if !confirmed {
+				if err := w.store.DeferDVNJob(ctx, item.Packet.GUID, string(packets.DVNReadyToVerify), loopInterval); err != nil {
+					return false, err
+				}
+				w.logger.Debug("deferred dvn verification below confirmation depth", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", string(packets.DVNReadyToVerify))
+				return true, nil
+			}
 			if err := w.store.MarkDVNVerifiedFromChain(ctx, item.Packet.GUID, string(packets.DVNReadyToVerify), item.Job.QuorumResult); err != nil {
 				return false, err
 			}
@@ -346,7 +360,7 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64) (bool, error) {
+func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, blockNumber *big.Int) (bool, error) {
 	if err := packet.Validate(); err != nil {
 		return false, err
 	}
@@ -364,21 +378,77 @@ func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.Pack
 	if caller == nil {
 		return false, fmt.Errorf("missing destination caller for eid %d", packet.DstEID)
 	}
-	payloadHash, err := callInboundPayloadHash(ctx, caller, dstChain.EndpointAddress, packet)
+	payloadHash, err := callInboundPayloadHash(ctx, caller, dstChain.EndpointAddress, packet, blockNumber)
 	if err != nil {
 		return false, err
 	}
 	if payloadHash == packet.PayloadHash {
 		return true, nil
 	}
-	if err := validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations); err != nil {
+	if err := validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, blockNumber); err != nil {
 		return false, err
 	}
-	submitted, observedConfirmations, err := callHashLookup(ctx, caller, pathway.ReceiveLib, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash, pathway.DestinationWorkers.OpenDVN)
+	submitted, observedConfirmations, err := callHashLookup(ctx, caller, pathway.ReceiveLib, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash, pathway.DestinationWorkers.OpenDVN, blockNumber)
 	if err != nil {
 		return false, err
 	}
 	return submitted && observedConfirmations >= confirmations, nil
+}
+
+// verificationConfirmedOnChain re-checks the "already verified" reconciliation at
+// the destination chain's confirmation-deep block, so a shallow (reorg-vulnerable)
+// verification is not written as terminal state. A not-yet-deep chain reports false.
+func (w *Worker) verificationConfirmedOnChain(ctx context.Context, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64) (bool, error) {
+	confBlock, err := w.confirmedDstBlock(ctx, packet.DstEID)
+	if errors.Is(err, errAwaitingConfirmations) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	complete, err := w.verificationAlreadyComplete(ctx, packet, pathway, confirmations, confBlock)
+	if err != nil {
+		// The current config was already validated against latest before this
+		// re-check. A config mismatch at the historical confirmed block just means
+		// a recent (still-unconfirmed) config change has not yet reached depth, so
+		// treat it as not-yet-confirmed and defer rather than flagging drift.
+		if isDestinationVerificationConfigMismatch(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return complete, nil
+}
+
+var errAwaitingConfirmations = errors.New("awaiting confirmation depth")
+
+// confirmedDstBlock returns the destination block that is chain.Confirmations
+// deep. A nil block with no error means no confirmation gate (read latest);
+// errAwaitingConfirmations means the chain has not produced enough blocks yet.
+func (w *Worker) confirmedDstBlock(ctx context.Context, dstEID uint32) (*big.Int, error) {
+	dstChain, err := w.registry.Get(dstEID)
+	if err != nil {
+		return nil, err
+	}
+	if dstChain.Confirmations == 0 {
+		return nil, nil
+	}
+	reader := w.head(dstEID)
+	if reader == nil {
+		return nil, fmt.Errorf("missing destination head reader for eid %d", dstEID)
+	}
+	headResult, err := reader.CheckHead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if headResult.Number == nil || !headResult.Number.IsUint64() {
+		return nil, errors.New("destination head block number is unavailable")
+	}
+	head := headResult.Number.Uint64()
+	if head < dstChain.Confirmations {
+		return nil, errAwaitingConfirmations
+	}
+	return new(big.Int).SetUint64(head - dstChain.Confirmations), nil
 }
 
 func (w *Worker) validateActiveDestinationConfig(ctx context.Context, packet db.PacketRecord, confirmations uint64) error {
@@ -400,18 +470,18 @@ func (w *Worker) validateActiveDestinationConfig(ctx context.Context, packet db.
 	if caller == nil {
 		return fmt.Errorf("missing destination caller for eid %d", packet.DstEID)
 	}
-	return validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations)
+	return validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, nil)
 }
 
-func validateDestinationVerificationConfig(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64) error {
-	receiveLib, err := callReceiveLibrary(ctx, caller, endpoint, packet.Receiver, packet.SrcEID)
+func validateDestinationVerificationConfig(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, blockNumber *big.Int) error {
+	receiveLib, err := callReceiveLibrary(ctx, caller, endpoint, packet.Receiver, packet.SrcEID, blockNumber)
 	if err != nil {
 		return err
 	}
 	if receiveLib != pathway.ReceiveLib {
 		return fmt.Errorf("%w: destination receive library %s does not match configured %s", errDestinationVerificationConfigMismatch, receiveLib, pathway.ReceiveLib)
 	}
-	config, err := callReceiveUlnConfig(ctx, caller, pathway.ReceiveLib, packet.Receiver, packet.SrcEID)
+	config, err := callReceiveUlnConfig(ctx, caller, pathway.ReceiveLib, packet.Receiver, packet.SrcEID, blockNumber)
 	if err != nil {
 		return err
 	}
@@ -421,7 +491,7 @@ func validateDestinationVerificationConfig(ctx context.Context, caller ContractC
 	return nil
 }
 
-func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord) (common.Hash, error) {
+func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, blockNumber *big.Int) (common.Hash, error) {
 	if endpoint == (common.Address{}) {
 		return common.Hash{}, errors.New("endpoint address is required")
 	}
@@ -435,7 +505,7 @@ func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint
 	if err != nil {
 		return common.Hash{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, nil)
+	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, blockNumber)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -453,7 +523,7 @@ func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint
 	return common.BytesToHash(value[:]), nil
 }
 
-func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, receiver common.Address, srcEID uint32) (common.Address, error) {
+func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, receiver common.Address, srcEID uint32, blockNumber *big.Int) (common.Address, error) {
 	if endpoint == (common.Address{}) {
 		return common.Address{}, errors.New("endpoint address is required")
 	}
@@ -464,7 +534,7 @@ func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, re
 	if err != nil {
 		return common.Address{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, nil)
+	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, blockNumber)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -491,7 +561,7 @@ type receiveUlnConfig struct {
 	OptionalDVNs         []common.Address `abi:"optionalDVNs"`
 }
 
-func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32) (receiveUlnConfig, error) {
+func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32, blockNumber *big.Int) (receiveUlnConfig, error) {
 	if receiveLib == (common.Address{}) {
 		return receiveUlnConfig{}, errors.New("receive lib address is required")
 	}
@@ -502,7 +572,7 @@ func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib
 	if err != nil {
 		return receiveUlnConfig{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, nil)
+	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, blockNumber)
 	if err != nil {
 		return receiveUlnConfig{}, err
 	}
@@ -564,7 +634,7 @@ func validateReceiveUlnConfig(config receiveUlnConfig, confirmations uint64, ope
 	return nil
 }
 
-func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib common.Address, headerHash, payloadHash common.Hash, dvn common.Address) (bool, uint64, error) {
+func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib common.Address, headerHash, payloadHash common.Hash, dvn common.Address, blockNumber *big.Int) (bool, uint64, error) {
 	if receiveLib == (common.Address{}) {
 		return false, 0, errors.New("receive lib address is required")
 	}
@@ -575,7 +645,7 @@ func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib commo
 	if err != nil {
 		return false, 0, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, nil)
+	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, blockNumber)
 	if err != nil {
 		return false, 0, err
 	}

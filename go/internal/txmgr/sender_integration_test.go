@@ -1006,6 +1006,60 @@ func TestStaleBroadcastReplacementUsesConfiguredDuration(t *testing.T) {
 	}
 }
 
+func TestStaleBroadcastReplacementSkipsMinedTxAwaitingConfirmations(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       35,
+		estimatedGas:       123_456,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+	}
+	manager := NewWithOptions(store, discardLogger(), Options{
+		StaleBroadcastReplacementAfter: 2 * time.Second,
+	})
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "commit-verification",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01, 0x02, 0x03},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	original, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(original) error = %v", err)
+	}
+	// The tx is mined but not yet deep, so its receipt exists while the row is
+	// still stale by time. It must not be replaced.
+	client.receipts[original.TxHash] = testReceipt(original.TxHash, types.ReceiptStatusSuccessful)
+	forceBroadcastAgeSeconds(t, id, 3)
+
+	skippedID, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target)
+	if err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement() error = %v", err)
+	}
+	if skippedID != id {
+		t.Fatalf("skipped id = %d, want %d", skippedID, id)
+	}
+	after, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(after) error = %v", err)
+	}
+	if after.TxHash != original.TxHash {
+		t.Fatal("replaced a mined tx that was only awaiting confirmation depth")
+	}
+}
+
 func TestStaleBroadcastReplacementRecoversSignedRows(t *testing.T) {
 	store := openTestStore(t)
 	signer := newTestKeystoreSigner(t)
@@ -1403,6 +1457,107 @@ func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 		`purpose=lz-receive`,
 		`receipt_status=1`,
 	)
+}
+
+func TestProcessReceiptsDefersReceiptBelowConfirmationDepth(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce: 33,
+		receipts:     make(map[common.Hash]*types.Receipt),
+		// Head is the receipt's own block, so the receipt is only 1 block deep.
+		header: &types.Header{Number: big.NewInt(1_234_567)},
+	}
+	manager := New(store, discardLogger())
+
+	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "lz-receive",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x04, 0x05},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	}); err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	id, err := manager.ProcessNext(t.Context(), testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy()))
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	outboxTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if outboxTx.Nonce >= client.pendingNonce {
+		client.pendingNonce = outboxTx.Nonce + 1
+	}
+	client.receipts[outboxTx.TxHash] = testReceipt(outboxTx.TxHash, types.ReceiptStatusSuccessful)
+
+	target := Target{ChainEID: 40161, ChainID: big.NewInt(11155111), Signer: signer, Client: client, Confirmations: 12}
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); !errors.Is(err, ErrNoReceiptUpdate) {
+		t.Fatalf("ProcessReceipts() error = %v, want ErrNoReceiptUpdate (receipt below confirmation depth)", err)
+	}
+	pending, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() after receipt error = %v", err)
+	}
+	if pending.Status != db.TxStatusBroadcast {
+		t.Fatalf("status = %q, want %q (must stay broadcast until confirmed)", pending.Status, db.TxStatusBroadcast)
+	}
+	if pending.ReceiptTxHash != (common.Hash{}) {
+		t.Fatal("receipt facts recorded before reaching confirmation depth")
+	}
+}
+
+func TestProcessReceiptsConfirmsReceiptAtConfirmationDepth(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce: 34,
+		receipts:     make(map[common.Hash]*types.Receipt),
+		// Head is 11 blocks past the receipt, so it is exactly 12 blocks deep.
+		header: &types.Header{Number: big.NewInt(1_234_567 + 11)},
+	}
+	manager := New(store, discardLogger())
+
+	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "lz-receive",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x04, 0x05},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	}); err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	id, err := manager.ProcessNext(t.Context(), testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy()))
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	outboxTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if outboxTx.Nonce >= client.pendingNonce {
+		client.pendingNonce = outboxTx.Nonce + 1
+	}
+	client.receipts[outboxTx.TxHash] = testReceipt(outboxTx.TxHash, types.ReceiptStatusSuccessful)
+
+	target := Target{ChainEID: 40161, ChainID: big.NewInt(11155111), Signer: signer, Client: client, Confirmations: 12}
+	processedID, err := manager.ProcessReceipts(t.Context(), target, 1)
+	if err != nil {
+		t.Fatalf("ProcessReceipts() error = %v", err)
+	}
+	if processedID != id {
+		t.Fatalf("processed id = %d, want %d", processedID, id)
+	}
+	confirmed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() after receipt error = %v", err)
+	}
+	if confirmed.Status != db.TxStatusConfirmed {
+		t.Fatalf("status = %q, want %q", confirmed.Status, db.TxStatusConfirmed)
+	}
 }
 
 func TestProcessReceiptsRejectsMismatchedReceiptTxHash(t *testing.T) {

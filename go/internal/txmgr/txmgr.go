@@ -26,10 +26,15 @@ type Options struct {
 
 // Target binds one configured chain RPC client to the signer that should consume its tx_outbox rows.
 type Target struct {
-	ChainEID            uint32
-	ChainID             *big.Int
-	Signer              signer.Signer
-	Client              ChainClient
+	ChainEID uint32
+	ChainID  *big.Int
+	Signer   signer.Signer
+	Client   ChainClient
+	// Confirmations is the number of blocks a receipt must be buried under
+	// before its terminal workflow state is applied, mirroring the indexer's
+	// confirmation gate so a short reorg cannot leave the database in a terminal
+	// state for a transaction the chain rolled back. Zero disables the gate.
+	Confirmations       uint64
 	FeePolicies         map[string]FeePolicy
 	MinNativeBalanceWei *big.Int
 }

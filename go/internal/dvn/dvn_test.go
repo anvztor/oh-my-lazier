@@ -397,6 +397,76 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
 	)
 }
 
+// fakeDVNDriftAtConfirmedCaller reports the configured receive library at latest
+// but a different (older) library at any historical block, simulating a recent
+// config change that has not yet reached confirmation depth.
+type fakeDVNDriftAtConfirmedCaller struct{}
+
+func (fakeDVNDriftAtConfirmedCaller) CallContract(_ context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	method, err := dvnMethodBySelector(call.Data)
+	if err != nil {
+		return nil, err
+	}
+	switch method.Name {
+	case "inboundPayloadHash":
+		return method.Outputs.Pack(common.Hash{})
+	case "getReceiveLibrary":
+		lib := common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		if blockNumber != nil {
+			lib = common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+		}
+		return method.Outputs.Pack(lib, false)
+	case "getUlnConfig":
+		return method.Outputs.Pack(defaultReceiveUlnConfig())
+	case "hashLookup":
+		return method.Outputs.Pack(true, uint64(12))
+	default:
+		return nil, fmt.Errorf("unexpected method %s", method.Name)
+	}
+}
+
+func TestProcessReadyToVerifyOnceActiveDefersConfigMismatchAtConfirmedBlock(t *testing.T) {
+	packet := testDVNPacket()
+	report := []byte(`{"status":"ready"}`)
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNReadyToVerify),
+				QuorumResult:          report,
+			},
+		}},
+	}
+	worker := NewWithClientsSettingsAndCallers(
+		store,
+		testRegistry(t, packet, config.DVNModeActive),
+		map[uint32]Settings{packet.DstEID: {SignerID: "0x8888888888888888888888888888888888888888"}},
+		map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
+		nil,
+		map[uint32]ContractCaller{packet.DstEID: fakeDVNDriftAtConfirmedCaller{}},
+		discardLogger(),
+	)
+
+	processed, err := worker.ProcessReadyToVerifyOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessReadyToVerifyOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.verifiedFromChainGUID != (common.Hash{}) {
+		t.Fatal("marked verified from a below-confirmation-depth observation")
+	}
+	if store.manualReviewGUID != (common.Hash{}) || store.pausedPathwayGUID != (common.Hash{}) {
+		t.Fatal("a historical (unconfirmed) config difference must not pause the pathway")
+	}
+	if store.deferredGUID != packet.GUID {
+		t.Fatalf("deferred guid = %s, want %s", store.deferredGUID, packet.GUID)
+	}
+}
+
 func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveLibraryDrift(t *testing.T) {
 	packet := testDVNPacket()
 	report := []byte(`{"status":"ready"}`)
@@ -584,7 +654,7 @@ func TestProcessReadyToVerifyOnceActiveMarksVerifiedWhenAlreadyCompleteOnChain(t
 						SignerID: "0x8888888888888888888888888888888888888888",
 					},
 				},
-				nil,
+				map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
 				nil,
 				map[uint32]ContractCaller{packet.DstEID: test.caller},
 				discardLogger(),

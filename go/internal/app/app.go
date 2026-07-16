@@ -609,6 +609,7 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 			ChainID:             new(big.Int).Set(configuredChain.ChainID),
 			Signer:              configuredSigner,
 			Client:              configuredChain.RPC,
+			Confirmations:       configuredChain.Confirmations,
 			FeePolicies:         cloneFeePolicies(requirement.policies),
 			MinNativeBalanceWei: bigutil.Clone(requirement.minNativeBalanceWei),
 		})

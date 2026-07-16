@@ -168,6 +168,7 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 	if err != nil {
 		return 0, err
 	}
+	var head *types.Header
 	for _, outboxTx := range broadcasts {
 		receipt, err := target.Client.TransactionReceipt(ctx, outboxTx.TxHash)
 		if errors.Is(err, ethereum.NotFound) {
@@ -178,6 +179,30 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 		}
 		if receipt.TxHash != outboxTx.TxHash {
 			return 0, fmt.Errorf("receipt tx hash %s does not match outbox tx hash %s", receipt.TxHash, outboxTx.TxHash)
+		}
+		// Do not apply an irreversible terminal workflow state until the receipt
+		// is buried under the chain's confirmation depth; a short reorg before
+		// then could otherwise leave the database terminal for a rolled-back tx.
+		if target.Confirmations > 0 {
+			if head == nil {
+				head, err = target.Client.HeaderByNumber(ctx, nil)
+				if err != nil {
+					return 0, err
+				}
+			}
+			confirmed, err := receiptConfirmed(head, receipt, target.Confirmations)
+			if err != nil {
+				return 0, err
+			}
+			if !confirmed {
+				// Refresh the row so the stale-broadcast replacement does not treat
+				// this mined-but-shallow tx as stuck in the mempool.
+				if err := m.store.RefreshBroadcastReceiptObservedAt(ctx, outboxTx.ID); err != nil {
+					return 0, err
+				}
+				m.logger.Debug("deferred tx receipt below confirmation depth", "id", outboxTx.ID, "chain_eid", target.ChainEID, "purpose", outboxTx.Purpose, "tx_hash", outboxTx.TxHash, "confirmations", target.Confirmations)
+				continue
+			}
 		}
 		facts, err := txReceiptFacts(receipt)
 		if err != nil {
@@ -232,6 +257,18 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 	if err != nil {
 		return 0, err
 	}
+	// A reserved stale row may actually be mined and only waiting to reach
+	// confirmation depth (the receipt gate keeps it in broadcast). Replacing it
+	// would broadcast a doomed same-nonce tx, so skip; PrepareNext already
+	// refreshed updated_at, keeping it out of the next stale window.
+	receipt, err := target.Client.TransactionReceipt(ctx, outboxTx.TxHash)
+	if err != nil && !errors.Is(err, ethereum.NotFound) {
+		return 0, err
+	}
+	if err == nil && receipt != nil {
+		m.logger.Debug("skipped stale replacement for a mined tx awaiting confirmations", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "tx_hash", outboxTx.TxHash)
+		return outboxTx.ID, nil
+	}
 	queued := queuedFromOutbox(outboxTx)
 	policy, ok := target.FeePolicies[outboxTx.Purpose]
 	if !ok {
@@ -282,6 +319,23 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 	}
 	m.logger.Info("broadcast stale tx replacement", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "tx_hash", signed.Hash(), "previous_tx_hash", outboxTx.TxHash)
 	return outboxTx.ID, nil
+}
+
+// receiptConfirmed reports whether a receipt is buried under at least
+// confirmations blocks relative to the latest head.
+func receiptConfirmed(head *types.Header, receipt *types.Receipt, confirmations uint64) (bool, error) {
+	if head == nil || head.Number == nil || !head.Number.IsUint64() {
+		return false, errors.New("latest header block number is unavailable")
+	}
+	if receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() {
+		return false, errors.New("receipt block number is unavailable")
+	}
+	headNumber := head.Number.Uint64()
+	receiptNumber := receipt.BlockNumber.Uint64()
+	if headNumber < receiptNumber {
+		return false, nil
+	}
+	return headNumber-receiptNumber+1 >= confirmations, nil
 }
 
 func (m *Manager) applyWorkflowReceipt(ctx context.Context, outboxTx db.OutboxTx, success bool) error {

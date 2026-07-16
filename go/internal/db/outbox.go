@@ -424,6 +424,20 @@ func (s *Store) GetOutboxTx(ctx context.Context, id int64) (OutboxTx, error) {
 	return row.toOutboxTx()
 }
 
+// RefreshBroadcastReceiptObservedAt bumps updated_at for a broadcast row whose
+// receipt has been observed but is not yet buried under the required
+// confirmation depth, so the stale-broadcast replacement mechanism does not
+// mistake a mined-but-shallow transaction for one stuck in the mempool and
+// replace it.
+func (s *Store) RefreshBroadcastReceiptObservedAt(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET updated_at = now()
+		WHERE id = $1 AND status = ANY($2)
+	`, id, []string{TxStatusSigned, TxStatusBroadcast})
+	return err
+}
+
 // ListBroadcastTx returns signed or broadcast transactions waiting for receipts for one chain signer.
 func (s *Store) ListBroadcastTx(ctx context.Context, chainEID uint32, signerID string, limit int) ([]OutboxTx, error) {
 	if chainEID == 0 {
