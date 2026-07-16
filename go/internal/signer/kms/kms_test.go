@@ -3,7 +3,9 @@ package kms
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/asn1"
 	"math/big"
+	"strings"
 	"testing"
 
 	kmstypes "github.com/aws/aws-sdk-go-v2/service/kms/types"
@@ -22,6 +24,26 @@ func TestValidateKeyRequiresSecp256k1(t *testing.T) {
 
 	if err := signer.ValidateKey(t.Context()); err == nil {
 		t.Fatal("ValidateKey() error = nil, want key spec error")
+	}
+}
+
+func TestValidateKeyRejectsAddressMismatch(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	other, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	signer := New(&fakeClient{keySpec: kmstypes.KeySpecEccSecgP256k1, key: key}, "test-key", crypto.PubkeyToAddress(other.PublicKey))
+
+	err = signer.ValidateKey(t.Context())
+	if err == nil {
+		t.Fatal("ValidateKey() error = nil, want address mismatch error")
+	}
+	if want := crypto.PubkeyToAddress(key.PublicKey).Hex(); !strings.Contains(err.Error(), want) {
+		t.Fatalf("ValidateKey() error = %q, want derived address %s", err, want)
 	}
 }
 
@@ -172,8 +194,16 @@ type fakeClient struct {
 	forceHighS bool
 }
 
-func (f *fakeClient) GetPublicKey(context.Context, string) (kmstypes.KeySpec, error) {
-	return f.keySpec, nil
+func (f *fakeClient) GetPublicKey(context.Context, string) ([]byte, kmstypes.KeySpec, error) {
+	point := crypto.FromECDSAPub(&f.key.PublicKey)
+	der, err := asn1.Marshal(subjectPublicKeyInfo{
+		Algorithm:        asn1.RawValue{Tag: asn1.TagSequence, IsCompound: true, Bytes: []byte{}},
+		SubjectPublicKey: asn1.BitString{Bytes: point, BitLength: 8 * len(point)},
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return der, f.keySpec, nil
 }
 
 func (f *fakeClient) SignDigest(_ context.Context, _ string, digest common.Hash) ([]byte, error) {
