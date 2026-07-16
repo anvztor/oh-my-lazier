@@ -131,9 +131,72 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   next_retry_at TIMESTAMPTZ,
   retry_of_id BIGINT REFERENCES tx_outbox(id),
   last_error TEXT,
+  -- Durable-attempt model (P2-A #1): the outbox owns the logical task and nonce;
+  -- each physical signed transaction is an immutable row in tx_attempts. The
+  -- columns above mirror the active attempt for existing readers.
+  active_attempt_id BIGINT,
+  -- Signing lease so only one worker instance signs a new attempt for this row.
+  lease_token UUID,
+  lease_until TIMESTAMPTZ,
+  -- When status = 'held', held_reason names why the signer lane is blocked.
+  held_reason TEXT
+    CHECK (held_reason IS NULL OR held_reason IN
+      ('nonce_reconcile_required', 'reprice_required', 'manual')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((status = 'held') = (held_reason IS NOT NULL)),
+  CHECK ((lease_token IS NULL) = (lease_until IS NULL))
 );
+
+CREATE TABLE IF NOT EXISTS tx_attempts (
+  id BIGSERIAL PRIMARY KEY,
+  outbox_id BIGINT NOT NULL REFERENCES tx_outbox(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('original', 'replacement', 'cancel')),
+  nonce BIGINT NOT NULL CHECK (nonce >= 0),
+  tx_type SMALLINT NOT NULL CHECK (tx_type IN (0, 2)),
+  tx_hash BYTEA NOT NULL CHECK (octet_length(tx_hash) = 32),
+  raw_tx BYTEA NOT NULL CHECK (octet_length(raw_tx) > 0),
+  gas_limit NUMERIC NOT NULL CHECK (gas_limit > 0),
+  max_fee_per_gas NUMERIC NOT NULL CHECK (max_fee_per_gas > 0),
+  max_priority_fee_per_gas NUMERIC
+    CHECK (
+      (tx_type = 0 AND max_priority_fee_per_gas IS NULL)
+      OR (tx_type = 2 AND max_priority_fee_per_gas > 0)
+    ),
+  state TEXT NOT NULL
+    CHECK (state IN ('signed', 'submitted', 'ambiguous', 'rejected', 'mined')),
+  send_error_class TEXT
+    CHECK (send_error_class IS NULL OR send_error_class IN
+      ('accepted', 'ambiguous', 'nonce_too_low', 'nonce_too_high',
+       'underpriced', 'retryable_env', 'definitive')),
+  send_error TEXT,
+  signing_token UUID NOT NULL,
+  broadcast_count INTEGER NOT NULL DEFAULT 0 CHECK (broadcast_count >= 0),
+  broadcast_lease_token UUID,
+  broadcast_lease_until TIMESTAMPTZ,
+  next_broadcast_at TIMESTAMPTZ,
+  last_broadcast_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tx_hash),
+  UNIQUE (outbox_id, id),
+  UNIQUE (outbox_id, signing_token),
+  CHECK ((broadcast_lease_token IS NULL) = (broadcast_lease_until IS NULL))
+);
+
+-- The active attempt must belong to the same outbox row (composite FK). The
+-- constraint is deferrable so an attempt insert and the active-pointer switch
+-- can happen in one transaction.
+ALTER TABLE tx_outbox
+  ADD CONSTRAINT tx_outbox_active_attempt_fk
+  FOREIGN KEY (id, active_attempt_id)
+  REFERENCES tx_attempts (outbox_id, id)
+  DEFERRABLE INITIALLY DEFERRED;
+
+CREATE INDEX IF NOT EXISTS idx_tx_attempts_outbox ON tx_attempts(outbox_id);
+CREATE INDEX IF NOT EXISTS idx_tx_attempts_broadcast_candidate
+  ON tx_attempts(next_broadcast_at, id)
+  WHERE state IN ('signed', 'ambiguous');
 
 CREATE TABLE IF NOT EXISTS tx_nonce_cursors (
   chain_eid INTEGER NOT NULL REFERENCES chains(eid),
