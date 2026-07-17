@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/google/uuid"
 	"github.com/islishude/oh-my-lazier/go/internal/chain"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
@@ -154,16 +155,36 @@ func TestPausePathwayForPacketAndChain(t *testing.T) {
 
 	packet := testPacketRecord()
 	cleanPacketRows(ctx, t, store, packet.GUID)
-	if _, err := store.pool.Exec(ctx, "UPDATE chains SET paused = false WHERE eid = $1", packet.SrcEID); err != nil {
-		t.Fatalf("reset chain pause: %v", err)
+	resetPause := func(ctx context.Context, store *Store) error {
+		if _, err := store.pool.Exec(ctx, "UPDATE chains SET paused = false WHERE eid = $1", packet.SrcEID); err != nil {
+			return err
+		}
+		_, err := store.pool.Exec(ctx, `
+			UPDATE pathways
+			SET paused = false
+			WHERE src_eid = $1 AND dst_eid = $2 AND src_oapp = $3 AND dst_oapp = $4
+		`, packet.SrcEID, packet.DstEID, addressBytes(packet.Sender), addressBytes(packet.Receiver))
+		return err
 	}
-	if _, err := store.pool.Exec(ctx, `
-		UPDATE pathways
-		SET paused = false
-		WHERE src_eid = $1 AND dst_eid = $2 AND src_oapp = $3 AND dst_oapp = $4
-	`, packet.SrcEID, packet.DstEID, addressBytes(packet.Sender), addressBytes(packet.Receiver)); err != nil {
-		t.Fatalf("reset pathway pause: %v", err)
+	if err := resetPause(ctx, store); err != nil {
+		t.Fatalf("reset pause: %v", err)
 	}
+	// The pause must not leak into later tests that select work on this shared
+	// chain/pathway (ListDVNWork/ListExecutorWork exclude paused rows). The test
+	// context and store are already torn down when cleanups run, so dial fresh.
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		cleanupStore, err := Connect(cleanupCtx, databaseURL)
+		if err != nil {
+			t.Errorf("cleanup connect: %v", err)
+			return
+		}
+		defer cleanupStore.Close()
+		if err := resetPause(cleanupCtx, cleanupStore); err != nil {
+			t.Errorf("cleanup reset pause: %v", err)
+		}
+	})
 	if err := store.UpsertPacket(ctx, packet); err != nil {
 		t.Fatalf("UpsertPacket() error = %v", err)
 	}
@@ -254,7 +275,7 @@ func TestMarkDVNManualReviewAndPausePathwayIsAtomic(t *testing.T) {
 	}
 }
 
-func TestClaimNextNonceAvoidsCollisions(t *testing.T) {
+func TestClaimOutboxForSigningSerializesLane(t *testing.T) {
 	databaseURL := os.Getenv("TEST_POSTGRES_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_POSTGRES_URL is not set")
@@ -287,17 +308,20 @@ func TestClaimNextNonceAvoidsCollisions(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_nonce_cursors WHERE signer_id = $1", signerID); err != nil {
 		t.Fatalf("delete test cursor: %v", err)
 	}
+	ids := make([]int64, 0, 5)
 	for range 5 {
-		if _, err := store.EnqueueTx(ctx, TxRequest{
+		id, err := store.EnqueueTx(ctx, TxRequest{
 			ChainEID: 40161,
 			Purpose:  "test",
 			To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 			Calldata: []byte{0x01, 0x02},
 			Value:    big.NewInt(0),
 			SignerID: signerID,
-		}); err != nil {
+		})
+		if err != nil {
 			t.Fatalf("EnqueueTx() error = %v", err)
 		}
+		ids = append(ids, id)
 	}
 	inserted, err := store.BootstrapTxNonceCursor(ctx, 40161, signerID, 42)
 	if err != nil {
@@ -307,34 +331,67 @@ func TestClaimNextNonceAvoidsCollisions(t *testing.T) {
 		t.Fatal("BootstrapTxNonceCursor() inserted = false, want true")
 	}
 
-	nonces := make(chan uint64, 5)
-	errs := make(chan error, 5)
+	// Concurrent signing claims across 5 queued rows: the signer lane admits
+	// exactly one in-flight nonce, so exactly one claim wins and the rest are
+	// blocked (never a duplicate or skipped nonce).
+	type result struct {
+		nonce uint64
+		err   error
+	}
+	results := make(chan result, len(ids))
 	var wg sync.WaitGroup
-	for range 5 {
+	for _, id := range ids {
 		wg.Go(func() {
-			claimed, err := store.ClaimNextNonce(ctx, 40161, signerID)
+			row, err := store.ClaimOutboxForSigning(ctx, id, 40161, signerID, uuid.New(), 30*time.Second)
 			if err != nil {
-				errs <- err
+				results <- result{err: err}
 				return
 			}
-			nonces <- claimed.Nonce
+			results <- result{nonce: row.Nonce}
 		})
 	}
 	wg.Wait()
-	close(nonces)
-	close(errs)
+	close(results)
 
-	for err := range errs {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
-	}
-	seen := make(map[uint64]struct{}, 5)
-	for nonce := range nonces {
-		seen[nonce] = struct{}{}
-	}
-	for nonce := uint64(42); nonce < 47; nonce++ {
-		if _, ok := seen[nonce]; !ok {
-			t.Fatalf("nonce %d was not assigned; assigned=%v", nonce, seen)
+	winners := 0
+	for res := range results {
+		switch {
+		case res.err == nil:
+			winners++
+			if res.nonce != 42 {
+				t.Fatalf("claimed nonce = %d, want 42", res.nonce)
+			}
+		case errors.Is(res.err, ErrSignerLaneBlocked) || errors.Is(res.err, ErrOutboxLeaseLost):
+			// Normal lane contention.
+		default:
+			t.Fatalf("ClaimOutboxForSigning() error = %v", res.err)
 		}
+	}
+	if winners != 1 {
+		t.Fatalf("winning claims = %d, want exactly 1", winners)
+	}
+
+	// Once the winner reaches broadcast, the next claim takes the next nonce.
+	var winnerID int64
+	if err := store.pool.QueryRow(ctx, `
+		SELECT id FROM tx_outbox WHERE signer_id = $1 AND status = 'nonce_assigned'
+	`, signerID).Scan(&winnerID); err != nil {
+		t.Fatalf("select winner: %v", err)
+	}
+	seedBroadcastMirror(ctx, t, store, winnerID, 42, common.HexToHash("0x4242"))
+	var nextID int64
+	for _, id := range ids {
+		if id != winnerID {
+			nextID = id
+			break
+		}
+	}
+	next, err := store.ClaimOutboxForSigning(ctx, nextID, 40161, signerID, uuid.New(), 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimOutboxForSigning(next) error = %v", err)
+	}
+	if next.Nonce != 43 {
+		t.Fatalf("next nonce = %d, want 43", next.Nonce)
 	}
 }
 
@@ -408,9 +465,9 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	if !inserted {
 		t.Fatal("BootstrapTxNonceCursor() inserted = false, want true")
 	}
-	claimed, err := store.ClaimNextNonce(ctx, 40161, signerID)
+	claimed, err := store.ClaimOutboxForSigning(ctx, firstQueuedID, 40161, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
+		t.Fatalf("ClaimOutboxForSigning() error = %v", err)
 	}
 	if claimed.ID != firstQueuedID {
 		t.Fatalf("claimed id = %d, want %d", claimed.ID, firstQueuedID)
@@ -426,6 +483,8 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	if inserted {
 		t.Fatal("BootstrapTxNonceCursor(existing) inserted = true, want false")
 	}
+	// Move the first claim to broadcast so the signer lane admits the next nonce.
+	seedBroadcastMirror(ctx, t, store, firstQueuedID, 11, common.HexToHash("0x1101"))
 	secondQueuedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
 		Purpose:  "second-queued",
@@ -437,9 +496,9 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx(second queued) error = %v", err)
 	}
-	claimed, err = store.ClaimNextNonce(ctx, 40161, signerID)
+	claimed, err = store.ClaimOutboxForSigning(ctx, secondQueuedID, 40161, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
-		t.Fatalf("ClaimNextNonce() after existing bootstrap error = %v", err)
+		t.Fatalf("ClaimOutboxForSigning() after existing bootstrap error = %v", err)
 	}
 	if claimed.ID != secondQueuedID {
 		t.Fatalf("claimed id = %d, want %d", claimed.ID, secondQueuedID)
@@ -498,23 +557,16 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
-	claimed, err := store.ClaimNextNonce(ctx, 40161, signerID)
+	claimed, err := store.ClaimOutboxForSigning(ctx, id, 40161, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
+		t.Fatalf("ClaimOutboxForSigning() error = %v", err)
 	}
 	if claimed.Nonce != 42 {
 		t.Fatalf("initial nonce = %d, want 42", claimed.Nonce)
 	}
 	txHash := common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
-	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 123_456, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
-		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
-	}
-	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
-		t.Fatalf("MarkTxBroadcast() error = %v", err)
-	}
-	if err := store.MarkTxFailed(ctx, id, errors.New("receipt reverted"), TxFailureReceiptFailed); err != nil {
-		t.Fatalf("MarkTxFailed() error = %v", err)
-	}
+	seedBroadcastMirror(ctx, t, store, id, 42, txHash)
+	seedReceiptFailed(ctx, t, store, id)
 
 	retryID, err := store.RetryFailedTx(ctx, id)
 	if err != nil {
@@ -559,9 +611,9 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 		t.Fatalf("duplicate RetryFailedTx() id = %d, want error", duplicateID)
 	}
 
-	reclaimed, err := store.ClaimNextNonce(ctx, 40161, signerID)
+	reclaimed, err := store.ClaimOutboxForSigning(ctx, retryID, 40161, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
-		t.Fatalf("ClaimNextNonce() after retry error = %v", err)
+		t.Fatalf("ClaimOutboxForSigning() after retry error = %v", err)
 	}
 	if reclaimed.ID != retryID {
 		t.Fatalf("reclaimed id = %d, want %d", reclaimed.ID, retryID)
@@ -625,8 +677,8 @@ func TestRetryFailedTxRequeuesNoNonceRowInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
-	if err := store.MarkTxFailed(ctx, id, errors.New("estimate gas reverted"), TxFailureEstimateGasRevert); err != nil {
-		t.Fatalf("MarkTxFailed() error = %v", err)
+	if applied, err := store.MarkQueuedTxEstimateRevertFailed(ctx, id, errors.New("estimate gas reverted")); err != nil || !applied {
+		t.Fatalf("MarkQueuedTxEstimateRevertFailed() = (%t, %v), want applied", applied, err)
 	}
 
 	retryID, err := store.RetryFailedTx(ctx, id)
@@ -648,94 +700,6 @@ func TestRetryFailedTxRequeuesNoNonceRowInPlace(t *testing.T) {
 	}
 	if retryTx.Attempts != 1 {
 		t.Fatalf("attempts = %d, want 1", retryTx.Attempts)
-	}
-}
-
-func TestRetryFailedTxRequeuesAssignedSignFailureInPlace(t *testing.T) {
-	databaseURL := os.Getenv("TEST_POSTGRES_URL")
-	if databaseURL == "" {
-		t.Skip("TEST_POSTGRES_URL is not set")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	store, err := Connect(ctx, databaseURL)
-	if err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-	defer store.Close()
-
-	if err := store.Migrate(ctx); err != nil {
-		t.Fatalf("Migrate() error = %v", err)
-	}
-	registry, err := chain.NewRegistry(testChains(), testPathways())
-	if err != nil {
-		t.Fatalf("NewRegistry() error = %v", err)
-	}
-	if err := store.SyncConfig(ctx, registry); err != nil {
-		t.Fatalf("SyncConfig() error = %v", err)
-	}
-
-	const signerID = "0x5555555555555555555555555555555555555555"
-	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE signer_id = $1", signerID); err != nil {
-		t.Fatalf("delete test rows: %v", err)
-	}
-	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_nonce_cursors WHERE signer_id = $1", signerID); err != nil {
-		t.Fatalf("delete test cursor: %v", err)
-	}
-	if inserted, err := store.BootstrapTxNonceCursor(ctx, 40161, signerID, 77); err != nil {
-		t.Fatalf("BootstrapTxNonceCursor() error = %v", err)
-	} else if !inserted {
-		t.Fatal("BootstrapTxNonceCursor() inserted = false, want true")
-	}
-	id, err := store.EnqueueTx(ctx, TxRequest{
-		ChainEID: 40161,
-		Purpose:  "sign-failed-retry",
-		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
-		Calldata: []byte{0x01, 0x02},
-		Value:    big.NewInt(0),
-		SignerID: signerID,
-	})
-	if err != nil {
-		t.Fatalf("EnqueueTx() error = %v", err)
-	}
-	claimed, err := store.ClaimNextNonce(ctx, 40161, signerID)
-	if err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
-	}
-	if claimed.ID != id || claimed.Nonce != 77 {
-		t.Fatalf("claimed = %d/%d, want %d/77", claimed.ID, claimed.Nonce, id)
-	}
-	if err := store.MarkTxFailed(ctx, id, errors.New("sign failed"), TxFailureSignFailed); err != nil {
-		t.Fatalf("MarkTxFailed() error = %v", err)
-	}
-
-	retryID, err := store.RetryFailedTx(ctx, id)
-	if err != nil {
-		t.Fatalf("RetryFailedTx() error = %v", err)
-	}
-	if retryID != id {
-		t.Fatalf("retry id = %d, want original id %d", retryID, id)
-	}
-	retryTx, err := store.GetOutboxTx(ctx, id)
-	if err != nil {
-		t.Fatalf("GetOutboxTx() error = %v", err)
-	}
-	if retryTx.Status != TxStatusQueued {
-		t.Fatalf("status = %q, want %q", retryTx.Status, TxStatusQueued)
-	}
-	if retryTx.Nonce != 77 {
-		t.Fatalf("nonce = %d, want 77", retryTx.Nonce)
-	}
-	if retryTx.TxHash != (common.Hash{}) {
-		t.Fatalf("tx hash = %s, want zero hash", retryTx.TxHash)
-	}
-	if retryTx.Attempts != 1 {
-		t.Fatalf("attempts = %d, want 1", retryTx.Attempts)
-	}
-	if retryTx.FailureKind != "" || retryTx.NextRetryAt != nil {
-		t.Fatalf("failure metadata = %q/%v, want cleared", retryTx.FailureKind, retryTx.NextRetryAt)
 	}
 }
 
@@ -841,14 +805,14 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 		UPDATE tx_outbox
 		SET status = $1, failure_kind = $2, next_retry_at = now() - interval '1 second', attempts = $3
 		WHERE id = $4
-	`, TxStatusFailed, TxFailureBroadcastFailed, TxAutoRetryMaxAttempts, exhaustedID); err != nil {
+	`, TxStatusFailed, TxFailureEstimateGasRevert, TxAutoRetryMaxAttempts, exhaustedID); err != nil {
 		t.Fatalf("mark exhausted: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `
 		UPDATE tx_outbox
 		SET status = $1, failure_kind = $2, next_retry_at = now() + interval '1 minute', attempts = 1
 		WHERE id = $3
-	`, TxStatusFailed, TxFailureBroadcastFailed, retryingID); err != nil {
+	`, TxStatusFailed, TxFailureEstimateGasRevert, retryingID); err != nil {
 		t.Fatalf("mark retrying: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `
@@ -1240,7 +1204,9 @@ func TestReceiptFeeAccountingStats(t *testing.T) {
 	}
 
 	packet := testPacketRecord()
-	packet.GUID = common.HexToHash("0xfeedcccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	// GUID must be unique per test: a shared GUID moves the packet between
+	// pathways across runs, breaking the other test's pathway-scoped cleanup.
+	packet.GUID = common.HexToHash("0xfeedaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	packet.SrcEID = 50121
 	packet.DstEID = 50122
 	syncDrainPathway(ctx, t, store, packet)
@@ -1267,20 +1233,29 @@ func TestReceiptFeeAccountingStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
+	// Neutralize any unpriced receipt-cost backlog other integration tests left in
+	// the shared database, so the bounded unpriced listing below surfaces this
+	// test's row.
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET receipt_gas_cost_src_wei = receipt_gas_cost_dst_wei, receipt_cost_priced_at = now()
+		WHERE receipt_gas_cost_dst_wei IS NOT NULL AND receipt_gas_cost_src_wei IS NULL
+	`); err != nil {
+		t.Fatalf("neutralize unpriced backlog: %v", err)
+	}
+	// Seed the receipt facts directly: production writes them via MarkAttemptMined,
+	// which needs a full durable-attempt flow this stats test does not exercise.
 	receiptHash := common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
-	if err := store.RecordTxReceipt(ctx, id, TxReceiptFacts{
-		TxHash:            receiptHash,
-		Status:            1,
-		BlockNumber:       1234,
-		GasUsed:           21,
-		EffectiveGasPrice: big.NewInt(5),
-		GasCostDstWei:     big.NewInt(105),
-	}); err != nil {
-		t.Fatalf("RecordTxReceipt() error = %v", err)
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET receipt_tx_hash = $1, receipt_status = 1, receipt_block_number = 1234,
+			receipt_gas_used = 21, receipt_effective_gas_price = 5,
+			receipt_gas_cost_dst_wei = 105, receipt_observed_at = now(), updated_at = now()
+		WHERE id = $2
+	`, receiptHash.Bytes(), id); err != nil {
+		t.Fatalf("seed receipt facts: %v", err)
 	}
-	if err := store.MarkTxConfirmed(ctx, id, receiptHash); err != nil {
-		t.Fatalf("MarkTxConfirmed() error = %v", err)
-	}
+	seedConfirmed(ctx, t, store, id, receiptHash)
 
 	tx, err := store.GetOutboxTx(ctx, id)
 	if err != nil {
@@ -1985,9 +1960,7 @@ func TestCheckDrainStatusAcceptsDeliveredShadowPathway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
-	if err := store.MarkTxConfirmed(ctx, id, common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")); err != nil {
-		t.Fatalf("MarkTxConfirmed() error = %v", err)
-	}
+	seedConfirmed(ctx, t, store, id, common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111"))
 
 	status, err := store.CheckDrainStatus(ctx, packet.SrcEID, packet.DstEID)
 	if err != nil {
@@ -2062,23 +2035,13 @@ func TestRetryFailedTxParksLzReceiveAtRetryBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueExecutorTx() error = %v", err)
 	}
-	if _, err := store.ClaimNextNonce(ctx, packet.DstEID, signerID); err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
-	}
 	txHash := common.HexToHash("0x3333333333333333333333333333333333333333333333333333333333333333")
-	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
-		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
-	}
-	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
-		t.Fatalf("MarkTxBroadcast() error = %v", err)
-	}
+	seedBroadcastMirror(ctx, t, store, id, 3, txHash)
 	// The lzReceive reverted: mark the job failed (bumps retry_count) and the row receipt-failed.
 	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, txHash, "reverted"); err != nil {
 		t.Fatalf("MarkExecutorReceiveFailed() error = %v", err)
 	}
-	if err := store.MarkTxFailed(ctx, id, errors.New("receipt reverted"), TxFailureReceiptFailed); err != nil {
-		t.Fatalf("MarkTxFailed() error = %v", err)
-	}
+	seedReceiptFailed(ctx, t, store, id)
 	// Simulate the budget already being exhausted and the auto-retry falling due.
 	if _, err := store.pool.Exec(ctx, "UPDATE executor_jobs SET retry_count = $1 WHERE guid = $2", MaxLzReceiveDeliveryAttempts, packet.GUID.Bytes()); err != nil {
 		t.Fatalf("bump retry_count: %v", err)
@@ -2159,22 +2122,12 @@ func TestRetryFailedTxDoesNotReactivateLzReceiveOnPausedPathway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueExecutorTx() error = %v", err)
 	}
-	if _, err := store.ClaimNextNonce(ctx, packet.DstEID, signerID); err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
-	}
 	txHash := common.HexToHash("0x5555555555555555555555555555555555555555555555555555555555555555")
-	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
-		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
-	}
-	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
-		t.Fatalf("MarkTxBroadcast() error = %v", err)
-	}
+	seedBroadcastMirror(ctx, t, store, id, 3, txHash)
 	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, txHash, "reverted"); err != nil {
 		t.Fatalf("MarkExecutorReceiveFailed() error = %v", err)
 	}
-	if err := store.MarkTxFailed(ctx, id, errors.New("receipt reverted"), TxFailureReceiptFailed); err != nil {
-		t.Fatalf("MarkTxFailed() error = %v", err)
-	}
+	seedReceiptFailed(ctx, t, store, id)
 	// The pathway is paused (retry_count is still well under the budget) and the
 	// auto-retry has fallen due.
 	if err := store.PausePathwayForPacket(ctx, packet.GUID); err != nil {
@@ -2294,7 +2247,7 @@ func TestListWorkExcludesPausedPathway(t *testing.T) {
 	}
 }
 
-func TestPrepareReplacementTxRejectsConfirmedRow(t *testing.T) {
+func TestRequestTxReplacementRejectsConfirmedRow(t *testing.T) {
 	databaseURL := os.Getenv("TEST_POSTGRES_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_POSTGRES_URL is not set")
@@ -2340,22 +2293,12 @@ func TestPrepareReplacementTxRejectsConfirmedRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
-	if _, err := store.ClaimNextNonce(ctx, 40161, signerID); err != nil {
-		t.Fatalf("ClaimNextNonce() error = %v", err)
-	}
 	txHash := common.HexToHash("0x2222222222222222222222222222222222222222222222222222222222222222")
-	if err := store.MarkTxSignedWithGasAndFees(ctx, id, txHash, 100_000, big.NewInt(2_000_000_000), big.NewInt(1_000_000_000)); err != nil {
-		t.Fatalf("MarkTxSignedWithGasAndFees() error = %v", err)
-	}
-	if err := store.MarkTxBroadcast(ctx, id, txHash); err != nil {
-		t.Fatalf("MarkTxBroadcast() error = %v", err)
-	}
-	if err := store.MarkTxConfirmed(ctx, id, txHash); err != nil {
-		t.Fatalf("MarkTxConfirmed() error = %v", err)
-	}
+	seedBroadcastMirror(ctx, t, store, id, 7, txHash)
+	seedConfirmed(ctx, t, store, id, txHash)
 
-	if err := store.PrepareReplacementTx(ctx, id); err == nil {
-		t.Fatal("PrepareReplacementTx(confirmed) error = nil, want not replaceable")
+	if err := store.RequestTxReplacement(ctx, id); err == nil {
+		t.Fatal("RequestTxReplacement(confirmed) error = nil, want not replaceable")
 	}
 	confirmed, err := store.GetOutboxTx(ctx, id)
 	if err != nil {
@@ -2481,6 +2424,50 @@ func testPacketRecord() PacketRecord {
 		PayloadHash:    common.HexToHash("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
 		Options:        []byte{0x07, 0x08},
 		Status:         string(packets.ExecutorNew),
+	}
+}
+
+// seedBroadcastMirror puts a nonce and a broadcast mirror state onto an outbox
+// row directly in SQL: production writes go through the durable-attempt flow,
+// which these workflow tests do not exercise.
+func seedBroadcastMirror(ctx context.Context, t *testing.T, store *Store, id, nonce int64, txHash common.Hash) {
+	t.Helper()
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET nonce = $2, status = 'broadcast', tx_hash = $3, gas_limit = 100000,
+			max_fee_per_gas = 2000000000, max_priority_fee_per_gas = 1000000000,
+			lease_token = NULL, lease_until = NULL, updated_at = now()
+		WHERE id = $1
+	`, id, nonce, txHash.Bytes()); err != nil {
+		t.Fatalf("seed broadcast mirror: %v", err)
+	}
+}
+
+// seedReceiptFailed marks a row failed with receipt-retry metadata directly in
+// SQL; production writes this state via FinalizeAttemptReceipt.
+func seedReceiptFailed(ctx context.Context, t *testing.T, store *Store, id int64) {
+	t.Helper()
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET status = 'failed', held_reason = NULL, failure_kind = 'receipt_failed',
+			next_retry_at = now() + interval '1 minute', last_error = 'receipt reverted', updated_at = now()
+		WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("seed receipt failed: %v", err)
+	}
+}
+
+// seedConfirmed marks a row terminal-confirmed directly in SQL; production
+// writes this state via FinalizeAttemptReceipt.
+func seedConfirmed(ctx context.Context, t *testing.T, store *Store, id int64, txHash common.Hash) {
+	t.Helper()
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE tx_outbox
+		SET status = 'confirmed', held_reason = NULL, tx_hash = $2,
+			failure_kind = NULL, next_retry_at = NULL, updated_at = now()
+		WHERE id = $1
+	`, id, txHash.Bytes()); err != nil {
+		t.Fatalf("seed confirmed: %v", err)
 	}
 }
 

@@ -65,8 +65,8 @@ func main() {
 		}
 		*id = afterID
 	case "replace":
-		if err := store.PrepareReplacementTx(ctx, *id); err != nil {
-			fmt.Fprintf(os.Stderr, "prepare replacement tx: %v\n", err)
+		if err := store.RequestTxReplacement(ctx, *id); err != nil {
+			fmt.Fprintf(os.Stderr, "request replacement tx: %v\n", err)
 			os.Exit(1)
 		}
 	default:

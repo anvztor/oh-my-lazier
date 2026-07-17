@@ -38,9 +38,29 @@ func TestClassifyBroadcastError(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := classifyBroadcastError(test.err); got != test.want {
+			got, detail := classifyBroadcastError(test.err)
+			if got != test.want {
 				t.Fatalf("classifyBroadcastError(%v) = %q, want %q", test.err, got, test.want)
 			}
+			if test.err != nil && detail == "" {
+				t.Fatalf("classifyBroadcastError(%v) returned an empty detail", test.err)
+			}
 		})
+	}
+}
+
+func TestClassifyBroadcastErrorDetailIsCanonical(t *testing.T) {
+	// The detail must never echo the raw error, which can embed RPC URLs or keys.
+	raw := errors.New("Post \"https://rpc.example/v1/SECRET-KEY\": nonce too low")
+	class, detail := classifyBroadcastError(raw)
+	if class != db.SendErrorNonceTooLow {
+		t.Fatalf("class = %q, want nonce_too_low", class)
+	}
+	if detail != "nonce too low" {
+		t.Fatalf("detail = %q, want the canonical phrase only", detail)
+	}
+	_, unknownDetail := classifyBroadcastError(errors.New("weird https://rpc.example/v1/SECRET-KEY failure"))
+	if unknownDetail != "unrecognized broadcast error" {
+		t.Fatalf("unknown detail = %q, want the fixed placeholder", unknownDetail)
 	}
 }

@@ -142,6 +142,20 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   held_reason TEXT
     CHECK (held_reason IS NULL OR held_reason IN
       ('nonce_reconcile_required', 'reprice_required', 'manual')),
+  -- Consecutive pre-sign failures (estimate, fee quote, or signing) since the
+  -- last successfully persisted attempt, counted only while the row holds a
+  -- nonce under a signing lease. At the cap the lane is held for manual review
+  -- instead of falling back to the destructive failed/requeue path, which would
+  -- release the nonce and wedge the signer.
+  pre_sign_failure_count INTEGER NOT NULL DEFAULT 0
+    CHECK (pre_sign_failure_count >= 0),
+  next_sign_at TIMESTAMPTZ,
+  -- Receipt polling fairness cursor: the poller visits non-terminal rows oldest
+  -- poll first so one receiptless attempt cannot starve the others of the batch.
+  last_receipt_poll_at TIMESTAMPTZ,
+  -- Operator-requested same-nonce replacement (txretry replace); cleared when the
+  -- replacement attempt is persisted.
+  replace_requested_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK ((status = 'held') = (held_reason IS NOT NULL)),
@@ -197,6 +211,10 @@ CREATE INDEX IF NOT EXISTS idx_tx_attempts_outbox ON tx_attempts(outbox_id);
 CREATE INDEX IF NOT EXISTS idx_tx_attempts_broadcast_candidate
   ON tx_attempts(next_broadcast_at, id)
   WHERE state IN ('signed', 'ambiguous');
+CREATE INDEX IF NOT EXISTS idx_tx_outbox_receipt_poll
+  ON tx_outbox(chain_eid, signer_id, last_receipt_poll_at ASC NULLS FIRST, id)
+  WHERE active_attempt_id IS NOT NULL
+    AND status NOT IN ('confirmed', 'failed');
 
 CREATE TABLE IF NOT EXISTS tx_nonce_cursors (
   chain_eid INTEGER NOT NULL REFERENCES chains(eid),
