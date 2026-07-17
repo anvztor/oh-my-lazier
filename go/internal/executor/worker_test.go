@@ -68,6 +68,42 @@ func TestProcessCommitterOnceEnqueuesCommitTx(t *testing.T) {
 	)
 }
 
+func TestProcessCommitterOnceSkipsInactiveSendScope(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorVerifiable)
+	logger, logs := captureLogger(slog.LevelDebug)
+	store := &fakeStore{
+		work: []db.ExecutorWorkItem{{
+			Packet: packet,
+			Job:    db.ExecutorJobRecord{GUID: packet.GUID, Status: string(packets.ExecutorVerifiable)},
+		}},
+		enqueueErr: db.ErrTxSendScopeInactive,
+	}
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeCommitReadyCaller{}},
+		logger,
+	)
+
+	// A pause committed between work selection and the enqueue is a normal
+	// skip: no error, no job transition, resumed after unpause.
+	processed, err := worker.ProcessCommitterOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessCommitterOnce() error = %v, want skipped without error", err)
+	}
+	if processed {
+		t.Fatal("processed = true, want false for an inactive send scope")
+	}
+	if store.nextStatus != "" {
+		t.Fatalf("job transitioned to %q, want untouched", store.nextStatus)
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped executor commit tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestProcessCommitterOnceMarksAssignedWaitingWhenNotVerifiable(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorAssigned)
@@ -600,6 +636,7 @@ type fakeStore struct {
 	lastError      string
 	deferredGUID   common.Hash
 	deferredStatus string
+	enqueueErr     error
 }
 
 func (s *fakeStore) ListExecutorWork(_ context.Context, status string, _ int) ([]db.ExecutorWorkItem, error) {
@@ -659,6 +696,9 @@ func (s *fakeStore) MarkExecutorDeliveredFromChain(_ context.Context, guid commo
 }
 
 func (s *fakeStore) EnqueueExecutorTx(_ context.Context, guid common.Hash, expectedStatus, nextStatus string, request db.TxRequest) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.guid = guid
 	s.expectedStatus = expectedStatus
 	s.nextStatus = nextStatus

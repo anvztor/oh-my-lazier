@@ -267,8 +267,10 @@ func (m *Manager) processOnce(ctx context.Context) (bool, error) {
 		}
 		id, err = m.ProcessNext(ctx, target)
 		if errors.Is(err, ErrNoQueuedTx) || errors.Is(err, ErrTxDeferred) ||
-			errors.Is(err, db.ErrSignerLaneBlocked) || errors.Is(err, db.ErrOutboxLeaseLost) {
-			// No signable work, a fee deferral, or normal multi-instance contention.
+			errors.Is(err, db.ErrSignerLaneBlocked) || errors.Is(err, db.ErrOutboxLeaseLost) ||
+			errors.Is(err, db.ErrTxSendScopeInactive) {
+			// No signable work, a fee deferral, normal multi-instance contention,
+			// or a pause/disable that landed between selection and the claim.
 			continue
 		}
 		if err != nil {

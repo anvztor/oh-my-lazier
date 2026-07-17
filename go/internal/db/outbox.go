@@ -151,16 +151,31 @@ func (s *Store) EnqueueTx(ctx context.Context, request TxRequest) (int64, error)
 		value = new(big.Int)
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Every purpose is gated at enqueue so a pause/disable committed before this
+	// insert never accepts new work, and a purpose outside the closed scope
+	// mapping is rejected here instead of lingering as a queued row the selector
+	// permanently filters out. The signing gate remains the final safety
+	// boundary for rows that slip in before a pause commits.
+	if err := lockTxSendScope(ctx, tx, request.ChainEID, request.Purpose, request.GUID); err != nil {
+		return 0, err
+	}
 	var id int64
-	err := s.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO tx_outbox (
 			chain_eid, purpose, guid, to_address, calldata, value,
 			signer_id, status
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id
-	`, request.ChainEID, request.Purpose, optionalBytes(request.GUID), addressBytes(request.To), request.Calldata, value.String(), request.SignerID, TxStatusQueued).Scan(&id)
-	return id, err
+	`, request.ChainEID, request.Purpose, optionalBytes(request.GUID), addressBytes(request.To), request.Calldata, value.String(), request.SignerID, TxStatusQueued).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, tx.Commit(ctx)
 }
 
 // PeekQueuedTx returns the next queued outbox row for one chain signer without reserving a nonce.
@@ -201,6 +216,10 @@ func (s *Store) peekSendableTx(ctx context.Context, chainEID uint32, signerID st
 			AND (o.next_sign_at IS NULL OR o.next_sign_at <= now())
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
 			AND o.cancel_requested_at IS NULL
+			-- Rows without a nonce whose send scope is paused/disabled are held
+			-- back here so they cannot starve active work behind them; the
+			-- signing gate re-checks the scope under share locks.
+			AND `+txSendScopeActiveSQL+`
 		ORDER BY CASE WHEN o.status = 'nonce_assigned' THEN 0 ELSE 1 END, o.nonce ASC NULLS LAST, o.id
 		LIMIT 1
 	`, chainEID, signerID, statuses).Scan(
@@ -427,17 +446,18 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var row struct {
+		ChainEID    uint32
 		Purpose     string
 		GUID        *[]byte
 		Nonce       *int64
 		FailureKind string
 	}
 	if err := tx.QueryRow(ctx, `
-		SELECT purpose, guid, nonce, COALESCE(failure_kind, '')
+		SELECT chain_eid, purpose, guid, nonce, COALESCE(failure_kind, '')
 		FROM tx_outbox
 		WHERE id = $1 AND status = $2
 		FOR UPDATE
-	`, id, TxStatusFailed).Scan(&row.Purpose, &row.GUID, &row.Nonce, &row.FailureKind); errors.Is(err, pgx.ErrNoRows) {
+	`, id, TxStatusFailed).Scan(&row.ChainEID, &row.Purpose, &row.GUID, &row.Nonce, &row.FailureKind); errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("outbox tx %d is not failed", id)
 	} else if err != nil {
 		return 0, err
@@ -463,7 +483,31 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 		return 0, fmt.Errorf("negative nonce for outbox tx %d", id)
 	}
 
-	if retryPrepared, err := prepareReceiptRetryWorkflow(ctx, tx, id, row.Purpose, row.GUID); err != nil {
+	// Cloning a receipt-failed row is new spend for its scope: while the pathway
+	// or chain is paused/disabled, defer the retry instead (nothing is cloned,
+	// the failure metadata and attempts stay untouched) so it resumes on its own
+	// once the scope is active. The lzReceive path applies the same gate inside
+	// its workflow preparation, where it can finalize the row because the
+	// deliverer owns resuming the job.
+	if row.Purpose != txPurposeExecutorLzReceive {
+		guid := []byte(nil)
+		if row.GUID != nil {
+			guid = *row.GUID
+		}
+		if err := lockTxSendScope(ctx, tx, row.ChainEID, row.Purpose, guid); err != nil {
+			if !errors.Is(err, ErrTxSendScopeInactive) {
+				return 0, err
+			}
+			if deferErr := deferFailedTxRetry(ctx, tx, id); deferErr != nil {
+				return 0, deferErr
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return 0, commitErr
+			}
+			return 0, ErrTxSendScopeInactive
+		}
+	}
+	if retryPrepared, err := prepareReceiptRetryWorkflow(ctx, tx, id, row.ChainEID, row.Purpose, row.GUID); err != nil {
 		return 0, err
 	} else if !retryPrepared {
 		if err := tx.Commit(ctx); err != nil {
@@ -498,13 +542,14 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 
 	var row struct {
 		ID          int64
+		ChainEID    uint32
 		Purpose     string
 		GUID        *[]byte
 		Nonce       *int64
 		FailureKind string
 	}
 	err = tx.QueryRow(ctx, `
-		SELECT id, purpose, guid, nonce, failure_kind
+		SELECT id, chain_eid, purpose, guid, nonce, failure_kind
 		FROM tx_outbox failed
 		WHERE chain_eid = $1
 			AND signer_id = $2
@@ -523,6 +568,7 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 		LIMIT 1
 	`, chainEID, signerID, TxStatusFailed, TxAutoRetryMaxAttempts, TxFailureEstimateGasRevert, TxFailureReceiptFailed).Scan(
 		&row.ID,
+		&row.ChainEID,
 		&row.Purpose,
 		&row.GUID,
 		&row.Nonce,
@@ -543,7 +589,27 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 		}
 		retryID = row.ID
 	case row.FailureKind == TxFailureReceiptFailed:
-		if retryPrepared, err := prepareReceiptRetryWorkflow(ctx, tx, row.ID, row.Purpose, row.GUID); err != nil {
+		// Same scope gate as RetryFailedTx: no clone while the scope is paused,
+		// only a deferred next_retry_at so the retry resumes after unpause.
+		if row.Purpose != txPurposeExecutorLzReceive {
+			guid := []byte(nil)
+			if row.GUID != nil {
+				guid = *row.GUID
+			}
+			if err := lockTxSendScope(ctx, tx, row.ChainEID, row.Purpose, guid); err != nil {
+				if !errors.Is(err, ErrTxSendScopeInactive) {
+					return 0, err
+				}
+				if deferErr := deferFailedTxRetry(ctx, tx, row.ID); deferErr != nil {
+					return 0, deferErr
+				}
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return 0, commitErr
+				}
+				return 0, ErrNoFailedTxRetry
+			}
+		}
+		if retryPrepared, err := prepareReceiptRetryWorkflow(ctx, tx, row.ID, row.ChainEID, row.Purpose, row.GUID); err != nil {
 			return 0, err
 		} else if !retryPrepared {
 			if err := tx.Commit(ctx); err != nil {
@@ -563,6 +629,17 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 		return 0, err
 	}
 	return retryID, nil
+}
+
+// deferFailedTxRetry pushes a failed row's next retry without touching its
+// failure metadata or attempt count; used while the row's send scope is paused.
+func deferFailedTxRetry(ctx context.Context, tx pgx.Tx, id int64) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE tx_outbox
+		SET next_retry_at = now() + $1::interval, updated_at = now()
+		WHERE id = $2 AND status = $3
+	`, txRetryScopeDeferDelay.String(), id, TxStatusFailed)
+	return err
 }
 
 func requeueFailedTx(ctx context.Context, tx pgx.Tx, id int64) error {
@@ -622,32 +699,7 @@ func cloneFailedTxRetry(ctx context.Context, tx pgx.Tx, id int64) (int64, error)
 	return retryID, nil
 }
 
-// lzReceiveJobPathwayActive reports whether the packet's pathway is enabled and
-// not paused and both endpoint chains are enabled and not paused. It mirrors the
-// work-selection gate so the receipt-retry re-activation path honors the same
-// pause/disable semantics.
-func lzReceiveJobPathwayActive(ctx context.Context, tx pgx.Tx, guidBytes []byte) (bool, error) {
-	var active bool
-	err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM packets p
-			WHERE p.guid = $1
-				AND EXISTS (
-					SELECT 1 FROM pathways pw
-					WHERE pw.src_eid = p.src_eid AND pw.dst_eid = p.dst_eid
-						AND pw.src_oapp = p.sender AND pw.dst_oapp = p.receiver
-						AND pw.enabled AND NOT pw.paused
-				)
-				AND NOT EXISTS (
-					SELECT 1 FROM chains c
-					WHERE c.eid IN (p.src_eid, p.dst_eid) AND (NOT c.enabled OR c.paused)
-				)
-		)
-	`, guidBytes).Scan(&active)
-	return active, err
-}
-
-func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int64, purpose string, guidBytes *[]byte) (bool, error) {
+func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int64, chainEID uint32, purpose string, guidBytes *[]byte) (bool, error) {
 	if purpose != txPurposeExecutorLzReceive || guidBytes == nil {
 		return true, nil
 	}
@@ -716,12 +768,13 @@ func prepareReceiptRetryWorkflow(ctx context.Context, tx pgx.Tx, failedTxID int6
 	// config after the failure; that would broadcast a fresh paid tx on a halted
 	// pathway. Finalize the failed row and leave the job LZ_RECEIVE_FAILED so the
 	// deliverer resumes it once the pathway is active again (the retry_count cap
-	// carries across the pause).
-	active, err := lzReceiveJobPathwayActive(ctx, tx, *guidBytes)
-	if err != nil {
+	// carries across the pause). The scope share locks serialize this decision
+	// against a concurrent pause.
+	err = lockTxSendScope(ctx, tx, chainEID, txPurposeExecutorLzReceive, *guidBytes)
+	if err != nil && !errors.Is(err, ErrTxSendScopeInactive) {
 		return false, err
 	}
-	if !active {
+	if errors.Is(err, ErrTxSendScopeInactive) {
 		if _, err := tx.Exec(ctx, `
 			UPDATE tx_outbox
 			SET failure_kind = NULL, next_retry_at = NULL, updated_at = now()

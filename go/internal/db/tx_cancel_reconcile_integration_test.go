@@ -514,9 +514,16 @@ func TestResolveExternalNonceRetryRejectsAdvancedWorkflow(t *testing.T) {
 	`, guid.Bytes()); err != nil {
 		t.Fatalf("seed job: %v", err)
 	}
-	id, err := h.store.EnqueueTx(h.ctx, TxRequest{ChainEID: 40161, Purpose: txPurposeExecutorLzReceive, GUID: guid.Bytes(), To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: h.signerID})
-	if err != nil {
-		t.Fatalf("EnqueueTx: %v", err)
+	// Seed the outbox row directly: these tests exercise the operator resolve
+	// path, not the enqueue-time send-scope gate (the harness has no pathway
+	// covering this packet).
+	var id int64
+	if err := h.store.pool.QueryRow(h.ctx, `
+		INSERT INTO tx_outbox (chain_eid, purpose, guid, to_address, calldata, value, signer_id, status)
+		VALUES (40161, $1, $2, $3, '\x01', 0, $4, 'queued')
+		RETURNING id
+	`, txPurposeExecutorLzReceive, guid.Bytes(), addressBytes(common.HexToAddress("0x22")), h.signerID).Scan(&id); err != nil {
+		t.Fatalf("seed outbox row: %v", err)
 	}
 	if _, err := h.store.pool.Exec(h.ctx, `
 		UPDATE tx_outbox SET nonce = 181, status = 'held', held_reason = 'nonce_consumed_externally' WHERE id = $1
@@ -558,9 +565,16 @@ func TestResolveExternalNonceAbandonParksWorkflow(t *testing.T) {
 	`, guid.Bytes()); err != nil {
 		t.Fatalf("seed job: %v", err)
 	}
-	id, err := h.store.EnqueueTx(h.ctx, TxRequest{ChainEID: 40161, Purpose: txPurposeExecutorLzReceive, GUID: guid.Bytes(), To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: h.signerID})
-	if err != nil {
-		t.Fatalf("EnqueueTx: %v", err)
+	// Seed the outbox row directly: these tests exercise the operator resolve
+	// path, not the enqueue-time send-scope gate (the harness has no pathway
+	// covering this packet).
+	var id int64
+	if err := h.store.pool.QueryRow(h.ctx, `
+		INSERT INTO tx_outbox (chain_eid, purpose, guid, to_address, calldata, value, signer_id, status)
+		VALUES (40161, $1, $2, $3, '\x01', 0, $4, 'queued')
+		RETURNING id
+	`, txPurposeExecutorLzReceive, guid.Bytes(), addressBytes(common.HexToAddress("0x22")), h.signerID).Scan(&id); err != nil {
+		t.Fatalf("seed outbox row: %v", err)
 	}
 	if _, err := h.store.pool.Exec(h.ctx, `
 		UPDATE tx_outbox SET nonce = 141, status = 'held', held_reason = 'nonce_consumed_externally' WHERE id = $1

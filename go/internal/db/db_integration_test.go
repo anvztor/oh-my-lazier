@@ -312,7 +312,7 @@ func TestClaimOutboxForSigningSerializesLane(t *testing.T) {
 	for range 5 {
 		id, err := store.EnqueueTx(ctx, TxRequest{
 			ChainEID: 40161,
-			Purpose:  "test",
+			Purpose:  TxPurposePricingSetPriceSnapshot,
 			To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 			Calldata: []byte{0x01, 0x02},
 			Value:    big.NewInt(0),
@@ -430,7 +430,7 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	}
 	usedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "used-nonce",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01},
 		Value:    big.NewInt(0),
@@ -448,7 +448,7 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	}
 	firstQueuedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "first-queued",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x02},
 		Value:    big.NewInt(0),
@@ -487,7 +487,7 @@ func TestBootstrapTxNonceCursorIsInsertOnlyAndUsesLocalMax(t *testing.T) {
 	seedBroadcastMirror(ctx, t, store, firstQueuedID, 11, common.HexToHash("0x1101"))
 	secondQueuedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "second-queued",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x03},
 		Value:    big.NewInt(0),
@@ -548,7 +548,7 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "retry-test",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -668,7 +668,7 @@ func TestRetryFailedTxRequeuesNoNonceRowInPlace(t *testing.T) {
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "no-nonce-retry",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -734,9 +734,9 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 		signerID           = "0x5555555555555555555555555555555555555555"
 	)
 	if _, err := store.pool.Exec(ctx, `
-		INSERT INTO chains (eid, name, chain_id, endpoint_address)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (eid) DO NOTHING
+		INSERT INTO chains (eid, name, chain_id, endpoint_address, enabled, paused)
+		VALUES ($1, $2, $3, $4, true, false)
+		ON CONFLICT (eid) DO UPDATE SET enabled = true, paused = false
 	`, retryStatsChainEID, "retry-stats-test", int64(49991), common.HexToAddress("0x9999999999999999999999999999999999999999").Bytes()); err != nil {
 		t.Fatalf("insert retry stats chain: %v", err)
 	}
@@ -748,7 +748,7 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 	}
 	exhaustedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: retryStatsChainEID,
-		Purpose:  "exhausted-retry",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01},
 		Value:    big.NewInt(0),
@@ -759,7 +759,7 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 	}
 	retryingID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: retryStatsChainEID,
-		Purpose:  "retrying",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x02},
 		Value:    big.NewInt(0),
@@ -770,7 +770,7 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 	}
 	parentID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: retryStatsChainEID,
-		Purpose:  "superseded",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x03},
 		Value:    big.NewInt(0),
@@ -781,7 +781,7 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 	}
 	neutralizedID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: retryStatsChainEID,
-		Purpose:  "neutralized",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x05},
 		Value:    big.NewInt(0),
@@ -792,7 +792,7 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 	}
 	childID, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: retryStatsChainEID,
-		Purpose:  "child",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04},
 		Value:    big.NewInt(0),
@@ -1872,7 +1872,7 @@ func TestCheckDrainStatusReportsPendingWork(t *testing.T) {
 		t.Fatalf("UpsertDVNJob() error = %v", err)
 	}
 	if _, err := store.EnqueueTx(ctx, TxRequest{
-		ChainEID: 40449,
+		ChainEID: packet.DstEID,
 		Purpose:  "executor_lz_receive",
 		GUID:     packet.GUID.Bytes(),
 		To:       common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -1949,7 +1949,7 @@ func TestCheckDrainStatusAcceptsDeliveredShadowPathway(t *testing.T) {
 		t.Fatalf("UpsertDVNJob() error = %v", err)
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
-		ChainEID: 40449,
+		ChainEID: packet.DstEID,
 		Purpose:  "executor_lz_receive",
 		GUID:     packet.GUID.Bytes(),
 		To:       common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -2284,7 +2284,7 @@ func TestRequestTxReplacementRejectsConfirmedRow(t *testing.T) {
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
 		ChainEID: 40161,
-		Purpose:  "replace-guard-test",
+		Purpose:  TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01},
 		Value:    big.NewInt(0),
@@ -2571,6 +2571,15 @@ func syncDrainPathway(ctx context.Context, t *testing.T, store *Store, packet Pa
 	}
 	if err := store.SyncConfig(ctx, registry); err != nil {
 		t.Fatalf("SyncConfig() error = %v", err)
+	}
+	// SyncConfig only manages the enabled flag; clear any paused residue a
+	// previous run's pause tests left on this pathway's scope so every test
+	// starts from an active scope.
+	if _, err := store.pool.Exec(ctx, "UPDATE chains SET paused = false WHERE eid IN ($1, $2)", packet.SrcEID, packet.DstEID); err != nil {
+		t.Fatalf("clear chain pause residue: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE pathways SET paused = false WHERE src_eid = $1 AND dst_eid = $2", packet.SrcEID, packet.DstEID); err != nil {
+		t.Fatalf("clear pathway pause residue: %v", err)
 	}
 }
 

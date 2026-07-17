@@ -66,6 +66,30 @@ func TestBotEnqueueOnceQueuesSharedPriceFeedUpdates(t *testing.T) {
 	})
 }
 
+func TestBotEnqueueOnceSkipsInactiveSendScope(t *testing.T) {
+	registry := testRegistry(t)
+	store := &fakeStore{enqueueErr: db.ErrTxSendScopeInactive}
+	logger, logs := captureLogger(slog.LevelDebug)
+	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), logger)
+	if err != nil {
+		t.Fatalf("NewWithDependencies() error = %v", err)
+	}
+	bot.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+
+	// A paused/disabled send chain skips this cycle's update without failing
+	// the pricing loop; the next cycle after unpause enqueues fresh prices.
+	if err := bot.EnqueueOnce(context.Background()); err != nil {
+		t.Fatalf("EnqueueOnce() error = %v, want skipped without error", err)
+	}
+	if len(store.requests) != 0 {
+		t.Fatalf("enqueued requests = %d, want none", len(store.requests))
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped price update tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestBotEnqueueOnceRejectsDeviationWithoutEnqueue(t *testing.T) {
 	registry := testRegistry(t)
 	store := &fakeStore{}
@@ -370,10 +394,14 @@ func TestBotEnqueueOnceRejectsConflictingSharedRoleFeeModel(t *testing.T) {
 }
 
 type fakeStore struct {
-	requests []db.TxRequest
+	requests   []db.TxRequest
+	enqueueErr error
 }
 
 func (s *fakeStore) EnqueueTx(_ context.Context, request db.TxRequest) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.requests = append(s.requests, request)
 	return int64(len(s.requests)), nil
 }

@@ -265,6 +265,12 @@ func (s *Store) EnqueueDVNVerifyTx(ctx context.Context, guid common.Hash, expect
 	if currentStatus != expectedStatus {
 		return 0, fmt.Errorf("dvn job %s status is %s, want %s", guid, currentStatus, expectedStatus)
 	}
+	// Refuse to enqueue new spend for a paused/disabled pathway or chain; the
+	// job keeps its current status and work selection re-offers it once the
+	// scope is active again.
+	if err := lockTxSendScope(ctx, tx, request.ChainEID, request.Purpose, request.GUID); err != nil {
+		return 0, err
+	}
 
 	var id int64
 	if err := tx.QueryRow(ctx, `

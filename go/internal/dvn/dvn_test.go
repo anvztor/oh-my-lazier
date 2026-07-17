@@ -322,6 +322,54 @@ func TestProcessReadyToVerifyOnceMarksWouldVerify(t *testing.T) {
 	}
 }
 
+func TestProcessReadyToVerifyOnceActiveSkipsInactiveSendScope(t *testing.T) {
+	packet := testDVNPacket()
+	logger, logs := captureLogger(slog.LevelDebug)
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNReadyToVerify),
+				QuorumResult:          []byte(`{"status":"ready"}`),
+			},
+		}},
+		enqueueErr: db.ErrTxSendScopeInactive,
+	}
+	registry := testRegistry(t, packet, config.DVNModeActive)
+	worker := NewWithClientsSettingsAndCallers(
+		store,
+		registry,
+		map[uint32]Settings{
+			packet.DstEID: {
+				SignerID: "0x8888888888888888888888888888888888888888",
+			},
+		},
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		nil,
+		map[uint32]ContractCaller{packet.DstEID: fakeDVNReconcileCaller{}},
+		logger,
+	)
+
+	// A pause committed between work selection and the enqueue is a normal
+	// skip: no error, no job transition, resumed after unpause.
+	processed, err := worker.ProcessReadyToVerifyOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessReadyToVerifyOnce() error = %v, want skipped without error", err)
+	}
+	if processed {
+		t.Fatal("processed = true, want false for an inactive send scope")
+	}
+	if store.verifyGUID != (common.Hash{}) {
+		t.Fatalf("verify enqueued for %s, want none", store.verifyGUID)
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped dvn verify tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
 	packet := testDVNPacket()
 	report := []byte(`{"status":"ready"}`)
@@ -942,6 +990,7 @@ type fakeStore struct {
 	quorumResult          []byte
 	deferredGUID          common.Hash
 	deferredStatus        string
+	enqueueErr            error
 }
 
 func (s *fakeStore) ListDVNWork(_ context.Context, status string, _ int) ([]db.DVNWorkItem, error) {
@@ -977,6 +1026,9 @@ func (s *fakeStore) MarkDVNWouldVerify(_ context.Context, guid common.Hash, _ st
 }
 
 func (s *fakeStore) EnqueueDVNVerifyTx(_ context.Context, guid common.Hash, _, _ string, request db.TxRequest, quorumResult []byte) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.verifyGUID = guid
 	s.verifyRequest = request
 	s.quorumResult = bytes.Clone(quorumResult)

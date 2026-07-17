@@ -156,15 +156,17 @@ func (s *Store) ClaimOutboxForSigning(ctx context.Context, id int64, chainEID ui
 	}
 
 	var status string
+	var purpose string
+	var guid []byte
 	var nonce *int64
 	err = tx.QueryRow(ctx, `
-		SELECT status, nonce
+		SELECT status, purpose, guid, nonce
 		FROM tx_outbox
 		WHERE id = $1 AND chain_eid = $2 AND signer_id = $3
 			AND (lease_until IS NULL OR lease_until <= now())
 			AND cancel_requested_at IS NULL
 		FOR UPDATE
-	`, id, chainEID, signerID).Scan(&status, &nonce)
+	`, id, chainEID, signerID).Scan(&status, &purpose, &guid, &nonce)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return OutboxTx{}, ErrOutboxLeaseLost
 	}
@@ -176,6 +178,14 @@ func (s *Store) ClaimOutboxForSigning(ctx context.Context, id int64, chainEID ui
 	}
 
 	if status == TxStatusQueued && nonce == nil {
+		// The send-scope gate runs before any nonce is reserved: a row whose
+		// pathway or chain is paused/disabled must not add a new nonce to the
+		// lane. Rows already holding a nonce are in flight and converge instead.
+		// The share locks taken here linearize this claim against concurrent
+		// pause/disable writers for the rest of the transaction.
+		if err := lockTxSendScope(ctx, tx, chainEID, purpose, guid); err != nil {
+			return OutboxTx{}, err
+		}
 		// A fresh nonce is one past every assigned nonce, so any signer row still
 		// short of broadcast blocks assigning it.
 		var blocked bool

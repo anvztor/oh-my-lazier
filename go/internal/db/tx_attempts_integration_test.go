@@ -46,7 +46,7 @@ func TestClaimOutboxForSigningInsertAttemptAndBarrier(t *testing.T) {
 		t.Fatalf("bootstrap: %v", err)
 	}
 	newRow := func() int64 {
-		id, err := store.EnqueueTx(ctx, TxRequest{ChainEID: 40161, Purpose: "p", To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: signerID})
+		id, err := store.EnqueueTx(ctx, TxRequest{ChainEID: 40161, Purpose: TxPurposePricingSetPriceSnapshot, To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: signerID})
 		if err != nil {
 			t.Fatalf("EnqueueTx: %v", err)
 		}
@@ -137,7 +137,7 @@ func TestClaimAttemptForBroadcastAndSendResult(t *testing.T) {
 	if _, err := store.BootstrapTxNonceCursor(ctx, 40161, signerID, 3); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
-	id, err := store.EnqueueTx(ctx, TxRequest{ChainEID: 40161, Purpose: "p", To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: signerID})
+	id, err := store.EnqueueTx(ctx, TxRequest{ChainEID: 40161, Purpose: TxPurposePricingSetPriceSnapshot, To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: signerID})
 	if err != nil {
 		t.Fatalf("EnqueueTx: %v", err)
 	}
@@ -241,7 +241,7 @@ func newAttemptHarness(t *testing.T, signerID string, bootstrapNonce uint64) *at
 
 func (h *attemptHarness) enqueue() int64 {
 	h.t.Helper()
-	id, err := h.store.EnqueueTx(h.ctx, TxRequest{ChainEID: 40161, Purpose: "p", To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: h.signerID})
+	id, err := h.store.EnqueueTx(h.ctx, TxRequest{ChainEID: 40161, Purpose: TxPurposePricingSetPriceSnapshot, To: common.HexToAddress("0x22"), Calldata: []byte{0x1}, Value: big.NewInt(0), SignerID: h.signerID})
 	if err != nil {
 		h.t.Fatalf("EnqueueTx: %v", err)
 	}

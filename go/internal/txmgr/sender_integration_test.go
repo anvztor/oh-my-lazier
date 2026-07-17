@@ -27,6 +27,47 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestProcessNextSkipsPausedChainUntilUnpause(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{pendingNonce: 20, estimatedGas: 100_000, header: dynamicHeader(), suggestedGasTipCap: big.NewInt(1_000_000_000)}
+	logger, _ := captureLogger(slog.LevelInfo)
+	manager := New(store, logger)
+
+	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	}); err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	// A pause committed after enqueue holds the queued row back from signing:
+	// no nonce is reserved and no RPC preflight runs for it.
+	setChainScopeFlags(t, 40161, true, true)
+	t.Cleanup(func() { setChainScopeFlags(t, 40161, true, false) })
+
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	if _, err := manager.ProcessNext(t.Context(), target); !errors.Is(err, ErrNoQueuedTx) {
+		t.Fatalf("ProcessNext(paused chain) error = %v, want ErrNoQueuedTx", err)
+	}
+
+	setChainScopeFlags(t, 40161, true, false)
+	id, err := manager.ProcessNext(t.Context(), target)
+	if err != nil {
+		t.Fatalf("ProcessNext(unpaused) error = %v", err)
+	}
+	signedTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if signedTx.Status != db.TxStatusSigned {
+		t.Fatalf("status = %q, want signed after unpause", signedTx.Status)
+	}
+}
+
 func TestProcessNextSignsAndBroadcastsDynamicFeeTx(t *testing.T) {
 	store := openTestStore(t)
 	signer := newTestKeystoreSigner(t)
@@ -36,7 +77,7 @@ func TestProcessNextSignsAndBroadcastsDynamicFeeTx(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -132,7 +173,7 @@ func TestProcessNextSignsAndBroadcastsDynamicFeeTx(t *testing.T) {
 		`gas_limit=123456`,
 		`dynamic_fee=true`,
 		`msg="broadcast tx attempt"`,
-		`purpose=commit-verification`,
+		`purpose=pricing_set_price_snapshot`,
 	)
 }
 
@@ -144,7 +185,7 @@ func TestProcessNextSignsLegacyTxWithSuggestedGasPrice(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -224,7 +265,7 @@ func TestProcessNextUsesExistingCursorWithoutPendingNonceAt(t *testing.T) {
 	}
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -266,7 +307,7 @@ func TestProcessNextRecoversNonceAssignedRow(t *testing.T) {
 	}
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -346,7 +387,7 @@ func TestProcessNextDefersFeeOverCapBeforeNonceAssignment(t *testing.T) {
 
 			queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 				ChainEID: 40161,
-				Purpose:  "commit-verification",
+				Purpose:  db.TxPurposePricingSetPriceSnapshot,
 				To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 				Calldata: []byte{0x01, 0x02, 0x03},
 				Value:    big.NewInt(123),
@@ -403,7 +444,7 @@ func TestProcessNextDefersEstimateGasNonRevertErrorBeforeNonceAssignment(t *test
 
 	queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -458,7 +499,7 @@ func TestProcessNextMarksEstimateGasRevertFailedBeforeNonceAssignment(t *testing
 
 	queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -536,7 +577,7 @@ func TestProcessNextLegacyGasPriceFailuresLeaveOutboxQueued(t *testing.T) {
 
 			queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 				ChainEID: 40161,
-				Purpose:  "commit-verification",
+				Purpose:  db.TxPurposePricingSetPriceSnapshot,
 				To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 				Calldata: []byte{0x01, 0x02, 0x03},
 				Value:    big.NewInt(123),
@@ -582,7 +623,7 @@ func TestProcessBroadcastAmbiguousSendKeepsAttemptTracked(t *testing.T) {
 
 	firstID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -641,7 +682,7 @@ func TestProcessBroadcastAmbiguousSendKeepsAttemptTracked(t *testing.T) {
 	// cursor nonce without any RPC nonce read.
 	secondID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05, 0x06},
 		Value:    big.NewInt(123),
@@ -686,7 +727,7 @@ func TestProcessBroadcastDefinitiveErrorHoldsLane(t *testing.T) {
 
 	heldID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -715,7 +756,7 @@ func TestProcessBroadcastDefinitiveErrorHoldsLane(t *testing.T) {
 	// The held nonce blocks every higher nonce until it is reconciled.
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05, 0x06},
 		Value:    big.NewInt(123),
@@ -749,7 +790,7 @@ func TestProcessOnceReplaysDueBroadcastBeforeQueuedTx(t *testing.T) {
 
 	ambiguousID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -767,7 +808,7 @@ func TestProcessOnceReplaysDueBroadcastBeforeQueuedTx(t *testing.T) {
 	forceAttemptBroadcastDue(t, ambiguousID)
 	queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x3333333333333333333333333333333333333333"),
 		Calldata: []byte{0x04, 0x05, 0x06},
 		Value:    big.NewInt(123),
@@ -826,7 +867,7 @@ func TestProcessOnceReplacesStaleBroadcastBeforeQueuedTx(t *testing.T) {
 
 	staleID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -848,7 +889,7 @@ func TestProcessOnceReplacesStaleBroadcastBeforeQueuedTx(t *testing.T) {
 	forceBroadcastStale(t, staleID)
 	queuedID, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x3333333333333333333333333333333333333333"),
 		Calldata: []byte{0x04, 0x05, 0x06},
 		Value:    big.NewInt(123),
@@ -943,7 +984,7 @@ func TestProcessOnceReceiptWinsOverStaleBroadcastReplacement(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -994,7 +1035,7 @@ func TestStaleBroadcastReplacementDefersWhenBumpExceedsCap(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -1070,7 +1111,7 @@ func TestStaleBroadcastReplacementUsesConfiguredDuration(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -1128,7 +1169,7 @@ func TestStaleBroadcastReplacementSkipsMinedTxAwaitingConfirmations(t *testing.T
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(0),
@@ -1182,7 +1223,7 @@ func TestStaleBroadcastReplacementSkipsUnsentSignedAttempt(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -1234,7 +1275,7 @@ func TestStaleBroadcastReplacementStopsAtReplacementCap(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -1308,7 +1349,7 @@ func TestProcessNextSignFailureRetainsAssignedNonce(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02, 0x03},
 		Value:    big.NewInt(123),
@@ -1363,7 +1404,7 @@ func TestProcessNextSignFailureRetainsAssignedNonce(t *testing.T) {
 	// The held nonce blocks fresh queued work while the backoff is pending.
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(123),
@@ -1384,7 +1425,7 @@ func TestRequestTxReplacementPreservesNonceAndBumpsFees(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -1469,7 +1510,7 @@ func TestRequestTxReplacementPreservesNonceAndRefreshesGasPrice(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -1540,7 +1581,7 @@ func TestUnderpricedSendAutoRepricesAfterCooldown(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -1805,7 +1846,7 @@ func TestNonceReconciliationPartialRPCFailureChangesNothing(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 			ChainEID: 40161,
-			Purpose:  "commit-verification",
+			Purpose:  db.TxPurposePricingSetPriceSnapshot,
 			To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 			Calldata: []byte{byte(i + 1)},
 			Value:    big.NewInt(0),
@@ -1903,7 +1944,7 @@ func TestNonceReconciliationReleasesAndParksExternally(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01},
 		Value:    big.NewInt(0),
@@ -1988,7 +2029,7 @@ func TestCancelBumpStaysCancelKind(t *testing.T) {
 
 	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "commit-verification",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -2049,7 +2090,7 @@ func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -2114,7 +2155,7 @@ func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 	assertLogContains(t, logs.String(),
 		`msg="confirmed tx receipt"`,
 		`chain_eid=40161`,
-		`purpose=lz-receive`,
+		`purpose=pricing_set_price_snapshot`,
 		`receipt_status=1`,
 	)
 }
@@ -2133,7 +2174,7 @@ func TestProcessReceiptsDefersReceiptBelowConfirmationDepth(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -2187,7 +2228,7 @@ func TestProcessReceiptsConfirmsReceiptAtConfirmationDepth(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -2239,7 +2280,7 @@ func TestProcessReceiptsRejectsMismatchedReceiptTxHash(t *testing.T) {
 
 	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
 		ChainEID: 40161,
-		Purpose:  "lz-receive",
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x04, 0x05},
 		Value:    big.NewInt(0),
@@ -3125,6 +3166,26 @@ func openTestStore(t *testing.T) *db.Store {
 	return store
 }
 
+func setChainScopeFlags(t *testing.T, eid uint32, enabled, paused bool) {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+	// A fresh context so the restore also works from t.Cleanup, after the
+	// test's own context is canceled.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("pgxpool.New() error = %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, "UPDATE chains SET enabled = $2, paused = $3 WHERE eid = $1", eid, enabled, paused); err != nil {
+		t.Fatalf("set chain scope flags: %v", err)
+	}
+}
+
 func forceRetryDue(t *testing.T, id int64) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_POSTGRES_URL")
@@ -3561,11 +3622,10 @@ func testTarget(chainEID uint32, chainID *big.Int, signer signeriface.Signer, cl
 		Signer:   signer,
 		Client:   client,
 		FeePolicies: map[string]FeePolicy{
-			"commit-verification":             policy,
-			"lz-receive":                      policy,
-			executorCommitVerificationPurpose: policy,
-			executorLzReceivePurpose:          policy,
-			dvnVerifyPurpose:                  policy,
+			db.TxPurposePricingSetPriceSnapshot: policy,
+			executorCommitVerificationPurpose:   policy,
+			executorLzReceivePurpose:            policy,
+			dvnVerifyPurpose:                    policy,
 		},
 	}
 }

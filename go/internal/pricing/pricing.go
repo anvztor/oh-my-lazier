@@ -284,6 +284,10 @@ func (b *Bot) EnqueueOnGasSpike(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if txOutboxID == 0 {
+			// The batch was skipped (paused/disabled chain); no tx to report.
+			continue
+		}
 		for _, selected := range spikes {
 			if selected.update.SrcEID != batch.SrcEID || selected.update.PriceFeed != batch.PriceFeed {
 				continue
@@ -362,6 +366,12 @@ func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBat
 		return 0, err
 	}
 	id, err := b.store.EnqueueTx(ctx, tx)
+	if errors.Is(err, db.ErrTxSendScopeInactive) {
+		// The chain was paused/disabled; skip this cycle's update for it instead
+		// of queueing snapshots that would all go stale behind the pause.
+		b.logger.Debug("skipped price update tx enqueue", "reason", "send_scope_inactive", "src_eid", srcChain.EID, "price_feed", batch.PriceFeed)
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}

@@ -82,6 +82,24 @@ func (s *Store) SyncConfig(ctx context.Context, registry *chain.Registry) error 
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Config syncs serialize globally: on a fresh database there are no rows to
+	// pre-lock, and two instances inserting the same new chains/pathways in
+	// registry map order could otherwise deadlock on the unique constraints.
+	// The (0, ...) namespace cannot collide with signer nonce locks, which
+	// always use a non-zero chain eid.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0, hashtext('config_sync'))`); err != nil {
+		return err
+	}
+	// Pre-lock every existing chain and pathway row in the same deterministic
+	// order the send-scope gates use (chains by ascending eid, then pathways),
+	// so a config sync racing a concurrent worker instance's signing/enqueue
+	// share locks cannot deadlock on the bulk updates below.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM chains ORDER BY eid FOR UPDATE`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM pathways ORDER BY src_eid, dst_eid, src_oapp, dst_oapp FOR UPDATE`); err != nil {
+		return err
+	}
 	// Disable everything first, then re-enable only what the current validated
 	// config declares. The repository keeps no compatibility burden, so a chain
 	// or pathway removed from config must not linger as an active record that

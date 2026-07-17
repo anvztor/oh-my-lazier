@@ -350,6 +350,12 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 			return false, err
 		}
 		id, err := w.store.EnqueueDVNVerifyTx(ctx, item.Packet.GUID, string(packets.DVNReadyToVerify), string(packets.DVNVerifyTxEnqueued), request, item.Job.QuorumResult)
+		if errors.Is(err, db.ErrTxSendScopeInactive) {
+			// The pathway or chain was paused/disabled between work selection and
+			// this enqueue; the job keeps its status and resumes after unpause.
+			w.logger.Debug("skipped dvn verify tx enqueue", "reason", "send_scope_inactive", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID)
+			return false, nil
+		}
 		if err != nil {
 			return false, err
 		}

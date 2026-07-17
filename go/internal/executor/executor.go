@@ -200,6 +200,12 @@ func (w *Worker) ProcessCommitterOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	id, err := w.store.EnqueueExecutorTx(ctx, item.Packet.GUID, string(packets.ExecutorVerifiable), string(packets.ExecutorCommitTxEnqueued), request)
+	if errors.Is(err, db.ErrTxSendScopeInactive) {
+		// The pathway or chain was paused/disabled between work selection and
+		// this enqueue; the job keeps its status and resumes after unpause.
+		w.logger.Debug("skipped executor commit tx enqueue", "reason", "send_scope_inactive", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -378,6 +384,12 @@ func (w *Worker) processDelivererStatus(ctx context.Context, status string) (boo
 		return w.markExecutorManualReview(ctx, item, status, err)
 	}
 	id, err := w.store.EnqueueExecutorTx(ctx, item.Packet.GUID, status, string(packets.ExecutorLzReceiveTxEnqueued), request)
+	if errors.Is(err, db.ErrTxSendScopeInactive) {
+		// The pathway or chain was paused/disabled between work selection and
+		// this enqueue; the job keeps its status and resumes after unpause.
+		w.logger.Debug("skipped executor lzReceive tx enqueue", "reason", "send_scope_inactive", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
