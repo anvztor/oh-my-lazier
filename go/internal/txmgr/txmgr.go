@@ -28,6 +28,9 @@ const (
 	DefaultSendTimeout = 15 * time.Second
 	// DefaultBroadcastLeaseTTL is how long a claimed attempt stays reserved for one sender.
 	DefaultBroadcastLeaseTTL = 45 * time.Second
+	// DefaultNonceReconcileInterval is the backoff between confirmed-nonce
+	// reconciliation passes for a signer lane with held rows.
+	DefaultNonceReconcileInterval = time.Minute
 )
 
 // Options controls tx manager runtime behavior.
@@ -45,6 +48,9 @@ type Options struct {
 	SendTimeout time.Duration
 	// BroadcastLeaseTTL is the attempt broadcast lease duration.
 	BroadcastLeaseTTL time.Duration
+	// NonceReconcileInterval is the backoff between confirmed-nonce
+	// reconciliation passes for one signer lane.
+	NonceReconcileInterval time.Duration
 }
 
 // Target binds one configured chain RPC client to the signer that should consume its tx_outbox rows.
@@ -119,6 +125,9 @@ func normalizeOptions(options Options) Options {
 	if options.BroadcastLeaseTTL <= 0 {
 		options.BroadcastLeaseTTL = DefaultBroadcastLeaseTTL
 	}
+	if options.NonceReconcileInterval <= 0 {
+		options.NonceReconcileInterval = DefaultNonceReconcileInterval
+	}
 	return options
 }
 
@@ -170,6 +179,37 @@ func (m *Manager) processOnce(ctx context.Context) (bool, error) {
 		} else {
 			processed = true
 			m.logger.Info("processed tx receipt", "id", id, "chain_eid", target.ChainEID, "signer", signerID)
+			continue
+		}
+		id, err = m.ProcessNonceReconciliation(ctx, target)
+		if errors.Is(err, db.ErrNoNonceReconcileWork) {
+			// No held lane due for reconciliation; cancel work may be due.
+		} else if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return processed, ctxErr
+			}
+			m.logger.Warn("nonce reconciliation failed", "chain_eid", target.ChainEID, "signer", signerID, "error", err.Error())
+			continue
+		} else {
+			processed = true
+			m.logger.Info("processed nonce reconciliation", "id", id, "chain_eid", target.ChainEID, "signer", signerID)
+			continue
+		}
+		id, err = m.ProcessCancelRequest(ctx, target)
+		if errors.Is(err, db.ErrNoCancelWork) || errors.Is(err, db.ErrOutboxLeaseLost) || errors.Is(err, db.ErrActiveAttemptChanged) {
+			// No due cancel request, or normal contention; broadcast work may be due.
+		} else if errors.Is(err, ErrTxDeferred) {
+			// The cancel fee would exceed configured caps; the request was pushed back.
+			continue
+		} else if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return processed, ctxErr
+			}
+			m.logger.Warn("cancel request processing failed", "chain_eid", target.ChainEID, "signer", signerID, "error", err.Error())
+			continue
+		} else {
+			processed = true
+			m.logger.Info("processed cancel request", "id", id, "chain_eid", target.ChainEID, "signer", signerID)
 			continue
 		}
 		id, err = m.ProcessBroadcast(ctx, target)

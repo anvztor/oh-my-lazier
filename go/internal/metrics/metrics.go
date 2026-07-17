@@ -333,6 +333,16 @@ func renderDBMetrics(output *strings.Builder, snapshot db.StatsSnapshot) {
 	for _, stat := range snapshot.TxOutbox {
 		fmt.Fprintf(output, "laz_tx_outbox_total{chain_eid=%q,status=%s,retry_state=%s} %d\n", uint32Label(stat.ChainEID), label(stat.Status), label(stat.RetryState), stat.Count)
 	}
+	output.WriteString("# HELP laz_tx_outbox_held_total Blocked or cancel-pending signer lanes by chain, signer, and hold reason.\n")
+	output.WriteString("# TYPE laz_tx_outbox_held_total gauge\n")
+	for _, stat := range snapshot.TxOutboxHeld {
+		fmt.Fprintf(output, "laz_tx_outbox_held_total{chain_eid=%q,signer=%s,reason=%s} %d\n", uint32Label(stat.ChainEID), label(stat.SignerID), label(stat.HeldReason), stat.Count)
+	}
+	output.WriteString("# HELP laz_tx_outbox_held_oldest_age_seconds Age of the oldest blocked or cancel-pending row by chain, signer, and hold reason.\n")
+	output.WriteString("# TYPE laz_tx_outbox_held_oldest_age_seconds gauge\n")
+	for _, stat := range snapshot.TxOutboxHeld {
+		fmt.Fprintf(output, "laz_tx_outbox_held_oldest_age_seconds{chain_eid=%q,signer=%s,reason=%s} %d\n", uint32Label(stat.ChainEID), label(stat.SignerID), label(stat.HeldReason), stat.OldestAgeSeconds)
+	}
 	output.WriteString("# HELP laz_tx_receipt_gas_cost_dst_wei Mined transaction receipt gas cost in destination-chain native wei by chain and outbox purpose.\n")
 	output.WriteString("# TYPE laz_tx_receipt_gas_cost_dst_wei gauge\n")
 	for _, stat := range snapshot.TxReceiptGasCosts {

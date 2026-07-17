@@ -13,6 +13,7 @@ type StatsSnapshot struct {
 	ExecutorJobs      []StatusStat
 	DVNJobs           []StatusStat
 	TxOutbox          []TxOutboxStat
+	TxOutboxHeld      []TxOutboxHeldStat
 	TxReceiptGasCosts []TxReceiptGasCostStat
 	WorkerFees        []WorkerFeeStat
 	IndexerCursors    []IndexerCursorStat
@@ -54,6 +55,17 @@ type TxOutboxStat struct {
 	Status     string
 	RetryState string
 	Count      uint64
+}
+
+// TxOutboxHeldStat details blocked signer lanes: held rows by chain, signer,
+// and hold reason, plus rows with pending operator cancel intent. OldestAge is
+// the age of the oldest matching row so alerting can page on stuck lanes.
+type TxOutboxHeldStat struct {
+	ChainEID         uint32
+	SignerID         string
+	HeldReason       string
+	Count            uint64
+	OldestAgeSeconds uint64
 }
 
 // TxReceiptGasCostStat sums mined receipt gas costs by destination chain and outbox purpose.
@@ -108,6 +120,10 @@ func (s *Store) Stats(ctx context.Context) (StatsSnapshot, error) {
 	if err != nil {
 		return StatsSnapshot{}, err
 	}
+	txOutboxHeld, err := s.txOutboxHeldStats(ctx)
+	if err != nil {
+		return StatsSnapshot{}, err
+	}
 	txReceiptGasCosts, err := s.txReceiptGasCostStats(ctx)
 	if err != nil {
 		return StatsSnapshot{}, err
@@ -127,6 +143,7 @@ func (s *Store) Stats(ctx context.Context) (StatsSnapshot, error) {
 		ExecutorJobs:      executorJobs,
 		DVNJobs:           dvnJobs,
 		TxOutbox:          txOutbox,
+		TxOutboxHeld:      txOutboxHeld,
 		TxReceiptGasCosts: txReceiptGasCosts,
 		WorkerFees:        workerFees,
 		IndexerCursors:    indexerCursors,
@@ -222,6 +239,46 @@ func (s *Store) statusStats(ctx context.Context, table string) ([]StatusStat, er
 		var stat StatusStat
 		if err := rows.Scan(&stat.Status, &stat.Count); err != nil {
 			return nil, err
+		}
+		stats = append(stats, stat)
+	}
+	return stats, rows.Err()
+}
+
+// txOutboxHeldStats surfaces every blocked or cancel-pending signer lane. A
+// pending cancel is reported under the synthetic reason 'cancel_requested' in
+// addition to its held reason, because a cancel can also sit on non-held rows.
+func (s *Store) txOutboxHeldStats(ctx context.Context) ([]TxOutboxHeldStat, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT chain_eid, signer_id, held_reason,
+			count(*)::bigint,
+			COALESCE(floor(extract(epoch FROM now() - min(updated_at)))::bigint, 0)
+		FROM tx_outbox
+		WHERE status = 'held'
+		GROUP BY chain_eid, signer_id, held_reason
+		UNION ALL
+		SELECT chain_eid, signer_id, 'cancel_requested',
+			count(*)::bigint,
+			COALESCE(floor(extract(epoch FROM now() - min(cancel_requested_at)))::bigint, 0)
+		FROM tx_outbox
+		WHERE cancel_requested_at IS NOT NULL
+			AND status NOT IN ('confirmed', 'failed')
+		GROUP BY chain_eid, signer_id
+		ORDER BY 1, 2, 3
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var stats []TxOutboxHeldStat
+	for rows.Next() {
+		var stat TxOutboxHeldStat
+		var oldest int64
+		if err := rows.Scan(&stat.ChainEID, &stat.SignerID, &stat.HeldReason, &stat.Count, &oldest); err != nil {
+			return nil, err
+		}
+		if oldest > 0 {
+			stat.OldestAgeSeconds = uint64(oldest)
 		}
 		stats = append(stats, stat)
 	}

@@ -29,11 +29,13 @@ const (
 	replacementBumpDenominator = int64(100)
 )
 
-// ChainClient is the tx manager's RPC boundary for first-use nonce bootstrap, fee reads, and broadcasts.
+// ChainClient is the tx manager's RPC boundary for first-use nonce bootstrap,
+// fee reads, broadcasts, and confirmed-nonce reconciliation.
 type ChainClient interface {
 	BalanceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (*big.Int, error)
 	EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error)
 	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+	NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error)
 	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
 	SuggestGasPrice(ctx context.Context) (*big.Int, error)
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
@@ -290,20 +292,46 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 	for _, task := range tasks {
 		var receipt *types.Receipt
 		var winning db.TxAttempt
-		for _, attempt := range task.Attempts {
-			candidate, err := target.Client.TransactionReceipt(ctx, attempt.TxHash)
+		if task.Outbox.ReceiptOutcome != "" {
+			// A resolution is already pinned (a prior pass crashed between the
+			// workflow and the finalizer): replay with exactly the pinned attempt.
+			for _, attempt := range task.Attempts {
+				if attempt.ID == task.Outbox.ReceiptAttemptID {
+					winning = attempt
+					break
+				}
+			}
+			if winning.ID == 0 {
+				return 0, fmt.Errorf("outbox tx %d pinned receipt attempt %d is not poll-worthy", task.Outbox.ID, task.Outbox.ReceiptAttemptID)
+			}
+			pinned, err := target.Client.TransactionReceipt(ctx, winning.TxHash)
 			if errors.Is(err, ethereum.NotFound) {
+				// Transient RPC view; the pinned resolution replays next pass.
+				if err := m.store.TouchReceiptPoll(ctx, task.Outbox.ID); err != nil {
+					return 0, err
+				}
 				continue
 			}
 			if err != nil {
 				return 0, err
 			}
-			if candidate.TxHash != attempt.TxHash {
-				return 0, fmt.Errorf("receipt tx hash %s does not match attempt tx hash %s", candidate.TxHash, attempt.TxHash)
+			receipt = pinned
+		} else {
+			for _, attempt := range task.Attempts {
+				candidate, err := target.Client.TransactionReceipt(ctx, attempt.TxHash)
+				if errors.Is(err, ethereum.NotFound) {
+					continue
+				}
+				if err != nil {
+					return 0, err
+				}
+				if candidate.TxHash != attempt.TxHash {
+					return 0, fmt.Errorf("receipt tx hash %s does not match attempt tx hash %s", candidate.TxHash, attempt.TxHash)
+				}
+				receipt = candidate
+				winning = attempt
+				break
 			}
-			receipt = candidate
-			winning = attempt
-			break
 		}
 		if err := m.store.TouchReceiptPoll(ctx, task.Outbox.ID); err != nil {
 			return 0, err
@@ -339,24 +367,38 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 		if err != nil {
 			return 0, err
 		}
-		// The idempotent workflow effects run first: until the atomic receipt
-		// finalizer commits, the attempt stays a poll candidate, so a crash or a
-		// transient error here is retried on the next pass instead of leaving the
-		// outbox stuck non-terminal with an unpollable mined attempt.
-		success := receipt.Status == types.ReceiptStatusSuccessful
-		if err := m.applyWorkflowReceipt(ctx, task.Outbox, winning.TxHash, success); err != nil {
+		// The terminal outcome is pinned once, under the row locks, BEFORE any
+		// workflow effect: the workflow application and the finalizer then consume
+		// exactly the same resolution, so a cancel request racing this pipeline
+		// cannot make them diverge, and a crash in between replays the same
+		// outcome (the attempt stays a poll candidate until the finalizer commits).
+		outcome := task.Outbox.ReceiptOutcome
+		if outcome == "" {
+			outcome, err = m.store.PrepareReceiptResolution(ctx, winning.ID, facts)
+			if errors.Is(err, db.ErrReceiptResolutionPinned) {
+				// Another instance pinned a different attempt; replay next pass.
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+		}
+		if outcome == db.ReceiptOutcomeCanceled {
+			if err := m.applyWorkflowCancel(ctx, task.Outbox); err != nil {
+				return 0, err
+			}
+		} else if err := m.applyWorkflowReceipt(ctx, task.Outbox, winning.TxHash, outcome == db.ReceiptOutcomeConfirmed); err != nil {
 			return 0, err
 		}
-		var receiptFailure error
-		if !success {
-			receiptFailure = fmt.Errorf("transaction receipt status %d", receipt.Status)
-		}
-		if err := m.store.FinalizeAttemptReceipt(ctx, winning.ID, facts, receiptFailure); err != nil {
+		if _, err := m.store.FinalizeAttemptReceipt(ctx, winning.ID, facts); err != nil {
 			return 0, err
 		}
-		if success {
+		switch outcome {
+		case db.ReceiptOutcomeConfirmed:
 			m.logger.Info("confirmed tx receipt", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", task.Outbox.Purpose, "tx_hash", winning.TxHash, "receipt_status", receipt.Status, "gas_used", facts.GasUsed, "effective_gas_price", facts.EffectiveGasPrice, "gas_cost_dst_wei", facts.GasCostDstWei)
-		} else {
+		case db.ReceiptOutcomeCanceled:
+			m.logger.Warn("canceled tx receipt", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", task.Outbox.Purpose, "tx_hash", winning.TxHash, "kind", winning.Kind, "receipt_status", receipt.Status)
+		default:
 			m.logger.Warn("failed tx receipt", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", task.Outbox.Purpose, "tx_hash", winning.TxHash, "receipt_status", receipt.Status, "gas_used", facts.GasUsed, "effective_gas_price", facts.EffectiveGasPrice, "gas_cost_dst_wei", facts.GasCostDstWei, "failure_kind", db.TxFailureReceiptFailed)
 		}
 		return task.Outbox.ID, nil
@@ -409,7 +451,14 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 	if !ok {
 		return 0, fmt.Errorf("missing fee policy for purpose %q", outboxTx.Purpose)
 	}
-	quote, gasLimit, err := m.preflight(ctx, target, queuedFromOutbox(outboxTx), policy, true)
+	// Bumping a cancel attempt must produce another cancel: rebuilding from the
+	// outbox task payload would re-send the very call the operator canceled.
+	bumpingCancel := candidate.ActiveKind == db.TxAttemptCancel
+	preflightView := queuedFromOutbox(outboxTx)
+	if bumpingCancel {
+		preflightView = cancelQueuedView(outboxTx, target.Signer.Address())
+	}
+	quote, gasLimit, err := m.preflight(ctx, target, preflightView, policy, true)
 	if err != nil {
 		if deferErr := m.store.DeferReplacement(ctx, outboxTx.ID); deferErr != nil {
 			return 0, deferErr
@@ -426,20 +475,235 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 		return 0, err
 	}
 	signCtx, cancel := context.WithTimeout(ctx, m.options.SignTimeout)
-	signed, err := signReplacementOutboxTx(signCtx, claimed, target.ChainID, gasLimit, quote, target.Signer)
+	var signed *types.Transaction
+	if bumpingCancel {
+		signed, err = signCancelTx(signCtx, claimed, target, gasLimit, quote)
+	} else {
+		signed, err = signReplacementOutboxTx(signCtx, claimed, target.ChainID, gasLimit, quote, target.Signer)
+	}
 	cancel()
 	if err != nil {
 		return m.chargePreSignFailure(ctx, target, signerID, claimed, leaseToken, "replacement_sign", err)
 	}
-	attempt, err := signedAttemptFromTx(signed, target, claimed, gasLimit, quote, db.TxAttemptReplacement)
+	var attempt db.SignedAttempt
+	if bumpingCancel {
+		attempt, err = cancelAttemptFromTx(signed, target, claimed, gasLimit, quote)
+	} else {
+		attempt, err = signedAttemptFromTx(signed, target, claimed, gasLimit, quote, db.TxAttemptReplacement)
+	}
 	if err != nil {
 		return m.chargePreSignFailure(ctx, target, signerID, claimed, leaseToken, "replacement_verify", err)
 	}
 	if _, err := m.store.InsertReplacementAttempt(ctx, outboxTx.ID, candidate.ActiveAttemptID, leaseToken, attempt); err != nil {
 		return 0, err
 	}
-	m.logger.Info("signed stale tx replacement attempt", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "tx_hash", attempt.TxHash, "previous_tx_hash", outboxTx.TxHash)
+	m.logger.Info("signed stale tx replacement attempt", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "kind", attempt.Kind, "tx_hash", attempt.TxHash, "previous_tx_hash", outboxTx.TxHash)
 	return outboxTx.ID, nil
+}
+
+// ProcessNonceReconciliation reconciles a signer lane's held
+// nonce_reconcile_required rows against the chain's confirmed account nonce.
+// All RPC reads happen outside any transaction, every outcome is applied with
+// its own compare-and-set, and any RPC error aborts the pass without touching
+// row state (the reconciliation lease is still released with its backoff).
+func (m *Manager) ProcessNonceReconciliation(ctx context.Context, target Target) (int64, error) {
+	if err := validateTarget(target); err != nil {
+		return 0, err
+	}
+	signerID := target.Signer.Address().Hex()
+	token := uuid.New()
+	holds, err := m.store.ClaimNonceReconciliation(ctx, target.ChainEID, signerID, token, m.options.SigningLeaseTTL)
+	if err != nil {
+		return 0, err
+	}
+	// ApplyNonceReconciliation releases the lease itself when it runs; this
+	// fallback covers the RPC-error paths that abort before it (only scheduling
+	// changes, never row state).
+	applied := false
+	defer func() {
+		if applied {
+			return
+		}
+		if finishErr := m.store.FinishNonceReconciliation(ctx, target.ChainEID, signerID, token, m.options.NonceReconcileInterval); finishErr != nil {
+			m.logger.Warn("failed to release nonce reconciliation lease", "chain_eid", target.ChainEID, "signer", signerID, "error", finishErr.Error())
+		}
+	}()
+
+	rpcCtx, cancel := context.WithTimeout(ctx, m.options.PreSignRPCTimeout)
+	defer cancel()
+	head, err := target.Client.HeaderByNumber(rpcCtx, nil)
+	if err != nil {
+		return 0, err
+	}
+	if head == nil || head.Number == nil || !head.Number.IsUint64() {
+		return 0, errors.New("latest header block number is unavailable")
+	}
+	// The confirmed block matches the receipt gate arithmetic
+	// (head - receipt + 1 >= confirmations): with confirmations c > 0 the newest
+	// confirmed block is head - c + 1; zero disables the gate and reads latest.
+	confirmedBlockNumber := head.Number.Uint64()
+	var confirmedBlock *big.Int
+	if target.Confirmations > 0 {
+		if confirmedBlockNumber >= target.Confirmations-1 {
+			confirmedBlockNumber -= target.Confirmations - 1
+		} else {
+			confirmedBlockNumber = 0
+		}
+		confirmedBlock = new(big.Int).SetUint64(confirmedBlockNumber)
+	}
+	confirmedNonce, err := target.Client.NonceAt(rpcCtx, target.Signer.Address(), confirmedBlock)
+	if err != nil {
+		return 0, err
+	}
+
+	// All RPC reads complete before anything is published: a receipt error here
+	// aborts the whole pass with every row untouched (the deferred finish only
+	// releases the lease with its backoff).
+	decisions := make([]db.NonceReconcileDecision, 0, len(holds))
+	for _, hold := range holds {
+		anyReceipt := false
+		for _, hash := range hold.AttemptHashes {
+			receipt, receiptErr := target.Client.TransactionReceipt(rpcCtx, hash)
+			if errors.Is(receiptErr, ethereum.NotFound) {
+				continue
+			}
+			if receiptErr != nil {
+				return 0, receiptErr
+			}
+			if receipt != nil {
+				anyReceipt = true
+				break
+			}
+		}
+		switch {
+		case anyReceipt:
+			// One of our own transactions consumed the nonce; the receipts-first
+			// path confirms and terminalizes it once it reaches depth.
+			m.logger.Debug("held nonce has an own receipt pending confirmation", "id", hold.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", hold.Nonce)
+		case confirmedNonce > hold.Nonce:
+			decisions = append(decisions, db.NonceReconcileDecision{ID: hold.ID, Action: db.NonceReconcileMarkExternal})
+			m.logger.Warn("nonce consumed externally; holding lane for operator resolution", "id", hold.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", hold.Nonce, "confirmed_nonce", confirmedNonce, "confirmed_block", confirmedBlockNumber)
+		case hold.CancelRequested && hold.ActiveKind != db.TxAttemptCancel:
+			// The nonce is still unspent and the first-cancel flow owns the row (it
+			// accepts held rows and will sign the cancel attempt).
+			m.logger.Debug("held nonce with cancel intent left to the cancel flow", "id", hold.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", hold.Nonce)
+		default:
+			// Still unspent: release back to broadcast. For a lane whose active
+			// attempt is already a cancel this resumes the same cancel raw, which
+			// no other flow owns.
+			decisions = append(decisions, db.NonceReconcileDecision{ID: hold.ID, Action: db.NonceReconcileRelease})
+			m.logger.Info("releasing nonce reconcile hold; nonce still unspent at the confirmed block", "id", hold.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", hold.Nonce, "confirmed_nonce", confirmedNonce)
+		}
+	}
+
+	result, err := m.store.ApplyNonceReconciliation(ctx, target.ChainEID, signerID, token, confirmedNonce, confirmedBlockNumber, m.options.NonceReconcileInterval, decisions)
+	if err != nil {
+		if errors.Is(err, db.ErrOutboxLeaseLost) {
+			// A newer owner took the lane; our snapshot is stale and unpublished.
+			m.logger.Debug("nonce reconciliation lease lost before applying decisions", "chain_eid", target.ChainEID, "signer", signerID)
+			return 0, db.ErrNoNonceReconcileWork
+		}
+		return 0, err
+	}
+	applied = true
+	if result.CursorForwarded {
+		m.logger.Warn("nonce cursor fast-forwarded to the confirmed chain nonce", "chain_eid", target.ChainEID, "signer", signerID, "previous_cursor", result.PreviousCursor, "confirmed_nonce", confirmedNonce)
+	}
+	if result.Changed > 0 {
+		return holds[0].ID, nil
+	}
+	return 0, db.ErrNoNonceReconcileWork
+}
+
+// ProcessCancelRequest signs the first cancel attempt (a same-nonce self
+// transfer) for a row with a due operator cancel request. ProcessBroadcast
+// sends it; fee bumps of an existing cancel attempt flow through the kind-aware
+// replacement path.
+func (m *Manager) ProcessCancelRequest(ctx context.Context, target Target) (int64, error) {
+	if err := validateTarget(target); err != nil {
+		return 0, err
+	}
+	signerID := target.Signer.Address().Hex()
+	candidate, err := m.store.NextCancelCandidate(ctx, target.ChainEID, signerID)
+	if err != nil {
+		return 0, err
+	}
+	outboxTx := candidate.Outbox
+	// A mined attempt only awaits confirmation depth; the receipt finalizer will
+	// consume the intent, so signing a doomed cancel is pointless.
+	for _, hash := range candidate.AttemptHashes {
+		receipt, receiptErr := target.Client.TransactionReceipt(ctx, hash)
+		if errors.Is(receiptErr, ethereum.NotFound) {
+			continue
+		}
+		if receiptErr != nil {
+			return 0, receiptErr
+		}
+		if receipt != nil {
+			if err := m.store.DeferCancel(ctx, outboxTx.ID); err != nil {
+				return 0, err
+			}
+			m.logger.Debug("deferred cancel for a mined attempt awaiting confirmations", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", outboxTx.Nonce, "tx_hash", hash)
+			return outboxTx.ID, nil
+		}
+	}
+	policy, ok := target.FeePolicies[outboxTx.Purpose]
+	if !ok {
+		return 0, fmt.Errorf("missing fee policy for purpose %q", outboxTx.Purpose)
+	}
+	cancelView := cancelQueuedView(outboxTx, target.Signer.Address())
+	quote, gasLimit, err := m.preflight(ctx, target, cancelView, policy, false)
+	if err != nil {
+		if deferErr := m.store.DeferCancel(ctx, outboxTx.ID); deferErr != nil {
+			return 0, deferErr
+		}
+		if errors.Is(err, ErrTxDeferred) {
+			return 0, ErrTxDeferred
+		}
+		m.logger.Warn("failed cancel preflight", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "error", err.Error())
+		return outboxTx.ID, nil
+	}
+	leaseToken := uuid.New()
+	claimed, err := m.store.ClaimOutboxForCancelSigning(ctx, outboxTx.ID, candidate.ActiveAttemptID, leaseToken, m.options.SigningLeaseTTL)
+	if err != nil {
+		return 0, err
+	}
+	signCtx, cancel := context.WithTimeout(ctx, m.options.SignTimeout)
+	signed, err := signCancelTx(signCtx, claimed, target, gasLimit, quote)
+	cancel()
+	if err != nil {
+		return m.chargePreSignFailure(ctx, target, signerID, claimed, leaseToken, "cancel_sign", err)
+	}
+	attempt, err := cancelAttemptFromTx(signed, target, claimed, gasLimit, quote)
+	if err != nil {
+		return m.chargePreSignFailure(ctx, target, signerID, claimed, leaseToken, "cancel_verify", err)
+	}
+	if _, err := m.store.InsertCancelAttempt(ctx, outboxTx.ID, candidate.ActiveAttemptID, leaseToken, attempt); err != nil {
+		return 0, err
+	}
+	m.logger.Warn("signed cancel attempt for operator request", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "purpose", outboxTx.Purpose, "nonce", outboxTx.Nonce, "tx_hash", attempt.TxHash)
+	return outboxTx.ID, nil
+}
+
+// cancelQueuedView is the preflight/signing view of a cancel: a zero-value self
+// transfer at the row's nonce, with the projected active-attempt fees as the
+// replacement bump base.
+func cancelQueuedView(outboxTx db.OutboxTx, self common.Address) db.QueuedOutboxTx {
+	nonce := outboxTx.Nonce
+	return db.QueuedOutboxTx{
+		ID:                   outboxTx.ID,
+		ChainEID:             outboxTx.ChainEID,
+		Purpose:              outboxTx.Purpose,
+		To:                   self,
+		Calldata:             nil,
+		Value:                new(big.Int),
+		GasLimit:             outboxTx.GasLimit,
+		MaxFeePerGas:         bigutil.Clone(outboxTx.MaxFeePerGas),
+		MaxPriorityFeePerGas: bigutil.Clone(outboxTx.MaxPriorityFeePerGas),
+		Nonce:                &nonce,
+		SignerID:             outboxTx.SignerID,
+		Status:               outboxTx.Status,
+	}
 }
 
 // receiptConfirmed reports whether a receipt is buried under at least
@@ -492,6 +756,35 @@ func (m *Manager) applyWorkflowReceipt(ctx context.Context, outboxTx db.OutboxTx
 				return m.store.MarkDVNVerified(ctx, guid, txHash)
 			}, packets.DVNVerified, packets.DVNManualReview)
 		}
+	}
+	return nil
+}
+
+// applyWorkflowCancel parks the owning worker job for operator review when a
+// nonce was consumed under an operator cancel: the operator abandoned this task
+// attempt, so nothing is re-enqueued automatically. Jobs that already advanced
+// past the enqueued state keep their chain outcome (the alreadyApplied sets).
+func (m *Manager) applyWorkflowCancel(ctx context.Context, outboxTx db.OutboxTx) error {
+	if len(outboxTx.GUID) != common.HashLength {
+		return nil
+	}
+	guid := common.BytesToHash(outboxTx.GUID)
+	const reason = "transaction canceled by operator"
+	switch outboxTx.Purpose {
+	case executorCommitVerificationPurpose:
+		return m.markExecutorReceipt(ctx, guid, func() error {
+			return m.store.MarkExecutorManualReview(ctx, guid, string(packets.ExecutorCommitTxEnqueued), reason)
+		}, packets.ExecutorCommitted, packets.ExecutorExecutable, packets.ExecutorLzReceiveTxEnqueued, packets.ExecutorLzReceiveFailed, packets.ExecutorDelivered, packets.ExecutorManualReview)
+	case executorLzReceivePurpose:
+		return m.markExecutorReceipt(ctx, guid, func() error {
+			return m.store.MarkExecutorManualReview(ctx, guid, string(packets.ExecutorLzReceiveTxEnqueued), reason)
+		}, packets.ExecutorLzReceiveFailed, packets.ExecutorDelivered, packets.ExecutorManualReview)
+	case dvnVerifyPurpose:
+		// Deliberately without a pathway pause: an operator cancel is not
+		// configuration drift.
+		return m.markDVNReceipt(ctx, guid, func() error {
+			return m.store.MarkDVNManualReview(ctx, guid, string(packets.DVNVerifyTxEnqueued), reason)
+		}, packets.DVNVerified, packets.DVNManualReview)
 	}
 	return nil
 }
@@ -720,18 +1013,8 @@ func signedAttemptFromTx(signed *types.Transaction, target Target, outboxTx db.O
 // a transaction other than the one requested; the raw bytes become the durable
 // broadcast source of truth, so they are checked field by field before persisting.
 func verifySignedOutboxTx(signed *types.Transaction, target Target, outboxTx db.OutboxTx, gasLimit uint64, quote feeQuote) error {
-	if signed == nil {
-		return errors.New("signed tx is required")
-	}
-	sender, err := types.Sender(types.LatestSignerForChainID(target.ChainID), signed)
-	if err != nil {
-		return fmt.Errorf("recover signed tx sender: %w", err)
-	}
-	if sender != target.Signer.Address() {
-		return fmt.Errorf("signed tx sender %s does not match signer %s", sender, target.Signer.Address())
-	}
-	if signed.Nonce() != outboxTx.Nonce {
-		return fmt.Errorf("signed tx nonce %d does not match outbox nonce %d", signed.Nonce(), outboxTx.Nonce)
+	if err := verifySignedTxCommon(signed, target, outboxTx.Nonce, gasLimit, quote); err != nil {
+		return err
 	}
 	if signed.To() == nil || *signed.To() != outboxTx.To {
 		return fmt.Errorf("signed tx destination does not match outbox tx %d", outboxTx.ID)
@@ -746,6 +1029,42 @@ func verifySignedOutboxTx(signed *types.Transaction, target Target, outboxTx db.
 	if !bytes.Equal(signed.Data(), outboxTx.Calldata) {
 		return fmt.Errorf("signed tx calldata does not match outbox tx %d", outboxTx.ID)
 	}
+	return nil
+}
+
+// verifySignedCancelTx checks a cancel attempt is exactly the requested noop: a
+// zero-value, dataless self transfer at the canceled nonce.
+func verifySignedCancelTx(signed *types.Transaction, target Target, nonce uint64, gasLimit uint64, quote feeQuote) error {
+	if err := verifySignedTxCommon(signed, target, nonce, gasLimit, quote); err != nil {
+		return err
+	}
+	self := target.Signer.Address()
+	if signed.To() == nil || *signed.To() != self {
+		return errors.New("signed cancel tx destination is not the signer itself")
+	}
+	if signed.Value() == nil || signed.Value().Sign() != 0 {
+		return errors.New("signed cancel tx value is not zero")
+	}
+	if len(signed.Data()) != 0 {
+		return errors.New("signed cancel tx carries calldata")
+	}
+	return nil
+}
+
+func verifySignedTxCommon(signed *types.Transaction, target Target, nonce, gasLimit uint64, quote feeQuote) error {
+	if signed == nil {
+		return errors.New("signed tx is required")
+	}
+	sender, err := types.Sender(types.LatestSignerForChainID(target.ChainID), signed)
+	if err != nil {
+		return fmt.Errorf("recover signed tx sender: %w", err)
+	}
+	if sender != target.Signer.Address() {
+		return fmt.Errorf("signed tx sender %s does not match signer %s", sender, target.Signer.Address())
+	}
+	if signed.Nonce() != nonce {
+		return fmt.Errorf("signed tx nonce %d does not match outbox nonce %d", signed.Nonce(), nonce)
+	}
 	if signed.Gas() != gasLimit {
 		return fmt.Errorf("signed tx gas limit %d does not match %d", signed.Gas(), gasLimit)
 	}
@@ -757,17 +1076,78 @@ func verifySignedOutboxTx(signed *types.Transaction, target Target, outboxTx db.
 			return fmt.Errorf("signed tx type %d is not a dynamic-fee tx", signed.Type())
 		}
 		if signed.GasFeeCap().Cmp(quote.MaxFeePerGas) != 0 || signed.GasTipCap().Cmp(quote.MaxPriorityFeePerGas) != 0 {
-			return fmt.Errorf("signed tx fees do not match the quote for outbox tx %d", outboxTx.ID)
+			return errors.New("signed tx fees do not match the quote")
 		}
 	} else {
 		if signed.Type() != types.LegacyTxType {
 			return fmt.Errorf("signed tx type %d is not a legacy tx", signed.Type())
 		}
 		if signed.GasPrice().Cmp(quote.MaxFeePerGas) != 0 {
-			return fmt.Errorf("signed tx gas price does not match the quote for outbox tx %d", outboxTx.ID)
+			return errors.New("signed tx gas price does not match the quote")
 		}
 	}
 	return nil
+}
+
+// signCancelTx builds and signs the same-nonce noop self transfer for a cancel.
+func signCancelTx(ctx context.Context, outboxTx db.OutboxTx, target Target, gasLimit uint64, quote feeQuote) (*types.Transaction, error) {
+	if gasLimit == 0 {
+		return nil, fmt.Errorf("outbox tx %d cancel gas limit is required", outboxTx.ID)
+	}
+	self := target.Signer.Address()
+	var tx *types.Transaction
+	if quote.Dynamic {
+		if quote.MaxFeePerGas == nil || quote.MaxFeePerGas.Sign() <= 0 || quote.MaxPriorityFeePerGas == nil || quote.MaxPriorityFeePerGas.Sign() <= 0 {
+			return nil, fmt.Errorf("outbox tx %d cancel fees are required", outboxTx.ID)
+		}
+		tx = types.NewTx(&types.DynamicFeeTx{
+			ChainID:   target.ChainID,
+			Nonce:     outboxTx.Nonce,
+			GasTipCap: quote.MaxPriorityFeePerGas,
+			GasFeeCap: quote.MaxFeePerGas,
+			Gas:       gasLimit,
+			To:        &self,
+			Value:     new(big.Int),
+		})
+	} else {
+		if quote.MaxFeePerGas == nil || quote.MaxFeePerGas.Sign() <= 0 {
+			return nil, fmt.Errorf("outbox tx %d cancel gas price is required", outboxTx.ID)
+		}
+		tx = types.NewTx(&types.LegacyTx{
+			Nonce:    outboxTx.Nonce,
+			GasPrice: quote.MaxFeePerGas,
+			Gas:      gasLimit,
+			To:       &self,
+			Value:    new(big.Int),
+		})
+	}
+	return target.Signer.SignTx(ctx, tx, target.ChainID)
+}
+
+// cancelAttemptFromTx verifies and packages a signed cancel as a durable attempt.
+func cancelAttemptFromTx(signed *types.Transaction, target Target, outboxTx db.OutboxTx, gasLimit uint64, quote feeQuote) (db.SignedAttempt, error) {
+	if err := verifySignedCancelTx(signed, target, outboxTx.Nonce, gasLimit, quote); err != nil {
+		return db.SignedAttempt{}, err
+	}
+	raw, err := signed.MarshalBinary()
+	if err != nil {
+		return db.SignedAttempt{}, fmt.Errorf("marshal signed cancel tx: %w", err)
+	}
+	var priority *big.Int
+	if quote.Dynamic {
+		priority = quote.MaxPriorityFeePerGas
+	}
+	return db.SignedAttempt{
+		Kind:                 db.TxAttemptCancel,
+		Nonce:                outboxTx.Nonce,
+		TxType:               signed.Type(),
+		TxHash:               signed.Hash(),
+		RawTx:                raw,
+		GasLimit:             gasLimit,
+		MaxFeePerGas:         quote.MaxFeePerGas,
+		MaxPriorityFeePerGas: priority,
+		SigningToken:         uuid.New(),
+	}, nil
 }
 
 func signOutboxTx(ctx context.Context, outboxTx db.OutboxTx, chainID *big.Int, gasLimit uint64, quote feeQuote, signer signer.Signer) (*types.Transaction, error) {

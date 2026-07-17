@@ -24,6 +24,7 @@ var _ interface {
 	EstimateGas(context.Context, ethereum.CallMsg) (uint64, error)
 	FilterLogs(context.Context, ethereum.FilterQuery) ([]gethtypes.Log, error)
 	HeaderByNumber(context.Context, *big.Int) (*gethtypes.Header, error)
+	NonceAt(context.Context, common.Address, *big.Int) (uint64, error)
 	PendingNonceAt(context.Context, common.Address) (uint64, error)
 	SendTransaction(context.Context, *gethtypes.Transaction) error
 	SuggestGasPrice(context.Context) (*big.Int, error)
@@ -407,6 +408,21 @@ func (c *Client) PendingNonceAt(ctx context.Context, account common.Address) (ui
 		return 0, err
 	}
 	result, err := client.PendingNonceAt(ctx, account)
+	return result, wrapProviderOperationError(index, "eth_getTransactionCount", err)
+}
+
+// NonceAt returns the first healthy provider's account nonce at the given block
+// (nil means latest); the nonce reconciler pins it to a confirmed block.
+func (c *Client) NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error) {
+	index, err := c.firstHealthyProvider()
+	if err != nil {
+		return 0, err
+	}
+	client, err := c.providerClient(ctx, index)
+	if err != nil {
+		return 0, err
+	}
+	result, err := client.NonceAt(ctx, account, blockNumber)
 	return result, wrapProviderOperationError(index, "eth_getTransactionCount", err)
 }
 

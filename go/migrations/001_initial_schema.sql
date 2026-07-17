@@ -139,7 +139,22 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   -- When status = 'held', held_reason names why the signer lane is blocked.
   held_reason TEXT
     CHECK (held_reason IS NULL OR held_reason IN
-      ('nonce_reconcile_required', 'reprice_required', 'manual')),
+      ('nonce_reconcile_required', 'reprice_required', 'manual',
+       'nonce_consumed_externally')),
+  -- Operator cancel intent (txretry cancel-nonce). It persists until the final
+  -- receipt terminalization: every send/replacement entry point must refuse to
+  -- advance the original task while it is set, and only cancel attempts fly.
+  cancel_requested_at TIMESTAMPTZ,
+  -- Persistent receipt resolution, derived once under the row locks when a
+  -- confirmation-depth receipt is first observed. The workflow application and
+  -- the terminal finalizer both consume exactly this pinned outcome/attempt, so
+  -- a cancel request racing the receipt pipeline cannot make them diverge, and
+  -- a crash between them replays the same resolution.
+  receipt_outcome TEXT
+    CHECK (receipt_outcome IS NULL OR receipt_outcome IN
+      ('confirmed', 'receipt_failed', 'canceled')),
+  receipt_attempt_id BIGINT,
+  CHECK ((receipt_outcome IS NULL) = (receipt_attempt_id IS NULL)),
   -- Consecutive pre-sign failures (estimate, fee quote, or signing) since the
   -- last successfully persisted attempt, counted only while the row holds a
   -- nonce under a signing lease. At the cap the lane is held for manual review
@@ -218,9 +233,16 @@ CREATE TABLE IF NOT EXISTS tx_nonce_cursors (
   chain_eid INTEGER NOT NULL REFERENCES chains(eid),
   signer_id TEXT NOT NULL,
   next_nonce BIGINT NOT NULL CHECK (next_nonce >= 0),
+  -- Nonce reconciliation scheduling: one instance claims the signer lane for a
+  -- confirmed-block NonceAt pass, and the backoff keeps held rows from hitting
+  -- the RPC on every manager pass.
+  reconcile_lease_token UUID,
+  reconcile_lease_until TIMESTAMPTZ,
+  next_reconcile_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY(chain_eid, signer_id)
+  PRIMARY KEY(chain_eid, signer_id),
+  CHECK ((reconcile_lease_token IS NULL) = (reconcile_lease_until IS NULL))
 );
 
 CREATE TABLE IF NOT EXISTS indexer_cursors (

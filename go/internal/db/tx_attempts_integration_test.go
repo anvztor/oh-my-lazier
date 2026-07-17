@@ -588,7 +588,7 @@ func TestFinalizeAttemptReceiptSwitchesActiveAndTerminalizes(t *testing.T) {
 
 	// The receipt hash must match the attempt being terminalized.
 	badFacts := TxReceiptFacts{TxHash: replacement.TxHash, Status: 1, BlockNumber: 100, GasUsed: 21000, EffectiveGasPrice: big.NewInt(1_000_000_000), GasCostDstWei: new(big.Int).Mul(big.NewInt(21000), big.NewInt(1_000_000_000))}
-	if err := h.store.FinalizeAttemptReceipt(h.ctx, original.ID, badFacts, nil); err == nil {
+	if _, err := h.store.FinalizeAttemptReceipt(h.ctx, original.ID, badFacts); err == nil {
 		t.Fatal("FinalizeAttemptReceipt with a mismatched hash succeeded")
 	}
 
@@ -597,8 +597,11 @@ func TestFinalizeAttemptReceiptSwitchesActiveAndTerminalizes(t *testing.T) {
 	// cleanup), so no crash window can strand a mined-but-non-terminal row.
 	facts := badFacts
 	facts.TxHash = original.TxHash
-	if err := h.store.FinalizeAttemptReceipt(h.ctx, original.ID, facts, nil); err != nil {
-		t.Fatalf("FinalizeAttemptReceipt: %v", err)
+	if outcome, err := h.store.PrepareReceiptResolution(h.ctx, original.ID, facts); err != nil || outcome != ReceiptOutcomeConfirmed {
+		t.Fatalf("PrepareReceiptResolution = (%q, %v), want confirmed", outcome, err)
+	}
+	if outcome, err := h.store.FinalizeAttemptReceipt(h.ctx, original.ID, facts); err != nil || outcome != ReceiptOutcomeConfirmed {
+		t.Fatalf("FinalizeAttemptReceipt = (%q, %v), want confirmed", outcome, err)
 	}
 	var attemptState string
 	if err := h.store.pool.QueryRow(h.ctx, `SELECT state FROM tx_attempts WHERE id = $1`, original.ID).Scan(&attemptState); err != nil {
@@ -652,8 +655,11 @@ func TestFinalizeAttemptReceiptFailedReceiptKeepsRetryMetadata(t *testing.T) {
 	h.broadcastResult(attempt.ID, SendErrorAccepted)
 
 	facts := TxReceiptFacts{TxHash: attempt.TxHash, Status: 0, BlockNumber: 200, GasUsed: 21000, EffectiveGasPrice: big.NewInt(1_000_000_000), GasCostDstWei: new(big.Int).Mul(big.NewInt(21000), big.NewInt(1_000_000_000))}
-	if err := h.store.FinalizeAttemptReceipt(h.ctx, attempt.ID, facts, errors.New("transaction receipt status 0")); err != nil {
-		t.Fatalf("FinalizeAttemptReceipt: %v", err)
+	if outcome, err := h.store.PrepareReceiptResolution(h.ctx, attempt.ID, facts); err != nil || outcome != ReceiptOutcomeFailed {
+		t.Fatalf("PrepareReceiptResolution = (%q, %v), want receipt_failed", outcome, err)
+	}
+	if outcome, err := h.store.FinalizeAttemptReceipt(h.ctx, attempt.ID, facts); err != nil || outcome != ReceiptOutcomeFailed {
+		t.Fatalf("FinalizeAttemptReceipt = (%q, %v), want receipt_failed", outcome, err)
 	}
 	after, err := h.store.GetOutboxTx(h.ctx, id)
 	if err != nil {

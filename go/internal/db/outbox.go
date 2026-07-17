@@ -105,6 +105,9 @@ type OutboxTx struct {
 	FailureKind              string
 	NextRetryAt              *time.Time
 	RetryOfID                *int64
+	CancelRequestedAt        *time.Time
+	ReceiptOutcome           string
+	ReceiptAttemptID         int64
 }
 
 // QueuedOutboxTx is a queued transaction request before the tx manager decides whether to sign it.
@@ -190,12 +193,14 @@ func (s *Store) peekSendableTx(ctx context.Context, chainEID uint32, signerID st
 			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
 			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
 			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
-			o.receipt_observed_at, o.receipt_cost_priced_at
+			o.receipt_observed_at, o.receipt_cost_priced_at, o.cancel_requested_at,
+			o.receipt_outcome, o.receipt_attempt_id
 		FROM tx_outbox o
 		LEFT JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
 		WHERE o.chain_eid = $1 AND o.signer_id = $2 AND o.status = ANY($3)
 			AND (o.next_sign_at IS NULL OR o.next_sign_at <= now())
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
+			AND o.cancel_requested_at IS NULL
 		ORDER BY CASE WHEN o.status = 'nonce_assigned' THEN 0 ELSE 1 END, o.nonce ASC NULLS LAST, o.id
 		LIMIT 1
 	`, chainEID, signerID, statuses).Scan(
@@ -226,6 +231,9 @@ func (s *Store) peekSendableTx(ctx context.Context, chainEID uint32, signerID st
 		&row.ReceiptGasCostSrcWei,
 		&row.ReceiptObservedAt,
 		&row.ReceiptCostPricedAt,
+		&row.CancelRequestedAt,
+		&row.ReceiptOutcome,
+		&row.ReceiptAttemptID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return QueuedOutboxTx{}, pgx.ErrNoRows
@@ -293,7 +301,8 @@ func (s *Store) GetOutboxTx(ctx context.Context, id int64) (OutboxTx, error) {
 			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
 			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
 			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
-			o.receipt_observed_at, o.receipt_cost_priced_at
+			o.receipt_observed_at, o.receipt_cost_priced_at, o.cancel_requested_at,
+			o.receipt_outcome, o.receipt_attempt_id
 		FROM tx_outbox o
 		LEFT JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
 		WHERE o.id = $1
@@ -325,6 +334,9 @@ func (s *Store) GetOutboxTx(ctx context.Context, id int64) (OutboxTx, error) {
 		&row.ReceiptGasCostSrcWei,
 		&row.ReceiptObservedAt,
 		&row.ReceiptCostPricedAt,
+		&row.CancelRequestedAt,
+		&row.ReceiptOutcome,
+		&row.ReceiptAttemptID,
 	)
 	if err != nil {
 		return OutboxTx{}, err
@@ -429,6 +441,13 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 		return 0, fmt.Errorf("outbox tx %d is not failed", id)
 	} else if err != nil {
 		return 0, err
+	}
+
+	// A canceled row was abandoned by the operator, and an externally consumed
+	// nonce can only be re-executed through resolve-external-nonce; requeueing
+	// either in place would try to reuse a consumed nonce.
+	if row.FailureKind == TxFailureCanceled || row.FailureKind == TxFailureNonceConsumedExternally {
+		return 0, fmt.Errorf("outbox tx %d failure kind %s is not retryable", id, row.FailureKind)
 	}
 
 	if row.Nonce == nil || row.FailureKind != TxFailureReceiptFailed {
@@ -834,6 +853,9 @@ type outboxTxRow struct {
 	ReceiptGasCostSrcWei     *string
 	ReceiptObservedAt        *time.Time
 	ReceiptCostPricedAt      *time.Time
+	CancelRequestedAt        *time.Time
+	ReceiptOutcome           *string
+	ReceiptAttemptID         *int64
 }
 
 func (r outboxTxRow) toOutboxTx() (OutboxTx, error) {
@@ -901,7 +923,17 @@ func (r outboxTxRow) toOutboxTx() (OutboxTx, error) {
 		FailureKind:              queued.FailureKind,
 		NextRetryAt:              cloneOptionalTime(queued.NextRetryAt),
 		RetryOfID:                cloneOptionalInt64(queued.RetryOfID),
+		CancelRequestedAt:        cloneOptionalTime(r.CancelRequestedAt),
+		ReceiptOutcome:           optionalStringValue(r.ReceiptOutcome),
+		ReceiptAttemptID:         optionalInt64Value(r.ReceiptAttemptID),
 	}, nil
+}
+
+func optionalInt64Value(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (r outboxTxRow) toQueuedOutboxTx() (QueuedOutboxTx, error) {

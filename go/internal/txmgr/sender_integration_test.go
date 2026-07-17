@@ -17,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/google/uuid"
 	"github.com/islishude/oh-my-lazier/go/internal/chain"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
@@ -1603,6 +1604,439 @@ func TestUnderpricedSendAutoRepricesAfterCooldown(t *testing.T) {
 	}
 }
 
+func TestCancelNonceEndToEnd(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       61,
+		estimatedGas:       111_111,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+	}
+	manager := New(store, discardLogger())
+	packet := testExecutorPacket(t)
+	packet.Status = string(packets.ExecutorExecutable)
+	if err := store.UpsertPacket(t.Context(), packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(t.Context(), db.ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+	id, err := store.EnqueueExecutorTx(
+		t.Context(),
+		packet.GUID,
+		string(packets.ExecutorExecutable),
+		string(packets.ExecutorLzReceiveTxEnqueued),
+		db.TxRequest{
+			ChainEID: packet.DstEID,
+			Purpose:  executorLzReceivePurpose,
+			GUID:     packet.GUID.Bytes(),
+			To:       packet.Receiver,
+			Calldata: []byte{0x04, 0x05},
+			Value:    big.NewInt(0),
+			SignerID: signer.Address().Hex(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("EnqueueExecutorTx() error = %v", err)
+	}
+	target := testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	original, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(original) error = %v", err)
+	}
+
+	if err := store.RequestTxCancel(t.Context(), id); err != nil {
+		t.Fatalf("RequestTxCancel() error = %v", err)
+	}
+	cancelID, err := manager.ProcessCancelRequest(t.Context(), target)
+	if err != nil {
+		t.Fatalf("ProcessCancelRequest() error = %v", err)
+	}
+	if cancelID != id {
+		t.Fatalf("cancel id = %d, want %d", cancelID, id)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(cancel) error = %v", err)
+	}
+	if len(client.sent) != 2 {
+		t.Fatalf("sent tx count = %d, want the task then the cancel", len(client.sent))
+	}
+	cancelTx := client.sent[1]
+	if cancelTx.To() == nil || *cancelTx.To() != signer.Address() {
+		t.Fatalf("cancel destination = %v, want the signer itself", cancelTx.To())
+	}
+	if cancelTx.Value().Sign() != 0 || len(cancelTx.Data()) != 0 {
+		t.Fatalf("cancel tx value/data = %s/%d bytes, want zero-value dataless noop", cancelTx.Value(), len(cancelTx.Data()))
+	}
+	if cancelTx.Nonce() != original.Nonce {
+		t.Fatalf("cancel nonce = %d, want the held nonce %d", cancelTx.Nonce(), original.Nonce)
+	}
+	if cancelTx.GasFeeCap().Cmp(big.NewInt(2_200_000_000)) != 0 {
+		t.Fatalf("cancel max fee = %s, want a 10%% bump over the task attempt", cancelTx.GasFeeCap())
+	}
+
+	// The cancel mines: the row terminates as canceled, the job parks for review,
+	// and the lane unlocks for the next nonce.
+	client.receipts = map[common.Hash]*types.Receipt{cancelTx.Hash(): testReceipt(cancelTx.Hash(), types.ReceiptStatusSuccessful)}
+	if _, err := manager.ProcessReceipts(t.Context(), Target{ChainEID: packet.DstEID, ChainID: big.NewInt(560048), Signer: signer, Client: client}, 1); err != nil {
+		t.Fatalf("ProcessReceipts(cancel) error = %v", err)
+	}
+	canceled, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(canceled) error = %v", err)
+	}
+	if canceled.Status != db.TxStatusFailed || canceled.FailureKind != db.TxFailureCanceled {
+		t.Fatalf("canceled row = %q/%q, want failed/canceled", canceled.Status, canceled.FailureKind)
+	}
+	parked, err := store.GetPacket(t.Context(), packet.GUID)
+	if err != nil {
+		t.Fatalf("GetPacket() error = %v", err)
+	}
+	if parked.Status != string(packets.ExecutorManualReview) {
+		t.Fatalf("packet status = %q, want %q (operator abandoned the task)", parked.Status, packets.ExecutorManualReview)
+	}
+}
+
+func TestFailedTaskReceiptUnderCancelIntentParksWorkflow(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       66,
+		estimatedGas:       111_111,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+	}
+	manager := New(store, discardLogger())
+	packet := testExecutorPacket(t)
+	packet.Status = string(packets.ExecutorExecutable)
+	if err := store.UpsertPacket(t.Context(), packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(t.Context(), db.ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorExecutable),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+	id, err := store.EnqueueExecutorTx(
+		t.Context(),
+		packet.GUID,
+		string(packets.ExecutorExecutable),
+		string(packets.ExecutorLzReceiveTxEnqueued),
+		db.TxRequest{
+			ChainEID: packet.DstEID,
+			Purpose:  executorLzReceivePurpose,
+			GUID:     packet.GUID.Bytes(),
+			To:       packet.Receiver,
+			Calldata: []byte{0x04, 0x05},
+			Value:    big.NewInt(0),
+			SignerID: signer.Address().Hex(),
+		},
+	)
+	if err != nil {
+		t.Fatalf("EnqueueExecutorTx() error = %v", err)
+	}
+	target := testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	if err := store.RequestTxCancel(t.Context(), id); err != nil {
+		t.Fatalf("RequestTxCancel() error = %v", err)
+	}
+	// The original task mines with a failed status while cancel intent is set:
+	// the full receipts pipeline must park the job for review, never write the
+	// LZ_RECEIVE_FAILED auto-retry state the operator just abandoned.
+	taskHash := client.sent[0].Hash()
+	client.receipts[taskHash] = testReceipt(taskHash, types.ReceiptStatusFailed)
+	if _, err := manager.ProcessReceipts(t.Context(), Target{ChainEID: packet.DstEID, ChainID: big.NewInt(560048), Signer: signer, Client: client}, 1); err != nil {
+		t.Fatalf("ProcessReceipts() error = %v", err)
+	}
+	parked, err := store.GetPacket(t.Context(), packet.GUID)
+	if err != nil {
+		t.Fatalf("GetPacket() error = %v", err)
+	}
+	if parked.Status != string(packets.ExecutorManualReview) {
+		t.Fatalf("packet status = %q, want %q (cancel intent must reach the workflow)", parked.Status, packets.ExecutorManualReview)
+	}
+	canceled, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if canceled.Status != db.TxStatusFailed || canceled.FailureKind != db.TxFailureCanceled || canceled.NextRetryAt != nil {
+		t.Fatalf("row = %q/%q/%v, want failed/canceled without retry", canceled.Status, canceled.FailureKind, canceled.NextRetryAt)
+	}
+}
+
+func TestNonceReconciliationPartialRPCFailureChangesNothing(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       91,
+		estimatedGas:       111_111,
+		header:             &types.Header{Number: big.NewInt(6_000_000), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		sendErr:            errors.New("nonce too low"),
+		receipts:           make(map[common.Hash]*types.Receipt),
+		receiptErrs:        make(map[common.Hash]error),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	// Two ambiguous broadcasts on the same lane (still replayable), then both
+	// replays hit stale-view nodes and hold for reconciliation.
+	client.sendErr = errors.New("connection glitch before acknowledgement")
+	var ids []int64
+	for i := 0; i < 2; i++ {
+		id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+			ChainEID: 40161,
+			Purpose:  "commit-verification",
+			To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+			Calldata: []byte{byte(i + 1)},
+			Value:    big.NewInt(0),
+			SignerID: signer.Address().Hex(),
+		})
+		if err != nil {
+			t.Fatalf("EnqueueTx(#%d) error = %v", i, err)
+		}
+		ids = append(ids, id)
+		if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+			t.Fatalf("ProcessNext(#%d) error = %v", i, err)
+		}
+		if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+			t.Fatalf("ProcessBroadcast(#%d) error = %v", i, err)
+		}
+	}
+	// Two instances claim the two due replays concurrently (both rows are still
+	// broadcast, so neither blocks the other), then both hit stale-view nodes.
+	forceAttemptBroadcastDue(t, ids[0])
+	forceAttemptBroadcastDue(t, ids[1])
+	token1, token2 := uuid.New(), uuid.New()
+	claim1, err := store.ClaimAttemptForBroadcast(t.Context(), 40161, signer.Address().Hex(), token1, 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimAttemptForBroadcast(1) error = %v", err)
+	}
+	claim2, err := store.ClaimAttemptForBroadcast(t.Context(), 40161, signer.Address().Hex(), token2, 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimAttemptForBroadcast(2) error = %v", err)
+	}
+	if err := store.MarkAttemptSendResult(t.Context(), claim1.AttemptID, token1, db.SendErrorNonceTooLow, "nonce too low"); err != nil {
+		t.Fatalf("MarkAttemptSendResult(1) error = %v", err)
+	}
+	if err := store.MarkAttemptSendResult(t.Context(), claim2.AttemptID, token2, db.SendErrorNonceTooLow, "nonce too low"); err != nil {
+		t.Fatalf("MarkAttemptSendResult(2) error = %v", err)
+	}
+	for _, id := range ids {
+		held, err := store.GetOutboxTx(t.Context(), id)
+		if err != nil {
+			t.Fatalf("GetOutboxTx(%d) error = %v", id, err)
+		}
+		if held.Status != db.TxStatusHeld {
+			t.Fatalf("row %d status = %q, want held", id, held.Status)
+		}
+	}
+
+	// The second hold's receipt lookup fails mid-pass: nothing may change, not
+	// even the first hold whose reads succeeded.
+	client.confirmedNonce = 200
+	client.receiptErrs[client.sent[1].Hash()] = errors.New("rpc receipt outage")
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err == nil {
+		t.Fatal("ProcessNonceReconciliation succeeded despite a receipt RPC failure")
+	}
+	for _, id := range ids {
+		after, err := store.GetOutboxTx(t.Context(), id)
+		if err != nil {
+			t.Fatalf("GetOutboxTx(after %d) error = %v", id, err)
+		}
+		if after.Status != db.TxStatusHeld {
+			t.Fatalf("row %d = %q, want untouched held", id, after.Status)
+		}
+	}
+
+	// After the outage clears (and the backoff), the pass publishes atomically.
+	forceReconcileDue(t, signer.Address().Hex())
+	delete(client.receiptErrs, client.sent[1].Hash())
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation(retry) error = %v", err)
+	}
+	for _, id := range ids {
+		after, err := store.GetOutboxTx(t.Context(), id)
+		if err != nil {
+			t.Fatalf("GetOutboxTx(final %d) error = %v", id, err)
+		}
+		if after.Status != db.TxStatusHeld || after.FailureKind != "" {
+			// confirmedNonce=200 passed both nonces with no receipts: both park as
+			// externally consumed, still held for the operator.
+			t.Fatalf("row %d = %q, want held (externally consumed)", id, after.Status)
+		}
+	}
+}
+
+func TestNonceReconciliationReleasesAndParksExternally(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       71,
+		estimatedGas:       111_111,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		sendErr:            errors.New("nonce too low"),
+		receipts:           make(map[common.Hash]*types.Receipt),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "commit-verification",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	held, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(held) error = %v", err)
+	}
+	if held.Status != db.TxStatusHeld {
+		t.Fatalf("status after nonce too low = %q, want held", held.Status)
+	}
+
+	// Transient case: the confirmed nonce has not passed the held nonce, so the
+	// hold releases back to broadcast and the raw keeps replaying.
+	client.header = &types.Header{Number: big.NewInt(5_000_000), BaseFee: big.NewInt(500_000_000)}
+	client.confirmedNonce = held.Nonce
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation(release) error = %v", err)
+	}
+	released, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(released) error = %v", err)
+	}
+	if released.Status != db.TxStatusBroadcast {
+		t.Fatalf("released status = %q, want broadcast", released.Status)
+	}
+
+	// External consumption: the confirmed nonce moved past the held nonce with no
+	// receipt on any attempt. The row parks for the operator and the cursor
+	// fast-forwards so the next fresh nonce is beyond the consumed range.
+	forceOutboxHeldNonceReconcile(t, id)
+	forceReconcileDue(t, signer.Address().Hex())
+	client.confirmedNonce = held.Nonce + 5
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation(external) error = %v", err)
+	}
+	consumed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(consumed) error = %v", err)
+	}
+	if consumed.Status != db.TxStatusHeld {
+		t.Fatalf("consumed status = %q, want held for operator resolution", consumed.Status)
+	}
+	cloneID, err := store.ResolveExternalNonceRetry(t.Context(), id)
+	if err != nil {
+		t.Fatalf("ResolveExternalNonceRetry() error = %v", err)
+	}
+	client.sendErr = nil
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext(clone) error = %v", err)
+	}
+	clone, err := store.GetOutboxTx(t.Context(), cloneID)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(clone) error = %v", err)
+	}
+	if clone.Nonce != held.Nonce+5 {
+		t.Fatalf("clone nonce = %d, want the fast-forwarded confirmed nonce %d", clone.Nonce, held.Nonce+5)
+	}
+}
+
+func TestCancelBumpStaysCancelKind(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       81,
+		estimatedGas:       111_111,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "commit-verification",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01, 0x02},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	if err := store.RequestTxCancel(t.Context(), id); err != nil {
+		t.Fatalf("RequestTxCancel() error = %v", err)
+	}
+	if _, err := manager.ProcessCancelRequest(t.Context(), target); err != nil {
+		t.Fatalf("ProcessCancelRequest() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(cancel) error = %v", err)
+	}
+
+	// The mempool-stuck cancel goes stale; its bump must be another cancel noop,
+	// never a rebuild of the canceled task calldata.
+	forceBroadcastStale(t, id)
+	if _, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target); err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement(cancel bump) error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(cancel bump) error = %v", err)
+	}
+	if len(client.sent) != 3 {
+		t.Fatalf("sent tx count = %d, want task, cancel, and cancel bump", len(client.sent))
+	}
+	bump := client.sent[2]
+	if bump.To() == nil || *bump.To() != signer.Address() || bump.Value().Sign() != 0 || len(bump.Data()) != 0 {
+		t.Fatalf("cancel bump to=%v value=%s data=%d bytes, want a self-transfer noop", bump.To(), bump.Value(), len(bump.Data()))
+	}
+	if bump.GasFeeCap().Cmp(client.sent[1].GasFeeCap()) <= 0 {
+		t.Fatalf("cancel bump fee %s did not exceed the previous cancel fee %s", bump.GasFeeCap(), client.sent[1].GasFeeCap())
+	}
+	if bumpKind := queryActiveAttemptKind(t, id); bumpKind != db.TxAttemptCancel {
+		t.Fatalf("bump kind = %q, want cancel", bumpKind)
+	}
+}
+
 func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 	store := openTestStore(t)
 	signer := newTestKeystoreSigner(t)
@@ -2769,6 +3203,66 @@ func cleanPacketWorkflowRows(t *testing.T, guid common.Hash) {
 	}
 }
 
+// forceOutboxHeldNonceReconcile puts a row back into the nonce-reconcile hold.
+func forceOutboxHeldNonceReconcile(t *testing.T, id int64) {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatalf("pgxpool.New() error = %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE tx_outbox SET status = 'held', held_reason = 'nonce_reconcile_required', updated_at = now() WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("force nonce reconcile hold: %v", err)
+	}
+}
+
+// forceReconcileDue clears the signer lane's reconciliation backoff and lease.
+func forceReconcileDue(t *testing.T, signerID string) {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatalf("pgxpool.New() error = %v", err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(t.Context(), `
+		UPDATE tx_nonce_cursors
+		SET next_reconcile_at = NULL, reconcile_lease_token = NULL, reconcile_lease_until = NULL
+		WHERE signer_id = $1
+	`, signerID); err != nil {
+		t.Fatalf("force reconcile due: %v", err)
+	}
+}
+
+func queryActiveAttemptKind(t *testing.T, outboxID int64) string {
+	t.Helper()
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), databaseURL)
+	if err != nil {
+		t.Fatalf("pgxpool.New() error = %v", err)
+	}
+	t.Cleanup(pool.Close)
+	var kind string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT a.kind FROM tx_attempts a JOIN tx_outbox o ON o.active_attempt_id = a.id WHERE o.id = $1
+	`, outboxID).Scan(&kind); err != nil {
+		t.Fatalf("select active attempt kind: %v", err)
+	}
+	return kind
+}
+
 // forceAttemptBroadcastDue clears the broadcast backoff and lease for every
 // attempt of one outbox row so the next ProcessBroadcast claims it immediately.
 func forceAttemptBroadcastDue(t *testing.T, outboxID int64) {
@@ -2903,6 +3397,10 @@ type fakeChainClient struct {
 	sendErr               error
 	sent                  []*types.Transaction
 	receipts              map[common.Hash]*types.Receipt
+	receiptErrs           map[common.Hash]error
+	confirmedNonce        uint64
+	nonceAtErr            error
+	nonceAtCalls          int
 	balance               *big.Int
 	balanceErr            error
 }
@@ -2937,6 +3435,14 @@ func (f *fakeChainClient) HeaderByNumber(context.Context, *big.Int) (*types.Head
 		return &copied, nil
 	}
 	return dynamicHeader(), nil
+}
+
+func (f *fakeChainClient) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+	f.nonceAtCalls++
+	if f.nonceAtErr != nil {
+		return 0, f.nonceAtErr
+	}
+	return f.confirmedNonce, nil
 }
 
 func (f *fakeChainClient) PendingNonceAt(context.Context, common.Address) (uint64, error) {
@@ -2975,6 +3481,9 @@ func (f *fakeChainClient) SendTransaction(_ context.Context, tx *types.Transacti
 }
 
 func (f *fakeChainClient) TransactionReceipt(_ context.Context, txHash common.Hash) (*types.Receipt, error) {
+	if err, ok := f.receiptErrs[txHash]; ok {
+		return nil, err
+	}
 	receipt, ok := f.receipts[txHash]
 	if !ok {
 		return nil, ethereum.NotFound

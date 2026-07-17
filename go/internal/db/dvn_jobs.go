@@ -345,6 +345,21 @@ func (s *Store) MarkDVNReorgDetected(ctx context.Context, guid common.Hash, expe
 	return s.updateDVNStatus(ctx, dvnStatusUpdate{GUID: guid, ExpectedStatus: expectedStatus, NextStatus: string(packets.DVNReorgDetected), LastError: reason, QuorumResult: quorumResult})
 }
 
+// MarkDVNManualReview parks a DVN job for operator review without pausing the
+// pathway: an operator-canceled verify transaction is not configuration drift,
+// so other packets on the pathway keep flowing.
+func (s *Store) MarkDVNManualReview(ctx context.Context, guid common.Hash, expectedStatus, reason string) error {
+	if reason == "" {
+		return errors.New("dvn manual review reason is required")
+	}
+	return s.updateDVNStatus(ctx, dvnStatusUpdate{
+		GUID:           guid,
+		ExpectedStatus: expectedStatus,
+		NextStatus:     string(packets.DVNManualReview),
+		LastError:      reason,
+	})
+}
+
 // MarkDVNManualReviewAndPausePathway atomically stops a job and its pathway after deterministic destination config drift.
 func (s *Store) MarkDVNManualReviewAndPausePathway(ctx context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte) error {
 	if guid == (common.Hash{}) {

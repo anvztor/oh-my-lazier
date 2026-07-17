@@ -78,6 +78,10 @@ var ErrBroadcastLaneHeld = errors.New("broadcast lane held after replay budget e
 // replacement claim and its persistence, so the signed replacement is stale.
 var ErrActiveAttemptChanged = errors.New("outbox active attempt changed")
 
+// ErrReceiptResolutionPinned indicates the outbox row already has a pinned
+// receipt resolution for a different attempt (or none where one is required).
+var ErrReceiptResolutionPinned = errors.New("receipt resolution pinned to another attempt")
+
 // TxAttempt is one immutable physical signed transaction for an outbox row.
 type TxAttempt struct {
 	ID                   int64
@@ -158,6 +162,7 @@ func (s *Store) ClaimOutboxForSigning(ctx context.Context, id int64, chainEID ui
 		FROM tx_outbox
 		WHERE id = $1 AND chain_eid = $2 AND signer_id = $3
 			AND (lease_until IS NULL OR lease_until <= now())
+			AND cancel_requested_at IS NULL
 		FOR UPDATE
 	`, id, chainEID, signerID).Scan(&status, &nonce)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -443,6 +448,8 @@ func (s *Store) ClaimAttemptForBroadcast(ctx context.Context, chainEID uint32, s
 			AND a.broadcast_count < $3
 			AND (a.next_broadcast_at IS NULL OR a.next_broadcast_at <= now())
 			AND (a.broadcast_lease_until IS NULL OR a.broadcast_lease_until <= now())
+			AND (o.cancel_requested_at IS NULL OR a.kind = 'cancel')
+			AND o.receipt_outcome IS NULL
 			AND NOT EXISTS (
 				SELECT 1 FROM tx_outbox lower
 				WHERE lower.chain_eid = o.chain_eid AND lower.signer_id = o.signer_id
@@ -571,7 +578,8 @@ func (s *Store) ListReceiptPollTasks(ctx context.Context, chainEID uint32, signe
 			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
 			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
 			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
-			o.receipt_observed_at, o.receipt_cost_priced_at
+			o.receipt_observed_at, o.receipt_cost_priced_at, o.cancel_requested_at,
+			o.receipt_outcome, o.receipt_attempt_id
 		FROM tx_outbox o
 		JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
 		WHERE o.chain_eid = $1 AND o.signer_id = $2
@@ -597,7 +605,8 @@ func (s *Store) ListReceiptPollTasks(ctx context.Context, chainEID uint32, signe
 			&row.RetryOfID, &row.ReceiptTxHash, &row.ReceiptStatus,
 			&row.ReceiptBlockNumber, &row.ReceiptGasUsed, &row.ReceiptEffectiveGasPrice,
 			&row.ReceiptGasCostDstWei, &row.ReceiptGasCostSrcWei,
-			&row.ReceiptObservedAt, &row.ReceiptCostPricedAt,
+			&row.ReceiptObservedAt, &row.ReceiptCostPricedAt, &row.CancelRequestedAt,
+			&row.ReceiptOutcome, &row.ReceiptAttemptID,
 		); err != nil {
 			return nil, err
 		}
@@ -666,70 +675,172 @@ func (s *Store) TouchReceiptPoll(ctx context.Context, id int64) error {
 	return err
 }
 
-// FinalizeAttemptReceipt applies a confirmation-depth receipt in one atomic
-// transaction: the winning attempt becomes mined, the outbox active pointer
-// and receipt facts switch to it, the outbox reaches its terminal
-// status (confirmed, or failed with receipt-retry metadata), and any signing
-// lease or pending replacement request is cleared so an in-flight replacement
-// signer cannot land on the terminal row. The caller must apply the idempotent
-// workflow effects BEFORE calling this: until it commits, the attempt stays a
-// receipt-poll candidate, so a crash in between simply replays the workflow.
-// Locks are taken attempt first, then outbox, matching MarkAttemptSendResult.
-func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, facts TxReceiptFacts, failure error) error {
+// Receipt terminalization outcomes derived by FinalizeAttemptReceipt.
+const (
+	// ReceiptOutcomeConfirmed means the task transaction succeeded on chain.
+	ReceiptOutcomeConfirmed = "confirmed"
+	// ReceiptOutcomeFailed means the task transaction mined with a failed status
+	// and stays eligible for the automatic receipt retry.
+	ReceiptOutcomeFailed = "receipt_failed"
+	// ReceiptOutcomeCanceled means the nonce was consumed under an operator
+	// cancel (a mined cancel attempt regardless of its receipt status, or a task
+	// attempt that mined failed while cancel intent was set); no automatic retry.
+	ReceiptOutcomeCanceled = "canceled"
+)
+
+// PrepareReceiptResolution derives and pins the terminal outcome for a
+// confirmation-depth receipt, once, under the attempt→outbox locks: the winning
+// attempt and the outcome (confirmed / receipt_failed / canceled, from the
+// attempt kind × receipt status × persistent cancel intent) are persisted on the
+// outbox row before any workflow effect runs. The workflow application and the
+// finalizer both consume exactly this resolution, and RequestTxCancel refuses
+// rows with a pinned resolution, so a cancel racing the receipt pipeline cannot
+// make them diverge. Re-preparing the same attempt is idempotent; a different
+// attempt against an existing resolution returns ErrReceiptResolutionPinned.
+func (s *Store) PrepareReceiptResolution(ctx context.Context, attemptID int64, facts TxReceiptFacts) (string, error) {
 	if attemptID <= 0 {
-		return errors.New("attempt id is required")
+		return "", errors.New("attempt id is required")
 	}
 	if err := validateTxReceiptFacts(facts); err != nil {
-		return err
-	}
-	success := facts.Status == 1
-	if success != (failure == nil) {
-		return errors.New("receipt failure detail must accompany exactly the failed receipts")
+		return "", err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var outboxID int64
 	var hashBytes []byte
+	var attemptKind string
 	if err := tx.QueryRow(ctx, `
-		SELECT outbox_id, tx_hash
+		SELECT outbox_id, tx_hash, kind
 		FROM tx_attempts
 		WHERE id = $1
 		FOR UPDATE
-	`, attemptID).Scan(&outboxID, &hashBytes); errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("tx attempt %d not found", attemptID)
+	`, attemptID).Scan(&outboxID, &hashBytes, &attemptKind); errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("tx attempt %d not found", attemptID)
 	} else if err != nil {
-		return err
+		return "", err
 	}
 	if common.BytesToHash(hashBytes) != facts.TxHash {
-		return fmt.Errorf("receipt tx hash %s does not match attempt %d hash", facts.TxHash, attemptID)
+		return "", fmt.Errorf("receipt tx hash %s does not match attempt %d hash", facts.TxHash, attemptID)
+	}
+
+	var status string
+	var cancelRequestedAt *time.Time
+	var existingOutcome *string
+	var existingAttemptID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT status, cancel_requested_at, receipt_outcome, receipt_attempt_id
+		FROM tx_outbox WHERE id = $1 FOR UPDATE
+	`, outboxID).Scan(&status, &cancelRequestedAt, &existingOutcome, &existingAttemptID); errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("outbox tx %d not found", outboxID)
+	} else if err != nil {
+		return "", err
+	}
+	if existingOutcome != nil {
+		if existingAttemptID != nil && *existingAttemptID == attemptID {
+			return *existingOutcome, nil
+		}
+		return "", ErrReceiptResolutionPinned
+	}
+	if status == TxStatusConfirmed || status == TxStatusFailed {
+		return "", fmt.Errorf("outbox tx %d is already terminal in status %s", outboxID, status)
+	}
+
+	success := facts.Status == 1
+	outcome := ReceiptOutcomeConfirmed
+	if attemptKind == TxAttemptCancel || (cancelRequestedAt != nil && !success) {
+		outcome = ReceiptOutcomeCanceled
+	} else if !success {
+		outcome = ReceiptOutcomeFailed
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE tx_outbox SET receipt_outcome = $1, receipt_attempt_id = $2, updated_at = now() WHERE id = $3
+	`, outcome, attemptID, outboxID); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return outcome, nil
+}
+
+// FinalizeAttemptReceipt applies a prepared receipt resolution in one atomic
+// transaction: the winning attempt becomes mined, the outbox active pointer and
+// receipt facts switch to it, the outbox reaches the pinned terminal status, and
+// any signing lease, replacement request, or cancel intent is cleared so no
+// in-flight signer can land on the terminal row. The resolution must have been
+// pinned by PrepareReceiptResolution for exactly this attempt (the caller runs
+// the idempotent workflow effects in between); until this commits, the attempt
+// stays a receipt-poll candidate, so a crash in between simply replays the
+// workflow with the same pinned outcome. Locks are taken attempt first, then
+// outbox.
+func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, facts TxReceiptFacts) (string, error) {
+	if attemptID <= 0 {
+		return "", errors.New("attempt id is required")
+	}
+	if err := validateTxReceiptFacts(facts); err != nil {
+		return "", err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var outboxID int64
+	var hashBytes []byte
+	var attemptKind string
+	if err := tx.QueryRow(ctx, `
+		SELECT outbox_id, tx_hash, kind
+		FROM tx_attempts
+		WHERE id = $1
+		FOR UPDATE
+	`, attemptID).Scan(&outboxID, &hashBytes, &attemptKind); errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("tx attempt %d not found", attemptID)
+	} else if err != nil {
+		return "", err
+	}
+	if common.BytesToHash(hashBytes) != facts.TxHash {
+		return "", fmt.Errorf("receipt tx hash %s does not match attempt %d hash", facts.TxHash, attemptID)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE tx_attempts SET state = $1, updated_at = now() WHERE id = $2
 	`, TxAttemptMined, attemptID); err != nil {
-		return err
+		return "", err
 	}
 
 	var attempts uint32
+	var pinnedOutcome *string
+	var pinnedAttemptID *int64
 	if err := tx.QueryRow(ctx, `
-		SELECT attempts FROM tx_outbox WHERE id = $1 FOR UPDATE
-	`, outboxID).Scan(&attempts); errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("outbox tx %d not found", outboxID)
+		SELECT attempts, receipt_outcome, receipt_attempt_id FROM tx_outbox WHERE id = $1 FOR UPDATE
+	`, outboxID).Scan(&attempts, &pinnedOutcome, &pinnedAttemptID); errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("outbox tx %d not found", outboxID)
 	} else if err != nil {
-		return err
+		return "", err
 	}
+	if pinnedOutcome == nil || pinnedAttemptID == nil || *pinnedAttemptID != attemptID {
+		return "", ErrReceiptResolutionPinned
+	}
+	outcome := *pinnedOutcome
+
 	status := TxStatusConfirmed
 	var failureKindArg, retryAtArg, lastErrorArg any
-	if !success {
+	switch outcome {
+	case ReceiptOutcomeCanceled:
+		status = TxStatusFailed
+		failureKindArg = TxFailureCanceled
+		lastErrorArg = fmt.Sprintf("canceled by operator (winning attempt kind %s, receipt status %d)", attemptKind, facts.Status)
+	case ReceiptOutcomeFailed:
 		status = TxStatusFailed
 		failureKindArg = TxFailureReceiptFailed
 		if attempts < TxAutoRetryMaxAttempts {
 			retryAtArg = time.Now().UTC().Add(autoRetryDelay(attempts))
 		}
-		lastErrorArg = optionalString(failure.Error())
+		lastErrorArg = fmt.Sprintf("transaction receipt status %d", facts.Status)
 	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
@@ -750,6 +861,7 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 			lease_token = NULL,
 			lease_until = NULL,
 			replace_requested_at = NULL,
+			cancel_requested_at = NULL,
 			next_sign_at = NULL,
 			updated_at = now()
 		WHERE id = $8
@@ -758,12 +870,15 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 		facts.EffectiveGasPrice.String(), facts.GasCostDstWei.String(), outboxID,
 		status, failureKindArg, retryAtArg, lastErrorArg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("outbox tx %d not found", outboxID)
+		return "", fmt.Errorf("outbox tx %d not found", outboxID)
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return outcome, nil
 }
 
 // TxMaxPreSignFailures bounds consecutive estimate, fee-quote, or signing
@@ -832,7 +947,9 @@ func (s *Store) RecordPreSignFailure(ctx context.Context, id int64, leaseToken u
 			return false, err
 		}
 		return false, tx.Commit(ctx)
-	case TxStatusBroadcast, TxStatusHeld:
+	case TxStatusBroadcast, TxStatusHeld, TxStatusSigned, TxStatusQueued:
+		// Replacement or cancel signing failures: the row already has (or is
+		// keeping) durable send state, so the budget only throttles new signatures.
 		if newCount >= TxMaxPreSignFailures {
 			// The replacement signing budget is exhausted: park the lane visibly for
 			// manual review instead of silently dropping out of the replacement
@@ -856,6 +973,10 @@ func (s *Store) RecordPreSignFailure(ctx context.Context, id int64, leaseToken u
 			SET pre_sign_failure_count = $1,
 				replace_requested_at = CASE
 					WHEN replace_requested_at IS NOT NULL THEN now() + $2::interval
+					ELSE NULL
+				END,
+				cancel_requested_at = CASE
+					WHEN cancel_requested_at IS NOT NULL THEN now() + $2::interval
 					ELSE NULL
 				END,
 				lease_token = NULL, lease_until = NULL, updated_at = now()
@@ -921,9 +1042,12 @@ func (s *Store) DeferReplacement(ctx context.Context, id int64) error {
 // ReplacementCandidate is one outbox row due for a same-nonce replacement, with
 // every poll-worthy attempt hash so the caller can pre-check receipts across all
 // of them (not only the active attempt) before signing a doomed replacement.
+// ActiveKind tells the caller what payload to build: bumping a cancel attempt
+// must produce another cancel, never the original task calldata.
 type ReplacementCandidate struct {
 	Outbox          OutboxTx
 	ActiveAttemptID int64
+	ActiveKind      string
 	AttemptHashes   []common.Hash
 }
 
@@ -943,6 +1067,7 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 	}
 	var row outboxTxRow
 	var activeAttemptID int64
+	var activeKind string
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 			o.id, o.chain_eid, o.purpose, o.guid, o.to_address, o.calldata, o.value::text,
@@ -952,27 +1077,37 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
 			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
 			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
-			o.receipt_observed_at, o.receipt_cost_priced_at,
-			a.id
+			o.receipt_observed_at, o.receipt_cost_priced_at, o.cancel_requested_at,
+			o.receipt_outcome, o.receipt_attempt_id,
+			a.id, a.kind
 		FROM tx_outbox o
 		JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
 		WHERE o.chain_eid = $1 AND o.signer_id = $2
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
+			AND o.receipt_outcome IS NULL
 			AND a.state IN ('submitted', 'ambiguous')
 			AND o.pre_sign_failure_count < $3
+			-- Under cancel intent only cancel attempts are bumped; the original
+			-- task must never be re-signed.
+			AND (o.cancel_requested_at IS NULL OR a.kind = 'cancel')
 			AND (
 				-- An operator request authorizes one replacement past the automatic
 				-- cap and cooldowns (the request is cleared when the replacement is
 				-- persisted).
 				(
 					o.replace_requested_at IS NOT NULL AND o.replace_requested_at <= now()
-					AND (o.status = $4 OR (o.status = $6 AND o.held_reason = $7))
+					AND (
+						o.status = $4
+						OR (o.status = $6 AND o.held_reason = $7)
+						OR (o.status = $6 AND o.held_reason = 'manual' AND a.kind = 'cancel')
+					)
 				)
 				OR (
 					o.status = $4 AND o.updated_at <= now() - $5::interval
 					AND (
 						SELECT count(*) FROM tx_attempts r
-						WHERE r.outbox_id = o.id AND r.kind = $8
+						WHERE r.outbox_id = o.id
+							AND r.kind = CASE WHEN a.kind = 'cancel' THEN 'cancel' ELSE $8 END
 					) < $9
 				)
 				-- A reprice hold recovers automatically after a cooldown (updated_at
@@ -985,7 +1120,8 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 					AND o.updated_at <= now() - $10::interval
 					AND (
 						SELECT count(*) FROM tx_attempts r
-						WHERE r.outbox_id = o.id AND r.kind = $8
+						WHERE r.outbox_id = o.id
+							AND r.kind = CASE WHEN a.kind = 'cancel' THEN 'cancel' ELSE $8 END
 					) < $9
 				)
 			)
@@ -1001,8 +1137,9 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 		&row.RetryOfID, &row.ReceiptTxHash, &row.ReceiptStatus,
 		&row.ReceiptBlockNumber, &row.ReceiptGasUsed, &row.ReceiptEffectiveGasPrice,
 		&row.ReceiptGasCostDstWei, &row.ReceiptGasCostSrcWei,
-		&row.ReceiptObservedAt, &row.ReceiptCostPricedAt,
-		&activeAttemptID,
+		&row.ReceiptObservedAt, &row.ReceiptCostPricedAt, &row.CancelRequestedAt,
+		&row.ReceiptOutcome, &row.ReceiptAttemptID,
+		&activeAttemptID, &activeKind,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ReplacementCandidate{}, ErrNoStaleBroadcastReplacement
@@ -1014,28 +1151,28 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 	if err != nil {
 		return ReplacementCandidate{}, err
 	}
-
-	hashRows, err := s.pool.Query(ctx, `
-		SELECT tx_hash FROM tx_attempts
-		WHERE outbox_id = $1 AND state IN ('signed', 'submitted', 'ambiguous')
-		ORDER BY id ASC
-	`, outboxTx.ID)
+	hashes, err := s.attemptPollHashes(ctx, outboxTx.ID)
 	if err != nil {
 		return ReplacementCandidate{}, err
 	}
-	defer hashRows.Close()
-	hashes := make([]common.Hash, 0)
-	for hashRows.Next() {
-		var hashBytes []byte
-		if err := hashRows.Scan(&hashBytes); err != nil {
-			return ReplacementCandidate{}, err
-		}
-		hashes = append(hashes, common.BytesToHash(hashBytes))
+	return ReplacementCandidate{Outbox: outboxTx, ActiveAttemptID: activeAttemptID, ActiveKind: activeKind, AttemptHashes: hashes}, nil
+}
+
+// replacementClaimable reports whether a row can take a replacement of the
+// given kind: broadcast and reprice-held rows always can, and a held(manual)
+// lane whose replacement is a cancel can recover through an operator
+// re-request (the selector gates on the explicit request).
+func replacementClaimable(status string, heldReason *string, kind string) bool {
+	if status == TxStatusBroadcast {
+		return true
 	}
-	if err := hashRows.Err(); err != nil {
-		return ReplacementCandidate{}, err
+	if status != TxStatusHeld || heldReason == nil {
+		return false
 	}
-	return ReplacementCandidate{Outbox: outboxTx, ActiveAttemptID: activeAttemptID, AttemptHashes: hashes}, nil
+	if *heldReason == HeldRepriceRequired {
+		return true
+	}
+	return *heldReason == HeldManual && kind == TxAttemptCancel
 }
 
 // ClaimOutboxForReplacementSigning writes a signing lease for a same-nonce
@@ -1055,22 +1192,30 @@ func (s *Store) ClaimOutboxForReplacementSigning(ctx context.Context, id, expect
 	var status string
 	var heldReason *string
 	var activeAttemptID *int64
+	var receiptOutcome *string
 	if err := tx.QueryRow(ctx, `
-		SELECT status, held_reason, active_attempt_id
+		SELECT status, held_reason, active_attempt_id, receipt_outcome
 		FROM tx_outbox
 		WHERE id = $1 AND (lease_until IS NULL OR lease_until <= now())
 		FOR UPDATE
-	`, id).Scan(&status, &heldReason, &activeAttemptID); errors.Is(err, pgx.ErrNoRows) {
+	`, id).Scan(&status, &heldReason, &activeAttemptID, &receiptOutcome); errors.Is(err, pgx.ErrNoRows) {
 		return OutboxTx{}, ErrOutboxLeaseLost
 	} else if err != nil {
 		return OutboxTx{}, err
 	}
+	if receiptOutcome != nil {
+		return OutboxTx{}, ErrActiveAttemptChanged
+	}
 	if activeAttemptID == nil || *activeAttemptID != expectedActiveAttemptID {
 		return OutboxTx{}, ErrActiveAttemptChanged
 	}
-	replaceable := status == TxStatusBroadcast ||
-		(status == TxStatusHeld && heldReason != nil && *heldReason == HeldRepriceRequired)
-	if !replaceable {
+	var activeKind string
+	if err := tx.QueryRow(ctx, `
+		SELECT kind FROM tx_attempts WHERE id = $1
+	`, expectedActiveAttemptID).Scan(&activeKind); err != nil {
+		return OutboxTx{}, err
+	}
+	if !replacementClaimable(status, heldReason, activeKind) {
 		return OutboxTx{}, fmt.Errorf("outbox tx %d is not replaceable in status %s", id, status)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -1093,8 +1238,8 @@ func (s *Store) InsertReplacementAttempt(ctx context.Context, outboxID, expected
 	if outboxID <= 0 || expectedActiveAttemptID <= 0 {
 		return TxAttempt{}, errors.New("outbox and expected active attempt ids are required")
 	}
-	if a.Kind != TxAttemptReplacement {
-		return TxAttempt{}, fmt.Errorf("replacement attempt kind %q must be %q", a.Kind, TxAttemptReplacement)
+	if a.Kind != TxAttemptReplacement && a.Kind != TxAttemptCancel {
+		return TxAttempt{}, fmt.Errorf("replacement attempt kind %q must be %q or %q", a.Kind, TxAttemptReplacement, TxAttemptCancel)
 	}
 	if len(a.TxHash) != common.HashLength || len(a.RawTx) == 0 {
 		return TxAttempt{}, errors.New("attempt requires a 32-byte hash and non-empty raw tx")
@@ -1123,11 +1268,13 @@ func (s *Store) InsertReplacementAttempt(ctx context.Context, outboxID, expected
 	var activeAttemptID *int64
 	var outboxStatus string
 	var heldReason *string
+	var cancelRequestedAt *time.Time
+	var receiptOutcome *string
 	if err := tx.QueryRow(ctx, `
-		SELECT lease_token::text, nonce, active_attempt_id, status, held_reason
+		SELECT lease_token::text, nonce, active_attempt_id, status, held_reason, cancel_requested_at, receipt_outcome
 		FROM tx_outbox WHERE id = $1 AND lease_until > now()
 		FOR UPDATE
-	`, outboxID).Scan(&curLease, &outboxNonce, &activeAttemptID, &outboxStatus, &heldReason); errors.Is(err, pgx.ErrNoRows) {
+	`, outboxID).Scan(&curLease, &outboxNonce, &activeAttemptID, &outboxStatus, &heldReason, &cancelRequestedAt, &receiptOutcome); errors.Is(err, pgx.ErrNoRows) {
 		return TxAttempt{}, ErrOutboxLeaseLost
 	} else if err != nil {
 		return TxAttempt{}, err
@@ -1135,15 +1282,22 @@ func (s *Store) InsertReplacementAttempt(ctx context.Context, outboxID, expected
 	if curLease == nil || *curLease != leaseToken.String() {
 		return TxAttempt{}, ErrOutboxLeaseLost
 	}
+	if receiptOutcome != nil {
+		return TxAttempt{}, ErrActiveAttemptChanged
+	}
 	if activeAttemptID == nil || *activeAttemptID != expectedActiveAttemptID {
 		return TxAttempt{}, ErrActiveAttemptChanged
 	}
 	// The row must still be replaceable: a receipt terminalization or a hold that
 	// raced this signature must win, or a terminal row's active attempt would be switched
-	// to a never-sent replacement.
-	replaceable := outboxStatus == TxStatusBroadcast ||
-		(outboxStatus == TxStatusHeld && heldReason != nil && *heldReason == HeldRepriceRequired)
-	if !replaceable {
+	// to a never-sent replacement. Bumping a cancel may also recover a
+	// held(manual) lane (an operator re-request authorized it).
+	if !replacementClaimable(outboxStatus, heldReason, a.Kind) {
+		return TxAttempt{}, ErrActiveAttemptChanged
+	}
+	// Under cancel intent only cancel bumps may land; a task replacement that
+	// raced the cancel request must lose.
+	if cancelRequestedAt != nil && a.Kind != TxAttemptCancel {
 		return TxAttempt{}, ErrActiveAttemptChanged
 	}
 	if outboxNonce == nil || *outboxNonce < 0 || uint64(*outboxNonce) != a.Nonce {
