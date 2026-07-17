@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	gethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -194,129 +197,466 @@ func TestTransactionReceiptTransientErrorRedactsProviderURL(t *testing.T) {
 	assertRedactedProviderError(t, err, []string{secretURL, "rpc-password", "rpc-api-key"}, "provider[0]", "eth_getTransactionReceipt")
 }
 
-func TestSelectCanonicalHeadRejectsSameHeightHashConflict(t *testing.T) {
-	_, err := selectCanonicalHead("testnet", []providerHead{
-		{Index: 0, Number: big.NewInt(42), Hash: common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")},
-		{Index: 1, Number: big.NewInt(42), Hash: common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
-	})
-	if err == nil {
-		t.Fatal("selectCanonicalHead() error = nil, want conflict")
+func TestCheckHeadUsesMajorityReachedHeight(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	liarTip := testHeaderAt(44, 0x02)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: liarTip, headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+
+	head, err := client.CheckHead(context.Background())
+	if err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
 	}
-	if !IsHeadConflict(err) {
-		t.Fatalf("IsHeadConflict() = false for %T", err)
+	// A single inflated tip cannot lift the trusted head: the canonical height is
+	// the one a configured majority has reached.
+	if head.Number.Uint64() != 42 {
+		t.Fatalf("head number = %s, want the majority-reached 42", head.Number)
 	}
-	if !strings.Contains(err.Error(), "provider[0]") || !strings.Contains(err.Error(), "provider[1]") {
-		t.Fatalf("error = %q, want redacted provider identities", err)
+	if head.Hash != canonical.Hash().Hex() {
+		t.Fatalf("head hash = %s, want the canonical %s", head.Hash, canonical.Hash().Hex())
+	}
+	for index, provider := range client.Providers() {
+		if provider.Status != ProviderHealthy {
+			t.Fatalf("provider[%d] status = %q, want healthy", index, provider.Status)
+		}
+	}
+	number, err := client.BlockNumber(context.Background())
+	if err != nil || number != 42 {
+		t.Fatalf("BlockNumber() = (%d, %v), want the quorum head 42", number, err)
 	}
 }
 
-func TestSelectCanonicalHeadIgnoresLaggingProvider(t *testing.T) {
-	expectedHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	head, err := selectCanonicalHead("testnet", []providerHead{
-		{Index: 0, Number: big.NewInt(42), Hash: expectedHash},
-		{Index: 1, Number: big.NewInt(41), Hash: common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
-	})
+func TestCheckHeadMarksMinorityForkConflictWithoutFailing(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	forked := testHeaderAt(42, 0x03)
+	liarTip := testHeaderAt(44, 0x02)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: liarTip, headers: map[int64]*gethtypes.Header{42: forked}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+
+	head, err := client.CheckHead(context.Background())
 	if err != nil {
-		t.Fatalf("selectCanonicalHead() error = %v", err)
+		t.Fatalf("CheckHead() error = %v (a minority dissenter must not fail the chain)", err)
+	}
+	if head.Hash != canonical.Hash().Hex() {
+		t.Fatalf("head hash = %s, want the majority hash", head.Hash)
+	}
+	providers := client.Providers()
+	if providers[0].Status != ProviderConflict {
+		t.Fatalf("provider[0] status = %q, want conflict", providers[0].Status)
+	}
+	if providers[1].Status != ProviderHealthy || providers[2].Status != ProviderHealthy {
+		t.Fatalf("majority statuses = %q/%q, want healthy", providers[1].Status, providers[2].Status)
+	}
+}
+
+func TestCheckHeadQuorumUnavailableOnInsufficientResponders(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{err: errors.New("boom")})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{err: errors.New("boom")})},
+	}}
+
+	// The quorum threshold is fixed on the CONFIGURED provider count: one
+	// responder out of three must never degenerate into single-node trust.
+	_, err := client.CheckHead(context.Background())
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("CheckHead() error = %v, want quorum unavailable", err)
+	}
+	providers := client.Providers()
+	if providers[1].Status != ProviderUnavailable || providers[2].Status != ProviderUnavailable {
+		t.Fatalf("failed providers = %q/%q, want unavailable (no stale healthy)", providers[1].Status, providers[2].Status)
+	}
+	// The lone responder's answer was never majority-verified, so a failed
+	// round must downgrade it as well; otherwise single-source reads would
+	// silently degrade to one unverified endpoint.
+	if providers[0].Status != ProviderUnavailable {
+		t.Fatalf("unverified responder status = %q, want unavailable", providers[0].Status)
+	}
+	if _, err := client.firstHealthyProvider(); err == nil {
+		t.Fatal("firstHealthyProvider() succeeded after a failed quorum round")
+	}
+}
+
+func TestCheckHeadSingleProviderDegenerate(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(0)}})},
+	}}
+	head, err := client.CheckHead(context.Background())
+	if err != nil {
+		t.Fatalf("CheckHead() error = %v (N=1 means q=1)", err)
 	}
 	if head.Number.Uint64() != 42 {
 		t.Fatalf("head number = %s, want 42", head.Number)
 	}
-	if head.Hash != expectedHash.Hex() {
-		t.Fatalf("head hash = %s, want %s", head.Hash, expectedHash.Hex())
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("FilterLogs() = (%d, %v), want the single provider's window", len(logs), err)
 	}
 }
 
-func TestSelectCanonicalHeadAcceptsTwoOfThreeAgreement(t *testing.T) {
-	expectedHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	head, err := selectCanonicalHead("testnet", []providerHead{
-		{Index: 0, Number: big.NewInt(42), Hash: expectedHash},
-		{Index: 1, Number: big.NewInt(42), Hash: expectedHash},
-		{Index: 2, Number: big.NewInt(41), Hash: common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
-	})
+func TestCheckHeadTwoProvidersRequireBothAndUseLowerHeight(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	ahead := testHeaderAt(44, 0x02)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: ahead, headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+	head, err := client.CheckHead(context.Background())
 	if err != nil {
-		t.Fatalf("selectCanonicalHead() error = %v", err)
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	// N=2 means q=2: the canonical height is the lower tip both have reached,
+	// and both must agree on its hash.
+	if head.Number.Uint64() != 42 {
+		t.Fatalf("head number = %s, want the height both providers reached (42)", head.Number)
+	}
+	for index, provider := range client.Providers() {
+		if provider.Status != ProviderHealthy {
+			t.Fatalf("provider[%d] status = %q, want healthy", index, provider.Status)
+		}
+	}
+}
+
+func TestCheckHeadBoundedByHangingProvider(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", probeTimeout: 100 * time.Millisecond, providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{hang: true})},
+	}}
+	start := time.Now()
+	head, err := client.CheckHead(context.Background())
+	if err != nil {
+		t.Fatalf("CheckHead() error = %v (a hanging provider must not stall the majority)", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("CheckHead took %s, want the hanging provider cut off by the probe deadline", elapsed)
 	}
 	if head.Number.Uint64() != 42 {
 		t.Fatalf("head number = %s, want 42", head.Number)
 	}
-	if head.Hash != expectedHash.Hex() {
-		t.Fatalf("head hash = %s, want %s", head.Hash, expectedHash.Hex())
+	if status := client.Providers()[2].Status; status != ProviderUnavailable {
+		t.Fatalf("hanging provider status = %q, want unavailable", status)
 	}
 }
 
-func TestClassifyHeadProviderStatusesDegradesLaggingProvider(t *testing.T) {
-	canonicalHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	statuses := classifyHeadProviderStatuses([]providerHead{
-		{Index: 0, Number: big.NewInt(42), Hash: canonicalHash},
-		{Index: 1, Number: big.NewInt(41), Hash: common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
-	}, HeadResult{Number: big.NewInt(42), Hash: canonicalHash.Hex()})
-
-	if statuses[0] != ProviderHealthy {
-		t.Fatalf("provider[0] status = %q, want %q", statuses[0], ProviderHealthy)
-	}
-	if statuses[1] != ProviderLagging {
-		t.Fatalf("provider[1] status = %q, want %q", statuses[1], ProviderLagging)
-	}
-}
-
-func TestClassifyHeadProviderStatusesMarksSameHeightConflict(t *testing.T) {
-	statuses := classifyHeadProviderStatuses([]providerHead{
-		{Index: 0, Number: big.NewInt(42), Hash: common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")},
-		{Index: 1, Number: big.NewInt(42), Hash: common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
-	}, HeadResult{})
-
-	if statuses[0] != ProviderConflict {
-		t.Fatalf("provider[0] status = %q, want %q", statuses[0], ProviderConflict)
-	}
-	if statuses[1] != ProviderConflict {
-		t.Fatalf("provider[1] status = %q, want %q", statuses[1], ProviderConflict)
-	}
-}
-
-func TestUpdateHeadProviderStatusesAllowsLaggingProviderRecovery(t *testing.T) {
-	canonicalHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	client := &Client{providers: []configuredProvider{
-		{url: "provider-a", status: ProviderHealthy},
-		{url: "provider-b", status: ProviderLagging},
+func TestCheckHeadClassifiesLaggingProvider(t *testing.T) {
+	canonical := testHeaderAt(43, 0x01)
+	lagging := testHeaderAt(41, 0x04)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "c", status: ProviderLagging, client: newTestEthClient(t, testEthService{header: lagging})},
 	}}
 
-	client.updateHeadProviderStatuses([]providerHead{
-		{Index: 0, Number: big.NewInt(43), Hash: canonicalHash},
-		{Index: 1, Number: big.NewInt(43), Hash: canonicalHash},
-	}, HeadResult{Number: big.NewInt(43), Hash: canonicalHash.Hex()})
-
-	providers := client.Providers()
-	if providers[1].ID != "provider[1]" {
-		t.Fatalf("provider id = %q, want provider[1]", providers[1].ID)
+	head, err := client.CheckHead(context.Background())
+	if err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
 	}
-	if providers[1].Status != ProviderHealthy {
-		t.Fatalf("provider[1] status = %q, want %q", providers[1].Status, ProviderHealthy)
+	if head.Number.Uint64() != 43 {
+		t.Fatalf("head number = %s, want 43", head.Number)
+	}
+	providers := client.Providers()
+	if providers[2].Status != ProviderLagging {
+		t.Fatalf("provider[2] status = %q, want lagging", providers[2].Status)
 	}
 }
 
-func TestUpdateHeadProviderStatusesAllowsConflictProviderRecovery(t *testing.T) {
-	canonicalHash := common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	client := &Client{providers: []configuredProvider{
-		{url: "provider-a", status: ProviderHealthy},
-		{url: "provider-b", status: ProviderConflict},
+func TestFirstHealthyProviderPrefersNearCanonicalTip(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	aheadTip := testHeaderAt(45, 0x02)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: aheadTip, headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
 	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	index, err := client.firstHealthyProvider()
+	if err != nil {
+		t.Fatalf("firstHealthyProvider() error = %v", err)
+	}
+	if index != 1 {
+		t.Fatalf("preferred provider = %d, want the near-canonical provider 1", index)
+	}
+}
 
-	client.updateHeadProviderStatuses([]providerHead{
-		{Index: 0, Number: big.NewInt(43), Hash: canonicalHash},
-		{Index: 1, Number: big.NewInt(43), Hash: canonicalHash},
-	}, HeadResult{Number: big.NewInt(43), Hash: canonicalHash.Hex()})
+func TestHeaderByNumberLatestReturnsVerifiedCanonicalHeader(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+	header, err := client.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("HeaderByNumber(nil) error = %v", err)
+	}
+	if header.Hash() != canonical.Hash() {
+		t.Fatalf("header hash = %s, want the verified canonical %s", header.Hash(), canonical.Hash())
+	}
+}
 
+func testWindowLog(index uint) gethtypes.Log {
+	return gethtypes.Log{
+		Address:     common.HexToAddress("0x1111111111111111111111111111111111111111"),
+		Topics:      []common.Hash{common.HexToHash("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")},
+		Data:        []byte{0x01},
+		BlockNumber: 40,
+		TxHash:      common.HexToHash("0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+		TxIndex:     0,
+		BlockHash:   common.HexToHash("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+		Index:       index,
+	}
+}
+
+func boundedLogQuery(to int64) ethereum.FilterQuery {
+	return ethereum.FilterQuery{FromBlock: big.NewInt(40), ToBlock: big.NewInt(to)}
+}
+
+func TestFilterLogsAdoptsMajorityAndFlagsMinority(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	full := []gethtypes.Log{testWindowLog(0), testWindowLog(1)}
+	missing := []gethtypes.Log{testWindowLog(0)}
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: full})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: full})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: missing})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil {
+		t.Fatalf("FilterLogs() error = %v", err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("logs = %d, want the majority window of 2 (a silent dropper must not win)", len(logs))
+	}
 	providers := client.Providers()
-	if providers[1].Status != ProviderHealthy {
-		t.Fatalf("provider[1] status = %q, want %q", providers[1].Status, ProviderHealthy)
+	if providers[2].LogConflict != true {
+		t.Fatal("provider[2] log conflict = false, want the dropped-log minority flagged")
+	}
+	if providers[0].LogConflict || providers[1].LogConflict {
+		t.Fatal("majority providers flagged with log conflict")
+	}
+	// A head check must not clear the sticky log-conflict dimension.
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead(second) error = %v", err)
+	}
+	if !client.Providers()[2].LogConflict {
+		t.Fatal("head check cleared an unresolved log conflict")
+	}
+}
+
+func TestFilterLogsOrderEquivalenceReturnsCanonicalOrder(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	ordered := []gethtypes.Log{testWindowLog(0), testWindowLog(1)}
+	reversed := []gethtypes.Log{testWindowLog(1), testWindowLog(0)}
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: reversed})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: ordered})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil {
+		t.Fatalf("FilterLogs() error = %v (equal sets in different orders must agree)", err)
+	}
+	if len(logs) != 2 || logs[0].Index != 0 || logs[1].Index != 1 {
+		t.Fatalf("logs order = %+v, want canonical (blockNumber, txIndex, logIndex) node order", logs)
+	}
+	for index, provider := range client.Providers() {
+		if provider.LogConflict {
+			t.Fatalf("provider[%d] flagged for a pure ordering difference", index)
+		}
+	}
+}
+
+func TestFilterLogsEmptyMajorityBeatsNonEmptyMinority(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(0)}})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil {
+		t.Fatalf("FilterLogs() error = %v", err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("logs = %d, want the empty majority window (a fabricating minority must not win)", len(logs))
+	}
+	providers := client.Providers()
+	if !providers[2].LogConflict {
+		t.Fatal("fabricating provider not flagged with log conflict")
+	}
+	if providers[0].LogConflict || providers[1].LogConflict {
+		t.Fatal("empty-majority providers flagged")
+	}
+}
+
+func TestFilterLogsErrorRetryRecovers(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	full := []gethtypes.Log{testWindowLog(0)}
+	flaky := &logsScript{steps: []logsStep{{err: errors.New("boom")}, {logs: full}}}
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: full})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logsScript: flaky})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil {
+		t.Fatalf("FilterLogs() error = %v (one transient error must be absorbed by the bounded retry)", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	if client.Providers()[1].LogConflict {
+		t.Fatal("recovered provider flagged with log conflict")
+	}
+}
+
+func TestFilterLogsDivergenceRetryConverges(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	full := []gethtypes.Log{testWindowLog(0), testWindowLog(1)}
+	converging := &logsScript{steps: []logsStep{{logs: []gethtypes.Log{testWindowLog(0)}}, {logs: full}}}
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: full})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: full})},
+		{url: "c", status: ProviderHealthy, logConflict: true, client: newTestEthClient(t, testEthService{header: canonical, logsScript: converging})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	logs, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if err != nil {
+		t.Fatalf("FilterLogs() error = %v", err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("logs = %d, want 2", len(logs))
+	}
+	// The diverging first answer converged on the single re-query, so the
+	// provider is not flagged and its earlier sticky flag clears.
+	if client.Providers()[2].LogConflict {
+		t.Fatal("converged provider still flagged with log conflict")
+	}
+}
+
+func TestLogWindowFingerprintInjectiveAcrossTopicDataBoundary(t *testing.T) {
+	topic := common.HexToHash("0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	withTopic := testWindowLog(0)
+	withTopic.Topics = []common.Hash{topic}
+	withTopic.Data = []byte{0x01}
+	// The delimiter-based encoding this replaced digested identical bytes for a
+	// log whose data starts with the topic bytes.
+	folded := testWindowLog(0)
+	folded.Topics = nil
+	folded.Data = append(append(append([]byte{}, topic.Bytes()...), '|'), 0x01)
+	if logWindowFingerprint([]gethtypes.Log{withTopic}) == logWindowFingerprint([]gethtypes.Log{folded}) {
+		t.Fatal("fingerprint collides across the topic/data boundary")
+	}
+}
+
+func TestFilterLogsConflictWithoutMajority(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "https://secret-a.example/key-a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(0)}})},
+		{url: "https://secret-b.example/key-b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(1)}})},
+	}}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	_, err := client.FilterLogs(context.Background(), boundedLogQuery(41))
+	if !IsLogConflict(err) {
+		t.Fatalf("FilterLogs() error = %v, want log conflict", err)
+	}
+	assertRedactedProviderError(t, err, []string{"secret-a.example", "key-b"}, "provider[0]", "provider[1]")
+}
+
+func TestFilterLogsRequiresSnapshotAndBoundedWindow(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+	if _, err := client.FilterLogs(context.Background(), boundedLogQuery(41)); err == nil {
+		t.Fatal("FilterLogs without a head snapshot succeeded")
+	}
+	if _, err := client.CheckHead(context.Background()); err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	if _, err := client.FilterLogs(context.Background(), ethereum.FilterQuery{}); err == nil {
+		t.Fatal("FilterLogs without bounds succeeded")
+	}
+	if _, err := client.FilterLogs(context.Background(), boundedLogQuery(43)); err == nil {
+		t.Fatal("FilterLogs beyond the quorum head succeeded")
+	}
+}
+
+func TestFilterLogsQuorumUnavailableWhenTooFewReachedWindow(t *testing.T) {
+	// A fresh snapshot always has at least quorum tips at the canonical height;
+	// this exercises the defensive branch for a stale snapshot whose recorded
+	// tips no longer cover the queried window.
+	canonical := testHeaderAt(42, 0x01)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(0)}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical, logs: []gethtypes.Log{testWindowLog(0)}})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: canonical})},
+	}}
+	client.storeHeadSnapshot(&headSnapshot{number: big.NewInt(42), hash: canonical.Hash(), tips: map[int]*big.Int{0: big.NewInt(42)}})
+	_, err := client.FilterLogs(context.Background(), boundedLogQuery(42))
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("FilterLogs() error = %v, want quorum unavailable", err)
 	}
 }
 
 type testEthService struct {
 	header  *gethtypes.Header
+	headers map[int64]*gethtypes.Header
 	receipt *gethtypes.Receipt
+	logs    []gethtypes.Log
+	logsErr error
 	err     error
+	// hang blocks header requests until the caller's context expires.
+	hang bool
+	// logsScript overrides logs/logsErr with per-call scripted answers.
+	logsScript *logsScript
+}
+
+// logsScript serves scripted GetLogs answers call by call; the last step
+// repeats forever.
+type logsScript struct {
+	mu    sync.Mutex
+	steps []logsStep
+}
+
+type logsStep struct {
+	logs []gethtypes.Log
+	err  error
+}
+
+func (s *logsScript) next() ([]gethtypes.Log, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	step := s.steps[0]
+	if len(s.steps) > 1 {
+		s.steps = s.steps[1:]
+	}
+	return step.logs, step.err
 }
 
 type testRPCError struct {
@@ -332,11 +672,28 @@ func (e testRPCError) ErrorCode() int {
 	return e.code
 }
 
-func (s testEthService) GetBlockByNumber(context.Context, rpc.BlockNumber, bool) (*gethtypes.Header, error) {
+func (s testEthService) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, _ bool) (*gethtypes.Header, error) {
+	if s.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
+	if number != rpc.LatestBlockNumber && s.headers != nil {
+		return s.headers[int64(number)], nil
+	}
 	return s.header, nil
+}
+
+func (s testEthService) GetLogs(context.Context, map[string]interface{}) ([]gethtypes.Log, error) {
+	if s.logsScript != nil {
+		return s.logsScript.next()
+	}
+	if s.logsErr != nil {
+		return nil, s.logsErr
+	}
+	return s.logs, nil
 }
 
 func (s testEthService) GetTransactionReceipt(context.Context, common.Hash) (any, error) {
@@ -362,6 +719,12 @@ func newTestEthClient(t *testing.T, service testEthService) *ethclient.Client {
 		server.Stop()
 	})
 	return client
+}
+
+func testHeaderAt(number int64, extra byte) *gethtypes.Header {
+	header := testHeader(extra)
+	header.Number = big.NewInt(number)
+	return header
 }
 
 func testHeader(extra byte) *gethtypes.Header {

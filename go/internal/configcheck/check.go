@@ -178,6 +178,16 @@ func (c *checker) checkChain(ctx context.Context, client ChainClient, configured
 			return fmt.Errorf("validate chain %d rpc chain_id: %w", configured.EID, err)
 		}
 	}
+	// Establish the quorum head before the first on-chain config read, so the
+	// provider trust state is set by the configured majority rather than by
+	// whichever provider happens to be listed first.
+	if headChecker, ok := client.(interface {
+		CheckHead(context.Context) (rpcquorum.HeadResult, error)
+	}); ok {
+		if _, err := headChecker.CheckHead(ctx); err != nil {
+			return fmt.Errorf("check chain %d rpc head quorum: %w", configured.EID, err)
+		}
+	}
 	actualChainID, err := client.ChainID(ctx)
 	if err != nil {
 		return fmt.Errorf("read chain %d chain_id: %w", configured.EID, err)

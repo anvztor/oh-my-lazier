@@ -110,6 +110,7 @@ Phase 1 is EVM-only.
 
 - Startup fails before durable loops if local config is invalid or live chain state does not match the loaded YAML.
 - Every configured RPC URL must report the configured EVM chain ID.
+- Chain head and log reads go through a fixed strict-majority quorum over all configured RPC providers (`q = floor(N/2) + 1` of the configured count, not of the reachable subset). The canonical head is the highest height a majority has reached with a majority-identical block hash, and indexer log windows require majority-identical log sequences from providers whose snapshot tip covers the window. A disagreeing minority provider is flagged (`conflict` head status, sticky log-conflict metric) without stopping progress; losing the majority stops the affected reads fail-closed. Startup establishes the head quorum before the first on-chain config read. Configured RPC endpoints must come from independent failure domains — duplicating one backend across URLs satisfies the count but silently voids the majority-safety assumption.
 - Address fields are parsed as EVM 20-byte hex addresses during config load.
 - Worker contract addresses remain required in every pathway config, even when this process runs only one role.
 - `services.executor.enabled` and `services.dvn.enabled` default to true when omitted; pricing remains independently controlled.
