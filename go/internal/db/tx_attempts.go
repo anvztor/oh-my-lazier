@@ -13,9 +13,9 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Durable-attempt model (P2-A #1). tx_outbox owns the logical task and nonce;
-// each physical signed transaction is an immutable tx_attempts row. The outbox
-// mirrors the active attempt's hash/gas/fees for existing readers.
+// Durable-attempt model (P2-A). tx_outbox owns the logical task and nonce;
+// each physical signed transaction is an immutable tx_attempts row, and read
+// queries project the current hash/gas/fees from the active attempt.
 
 const (
 	// TxStatusHeld means the signer lane is blocked and needs reconciliation,
@@ -238,7 +238,7 @@ func (s *Store) ClaimOutboxForSigning(ctx context.Context, id int64, chainEID ui
 }
 
 // InsertSignedAttempt persists an already-signed attempt (state=signed), switches
-// the outbox active pointer and mirror to it, and clears the signing lease, all
+// the outbox active pointer to it, and clears the signing lease, all
 // in one transaction. It is idempotent on tx_hash for crash recovery: a matching
 // existing attempt is returned. The signing lease must still be held.
 func (s *Store) InsertSignedAttempt(ctx context.Context, outboxID int64, leaseToken uuid.UUID, a SignedAttempt) (TxAttempt, error) {
@@ -306,12 +306,10 @@ func (s *Store) InsertSignedAttempt(ctx context.Context, outboxID int64, leaseTo
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
-		SET active_attempt_id = $1, tx_hash = $2, gas_limit = $3::numeric,
-			max_fee_per_gas = $4::numeric, max_priority_fee_per_gas = $5::numeric,
-			status = $6, lease_token = NULL, lease_until = NULL,
+		SET active_attempt_id = $1, status = $2, lease_token = NULL, lease_until = NULL,
 			pre_sign_failure_count = 0, next_sign_at = NULL, updated_at = now()
-		WHERE id = $7
-	`, attemptID, a.TxHash.Bytes(), int64(a.GasLimit), a.MaxFeePerGas.String(), priorityArg, TxStatusSigned, outboxID); err != nil {
+		WHERE id = $3
+	`, attemptID, TxStatusSigned, outboxID); err != nil {
 		return TxAttempt{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -566,19 +564,20 @@ func (s *Store) ListReceiptPollTasks(ctx context.Context, chainEID uint32, signe
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT
-			id, chain_eid, purpose, guid, to_address, calldata, value::text,
-			gas_limit::text, max_fee_per_gas::text, max_priority_fee_per_gas::text,
-			nonce, tx_hash, signer_id, status, attempts,
-			failure_kind, next_retry_at, retry_of_id,
-			receipt_tx_hash, receipt_status::text, receipt_block_number::text,
-			receipt_gas_used::text, receipt_effective_gas_price::text,
-			receipt_gas_cost_dst_wei::text, receipt_gas_cost_src_wei::text,
-			receipt_observed_at, receipt_cost_priced_at
-		FROM tx_outbox
-		WHERE chain_eid = $1 AND signer_id = $2
-			AND status IN ('signed', 'broadcast', 'held')
-			AND active_attempt_id IS NOT NULL
-		ORDER BY last_receipt_poll_at ASC NULLS FIRST, id ASC
+			o.id, o.chain_eid, o.purpose, o.guid, o.to_address, o.calldata, o.value::text,
+			a.gas_limit::text, a.max_fee_per_gas::text, a.max_priority_fee_per_gas::text,
+			o.nonce, a.tx_hash, o.signer_id, o.status, o.attempts,
+			o.failure_kind, o.next_retry_at, o.retry_of_id,
+			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
+			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
+			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
+			o.receipt_observed_at, o.receipt_cost_priced_at
+		FROM tx_outbox o
+		JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
+		WHERE o.chain_eid = $1 AND o.signer_id = $2
+			AND o.status IN ('signed', 'broadcast', 'held')
+			AND o.active_attempt_id IS NOT NULL
+		ORDER BY o.last_receipt_poll_at ASC NULLS FIRST, o.id ASC
 		LIMIT $3
 	`, chainEID, signerID, limit)
 	if err != nil {
@@ -668,8 +667,8 @@ func (s *Store) TouchReceiptPoll(ctx context.Context, id int64) error {
 }
 
 // FinalizeAttemptReceipt applies a confirmation-depth receipt in one atomic
-// transaction: the winning attempt becomes mined, the outbox mirror, active
-// pointer, and receipt facts switch to it, the outbox reaches its terminal
+// transaction: the winning attempt becomes mined, the outbox active pointer
+// and receipt facts switch to it, the outbox reaches its terminal
 // status (confirmed, or failed with receipt-retry metadata), and any signing
 // lease or pending replacement request is cleared so an in-flight replacement
 // signer cannot land on the terminal row. The caller must apply the idempotent
@@ -695,14 +694,12 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 
 	var outboxID int64
 	var hashBytes []byte
-	var gasLimit, maxFee string
-	var maxPriority *string
 	if err := tx.QueryRow(ctx, `
-		SELECT outbox_id, tx_hash, gas_limit::text, max_fee_per_gas::text, max_priority_fee_per_gas::text
+		SELECT outbox_id, tx_hash
 		FROM tx_attempts
 		WHERE id = $1
 		FOR UPDATE
-	`, attemptID).Scan(&outboxID, &hashBytes, &gasLimit, &maxFee, &maxPriority); errors.Is(err, pgx.ErrNoRows) {
+	`, attemptID).Scan(&outboxID, &hashBytes); errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("tx attempt %d not found", attemptID)
 	} else if err != nil {
 		return err
@@ -734,37 +731,29 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 		}
 		lastErrorArg = optionalString(failure.Error())
 	}
-	var maxPriorityArg any
-	if maxPriority != nil {
-		maxPriorityArg = *maxPriority
-	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
 		SET
 			active_attempt_id = $1,
-			tx_hash = $2,
-			gas_limit = $3::numeric,
-			max_fee_per_gas = $4::numeric,
-			max_priority_fee_per_gas = $5::numeric,
 			receipt_tx_hash = $2,
-			receipt_status = $6,
-			receipt_block_number = $7,
-			receipt_gas_used = $8::numeric,
-			receipt_effective_gas_price = $9::numeric,
-			receipt_gas_cost_dst_wei = $10::numeric,
+			receipt_status = $3,
+			receipt_block_number = $4,
+			receipt_gas_used = $5::numeric,
+			receipt_effective_gas_price = $6::numeric,
+			receipt_gas_cost_dst_wei = $7::numeric,
 			receipt_observed_at = now(),
-			status = $12,
+			status = $9,
 			held_reason = NULL,
-			failure_kind = $13,
-			next_retry_at = $14,
-			last_error = $15,
+			failure_kind = $10,
+			next_retry_at = $11,
+			last_error = $12,
 			lease_token = NULL,
 			lease_until = NULL,
 			replace_requested_at = NULL,
 			next_sign_at = NULL,
 			updated_at = now()
-		WHERE id = $11
-	`, attemptID, facts.TxHash.Bytes(), gasLimit, maxFee, maxPriorityArg,
+		WHERE id = $8
+	`, attemptID, facts.TxHash.Bytes(),
 		int64(facts.Status), int64(facts.BlockNumber), strconv.FormatUint(facts.GasUsed, 10),
 		facts.EffectiveGasPrice.String(), facts.GasCostDstWei.String(), outboxID,
 		status, failureKindArg, retryAtArg, lastErrorArg)
@@ -931,7 +920,7 @@ func (s *Store) DeferReplacement(ctx context.Context, id int64) error {
 
 // ReplacementCandidate is one outbox row due for a same-nonce replacement, with
 // every poll-worthy attempt hash so the caller can pre-check receipts across all
-// of them (not only the active mirror) before signing a doomed replacement.
+// of them (not only the active attempt) before signing a doomed replacement.
 type ReplacementCandidate struct {
 	Outbox          OutboxTx
 	ActiveAttemptID int64
@@ -939,11 +928,12 @@ type ReplacementCandidate struct {
 }
 
 // NextReplacementCandidate peeks (without reserving) the next outbox row whose
-// active attempt should be replaced: either a stale broadcast whose accepted or
-// ambiguous attempt has gone staleAfter without a receipt, or an operator
-// replacement request that has come due. Rows whose active attempt has not been
-// sent yet are skipped (the pending signed attempt broadcasts first), as are rows
-// at the replacement or pre-sign failure budget or under a signing lease.
+// active attempt should be replaced: a stale broadcast whose accepted or
+// ambiguous attempt has gone staleAfter without a receipt, a reprice hold that
+// has cooled down for an automatic fee bump, or an operator replacement request
+// that has come due. Rows whose active attempt has not been sent yet are skipped
+// (the pending signed attempt broadcasts first), as are rows at the replacement
+// or pre-sign failure budget or under a signing lease.
 func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, signerID string, staleAfter time.Duration) (ReplacementCandidate, error) {
 	if chainEID == 0 || signerID == "" {
 		return ReplacementCandidate{}, errors.New("chain and signer are required")
@@ -956,8 +946,8 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 			o.id, o.chain_eid, o.purpose, o.guid, o.to_address, o.calldata, o.value::text,
-			o.gas_limit::text, o.max_fee_per_gas::text, o.max_priority_fee_per_gas::text,
-			o.nonce, o.tx_hash, o.signer_id, o.status, o.attempts,
+			a.gas_limit::text, a.max_fee_per_gas::text, a.max_priority_fee_per_gas::text,
+			o.nonce, a.tx_hash, o.signer_id, o.status, o.attempts,
 			o.failure_kind, o.next_retry_at, o.retry_of_id,
 			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
 			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
@@ -965,14 +955,15 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 			o.receipt_observed_at, o.receipt_cost_priced_at,
 			a.id
 		FROM tx_outbox o
-		JOIN tx_attempts a ON a.id = o.active_attempt_id
+		JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
 		WHERE o.chain_eid = $1 AND o.signer_id = $2
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
 			AND a.state IN ('submitted', 'ambiguous')
 			AND o.pre_sign_failure_count < $3
 			AND (
 				-- An operator request authorizes one replacement past the automatic
-				-- cap (the request is cleared when the replacement is persisted).
+				-- cap and cooldowns (the request is cleared when the replacement is
+				-- persisted).
 				(
 					o.replace_requested_at IS NOT NULL AND o.replace_requested_at <= now()
 					AND (o.status = $4 OR (o.status = $6 AND o.held_reason = $7))
@@ -984,11 +975,25 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 						WHERE r.outbox_id = o.id AND r.kind = $8
 					) < $9
 				)
+				-- A reprice hold recovers automatically after a cooldown (updated_at
+				-- is refreshed by the underpriced send result and by deferrals, so
+				-- back-to-back underpriced rounds cannot burn the budget in one hot
+				-- loop), until the automatic replacement cap sends it back to the
+				-- operator.
+				OR (
+					o.status = $6 AND o.held_reason = $7
+					AND o.updated_at <= now() - $10::interval
+					AND (
+						SELECT count(*) FROM tx_attempts r
+						WHERE r.outbox_id = o.id AND r.kind = $8
+					) < $9
+				)
 			)
 		ORDER BY o.updated_at, o.id
 		LIMIT 1
 	`, chainEID, signerID, TxMaxPreSignFailures, TxStatusBroadcast, pgInterval(staleAfter),
-		TxStatusHeld, HeldRepriceRequired, TxAttemptReplacement, TxMaxReplacements).Scan(
+		TxStatusHeld, HeldRepriceRequired, TxAttemptReplacement, TxMaxReplacements,
+		pgInterval(txReplacementDeferDelay)).Scan(
 		&row.ID, &row.ChainEID, &row.Purpose, &row.GUID, &row.ToAddress,
 		&row.Calldata, &row.Value, &row.GasLimit, &row.MaxFeePerGas,
 		&row.MaxPriorityFeePerGas, &row.Nonce, &row.TxHash, &row.SignerID,
@@ -1080,7 +1085,7 @@ func (s *Store) ClaimOutboxForReplacementSigning(ctx context.Context, id, expect
 }
 
 // InsertReplacementAttempt persists an already-signed replacement attempt
-// (state=signed), switches the outbox active pointer and mirror to it, clears any
+// (state=signed), switches the outbox active pointer to it, clears any
 // reprice hold and the replacement request, and releases the signing lease, all in
 // one transaction. The active-attempt CAS rejects a replacement raced by another
 // switch; tx_hash reinsertion is idempotent for crash recovery.
@@ -1134,7 +1139,7 @@ func (s *Store) InsertReplacementAttempt(ctx context.Context, outboxID, expected
 		return TxAttempt{}, ErrActiveAttemptChanged
 	}
 	// The row must still be replaceable: a receipt terminalization or a hold that
-	// raced this signature must win, or a terminal row's mirror would be switched
+	// raced this signature must win, or a terminal row's active attempt would be switched
 	// to a never-sent replacement.
 	replaceable := outboxStatus == TxStatusBroadcast ||
 		(outboxStatus == TxStatusHeld && heldReason != nil && *heldReason == HeldRepriceRequired)
@@ -1162,15 +1167,13 @@ func (s *Store) InsertReplacementAttempt(ctx context.Context, outboxID, expected
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
-		SET active_attempt_id = $1, tx_hash = $2, gas_limit = $3::numeric,
-			max_fee_per_gas = $4::numeric, max_priority_fee_per_gas = $5::numeric,
-			status = CASE WHEN status = $6 THEN $7 ELSE status END,
+		SET active_attempt_id = $1,
+			status = CASE WHEN status = $2 THEN $3 ELSE status END,
 			held_reason = NULL, replace_requested_at = NULL,
 			lease_token = NULL, lease_until = NULL,
 			pre_sign_failure_count = 0, next_sign_at = NULL, updated_at = now()
-		WHERE id = $8
-	`, attemptID, a.TxHash.Bytes(), int64(a.GasLimit), a.MaxFeePerGas.String(), priorityArg,
-		TxStatusHeld, TxStatusSigned, outboxID); err != nil {
+		WHERE id = $4
+	`, attemptID, TxStatusHeld, TxStatusSigned, outboxID); err != nil {
 		return TxAttempt{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

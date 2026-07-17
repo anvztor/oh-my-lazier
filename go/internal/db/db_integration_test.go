@@ -2427,19 +2427,27 @@ func testPacketRecord() PacketRecord {
 	}
 }
 
-// seedBroadcastMirror puts a nonce and a broadcast mirror state onto an outbox
-// row directly in SQL: production writes go through the durable-attempt flow,
-// which these workflow tests do not exercise.
+// seedBroadcastMirror puts a nonce, a submitted attempt, and broadcast status
+// onto an outbox row directly in SQL: production reaches this state through the
+// durable-attempt flow, which these workflow tests do not exercise.
 func seedBroadcastMirror(ctx context.Context, t *testing.T, store *Store, id, nonce int64, txHash common.Hash) {
 	t.Helper()
+	var attemptID int64
+	if err := store.pool.QueryRow(ctx, `
+		INSERT INTO tx_attempts (outbox_id, kind, nonce, tx_type, tx_hash, raw_tx, gas_limit,
+			max_fee_per_gas, max_priority_fee_per_gas, state, signing_token, broadcast_count)
+		VALUES ($1, 'original', $2, 2, $3, '\x01', 100000, 2000000000, 1000000000, 'submitted', gen_random_uuid(), 1)
+		RETURNING id
+	`, id, nonce, txHash.Bytes()).Scan(&attemptID); err != nil {
+		t.Fatalf("seed broadcast attempt: %v", err)
+	}
 	if _, err := store.pool.Exec(ctx, `
 		UPDATE tx_outbox
-		SET nonce = $2, status = 'broadcast', tx_hash = $3, gas_limit = 100000,
-			max_fee_per_gas = 2000000000, max_priority_fee_per_gas = 1000000000,
+		SET nonce = $2, status = 'broadcast', active_attempt_id = $3,
 			lease_token = NULL, lease_until = NULL, updated_at = now()
 		WHERE id = $1
-	`, id, nonce, txHash.Bytes()); err != nil {
-		t.Fatalf("seed broadcast mirror: %v", err)
+	`, id, nonce, attemptID); err != nil {
+		t.Fatalf("seed broadcast state: %v", err)
 	}
 }
 
@@ -2458,12 +2466,13 @@ func seedReceiptFailed(ctx context.Context, t *testing.T, store *Store, id int64
 }
 
 // seedConfirmed marks a row terminal-confirmed directly in SQL; production
-// writes this state via FinalizeAttemptReceipt.
+// writes this state via FinalizeAttemptReceipt. The winning hash is recorded in
+// the receipt facts column (the current hash projects from the active attempt).
 func seedConfirmed(ctx context.Context, t *testing.T, store *Store, id int64, txHash common.Hash) {
 	t.Helper()
 	if _, err := store.pool.Exec(ctx, `
 		UPDATE tx_outbox
-		SET status = 'confirmed', held_reason = NULL, tx_hash = $2,
+		SET status = 'confirmed', held_reason = NULL, receipt_tx_hash = $2,
 			failure_kind = NULL, next_retry_at = NULL, updated_at = now()
 		WHERE id = $1
 	`, id, txHash.Bytes()); err != nil {

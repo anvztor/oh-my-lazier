@@ -11,8 +11,8 @@ import (
 
 // TxReceiptFacts records the mined receipt values used for actual gas-cost accounting.
 type TxReceiptFacts struct {
-	// TxHash intentionally mirrors tx_outbox.tx_hash for mined rows so receipt facts
-	// remain self-contained evidence for the exact transaction the RPC returned.
+	// TxHash is the winning attempt's hash, persisted with the receipt facts so
+	// they stay self-contained evidence for the exact transaction the RPC returned.
 	TxHash            common.Hash
 	Status            uint64
 	BlockNumber       uint64

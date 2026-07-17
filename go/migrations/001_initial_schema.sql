@@ -109,14 +109,11 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   to_address BYTEA NOT NULL,
   calldata BYTEA NOT NULL,
   value NUMERIC NOT NULL DEFAULT 0,
-  gas_limit NUMERIC,
-  max_fee_per_gas NUMERIC,
-  max_priority_fee_per_gas NUMERIC,
   nonce BIGINT,
   signer_id TEXT NOT NULL,
   status TEXT NOT NULL,
-  tx_hash BYTEA,
-  -- Mirrors tx_hash for mined rows so receipt facts stay self-contained audit evidence.
+  -- Records the winning attempt's hash at terminalization so receipt facts stay
+  -- self-contained audit evidence.
   receipt_tx_hash BYTEA,
   receipt_status INTEGER,
   receipt_block_number BIGINT,
@@ -131,9 +128,10 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   next_retry_at TIMESTAMPTZ,
   retry_of_id BIGINT REFERENCES tx_outbox(id),
   last_error TEXT,
-  -- Durable-attempt model (P2-A #1): the outbox owns the logical task and nonce;
-  -- each physical signed transaction is an immutable row in tx_attempts. The
-  -- columns above mirror the active attempt for existing readers.
+  -- Durable-attempt model (P2-A): the outbox owns the logical task and nonce;
+  -- each physical signed transaction is an immutable row in tx_attempts, and the
+  -- active attempt is the single source of truth for the current hash, gas, and
+  -- fees (read queries project them from the join; nothing is mirrored here).
   active_attempt_id BIGINT,
   -- Signing lease so only one worker instance signs a new attempt for this row.
   lease_token UUID,

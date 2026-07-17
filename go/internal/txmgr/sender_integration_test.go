@@ -1524,6 +1524,85 @@ func TestRequestTxReplacementPreservesNonceAndRefreshesGasPrice(t *testing.T) {
 	}
 }
 
+func TestUnderpricedSendAutoRepricesAfterCooldown(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       23,
+		estimatedGas:       111_111,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		sendErr:            errors.New("transaction underpriced"),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  "commit-verification",
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x01, 0x02},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	heldTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(held) error = %v", err)
+	}
+	if heldTx.Status != db.TxStatusHeld {
+		t.Fatalf("status after underpriced = %q, want %q", heldTx.Status, db.TxStatusHeld)
+	}
+
+	// Inside the cooldown nothing is repriced; after it, the hold recovers with
+	// no operator involvement.
+	if _, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target); !errors.Is(err, db.ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("ProcessStaleBroadcastReplacement(cooldown) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+	forceBroadcastAgeSeconds(t, id, 120)
+	client.sendErr = nil
+	if _, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target); err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement(auto reprice) error = %v", err)
+	}
+	repriced, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(repriced) error = %v", err)
+	}
+	if repriced.Status != db.TxStatusSigned {
+		t.Fatalf("status after auto reprice = %q, want %q", repriced.Status, db.TxStatusSigned)
+	}
+	if repriced.MaxFeePerGas.Cmp(big.NewInt(2_200_000_000)) != 0 || repriced.MaxPriorityFeePerGas.Cmp(big.NewInt(1_100_000_000)) != 0 {
+		t.Fatalf("repriced fees = %s/%s, want 10%% bump over the underpriced attempt", repriced.MaxFeePerGas, repriced.MaxPriorityFeePerGas)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(repriced) error = %v", err)
+	}
+	if len(client.sent) != 2 {
+		t.Fatalf("sent tx count = %d, want 2", len(client.sent))
+	}
+	if client.sent[1].Nonce() != client.sent[0].Nonce() {
+		t.Fatalf("repriced nonce = %d, want the held nonce %d", client.sent[1].Nonce(), client.sent[0].Nonce())
+	}
+	if client.sent[1].GasFeeCap().Cmp(big.NewInt(2_200_000_000)) != 0 {
+		t.Fatalf("repriced max fee = %s, want 2200000000", client.sent[1].GasFeeCap())
+	}
+	final, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(final) error = %v", err)
+	}
+	if final.Status != db.TxStatusBroadcast {
+		t.Fatalf("final status = %q, want broadcast", final.Status)
+	}
+}
+
 func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 	store := openTestStore(t)
 	signer := newTestKeystoreSigner(t)

@@ -490,10 +490,11 @@ func TestRequestTxReplacementFromRepriceHold(t *testing.T) {
 		t.Fatalf("outbox status=%q held_reason=%q, want held/reprice_required", status, heldReason)
 	}
 
-	// A reprice hold is only replaced on operator request.
+	// A fresh reprice hold is inside the automatic cooldown window.
 	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
-		t.Fatalf("NextReplacementCandidate(no request) error = %v, want ErrNoStaleBroadcastReplacement", err)
+		t.Fatalf("NextReplacementCandidate(inside cooldown) error = %v, want ErrNoStaleBroadcastReplacement", err)
 	}
+	// An operator request bypasses the cooldown.
 	if err := h.store.RequestTxReplacement(h.ctx, id); err != nil {
 		t.Fatalf("RequestTxReplacement: %v", err)
 	}
@@ -503,6 +504,24 @@ func TestRequestTxReplacementFromRepriceHold(t *testing.T) {
 	}
 	if candidate.Outbox.ID != id {
 		t.Fatalf("candidate outbox = %d, want %d", candidate.Outbox.ID, id)
+	}
+	// Once the cooldown has passed, the reprice hold recovers automatically,
+	// with no operator request at all.
+	if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_outbox SET replace_requested_at = NULL WHERE id = $1`, id); err != nil {
+		t.Fatalf("clear request: %v", err)
+	}
+	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("NextReplacementCandidate(cooldown, request cleared) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+	if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_outbox SET updated_at = now() - interval '2 minutes' WHERE id = $1`, id); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	candidate, err = h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("NextReplacementCandidate(auto reprice): %v", err)
+	}
+	if candidate.Outbox.ID != id {
+		t.Fatalf("auto reprice candidate = %d, want %d", candidate.Outbox.ID, id)
 	}
 
 	leaseToken := uuid.New()

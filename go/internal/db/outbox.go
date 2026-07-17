@@ -183,19 +183,20 @@ func (s *Store) peekSendableTx(ctx context.Context, chainEID uint32, signerID st
 	var row outboxTxRow
 	err := s.pool.QueryRow(ctx, `
 		SELECT
-			id, chain_eid, purpose, guid, to_address, calldata, value::text,
-			gas_limit::text, max_fee_per_gas::text, max_priority_fee_per_gas::text,
-			nonce, tx_hash, signer_id, status, attempts,
-			failure_kind, next_retry_at, retry_of_id,
-			receipt_tx_hash, receipt_status::text, receipt_block_number::text,
-			receipt_gas_used::text, receipt_effective_gas_price::text,
-			receipt_gas_cost_dst_wei::text, receipt_gas_cost_src_wei::text,
-			receipt_observed_at, receipt_cost_priced_at
-		FROM tx_outbox
-		WHERE chain_eid = $1 AND signer_id = $2 AND status = ANY($3)
-			AND (next_sign_at IS NULL OR next_sign_at <= now())
-			AND (lease_until IS NULL OR lease_until <= now())
-		ORDER BY CASE WHEN status = 'nonce_assigned' THEN 0 ELSE 1 END, nonce ASC NULLS LAST, id
+			o.id, o.chain_eid, o.purpose, o.guid, o.to_address, o.calldata, o.value::text,
+			a.gas_limit::text, a.max_fee_per_gas::text, a.max_priority_fee_per_gas::text,
+			o.nonce, a.tx_hash, o.signer_id, o.status, o.attempts,
+			o.failure_kind, o.next_retry_at, o.retry_of_id,
+			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
+			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
+			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
+			o.receipt_observed_at, o.receipt_cost_priced_at
+		FROM tx_outbox o
+		LEFT JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
+		WHERE o.chain_eid = $1 AND o.signer_id = $2 AND o.status = ANY($3)
+			AND (o.next_sign_at IS NULL OR o.next_sign_at <= now())
+			AND (o.lease_until IS NULL OR o.lease_until <= now())
+		ORDER BY CASE WHEN o.status = 'nonce_assigned' THEN 0 ELSE 1 END, o.nonce ASC NULLS LAST, o.id
 		LIMIT 1
 	`, chainEID, signerID, statuses).Scan(
 		&row.ID,
@@ -279,21 +280,23 @@ func (s *Store) BootstrapTxNonceCursor(ctx context.Context, chainEID uint32, sig
 	return tag.RowsAffected() == 1, nil
 }
 
-// GetOutboxTx returns one persisted transaction request.
+// GetOutboxTx returns one persisted transaction request. The current hash, gas,
+// and fees are projected from the active attempt (the single source of truth).
 func (s *Store) GetOutboxTx(ctx context.Context, id int64) (OutboxTx, error) {
 	var row outboxTxRow
 	err := s.pool.QueryRow(ctx, `
 		SELECT
-			id, chain_eid, purpose, guid, to_address, calldata, value::text,
-			gas_limit::text, max_fee_per_gas::text, max_priority_fee_per_gas::text,
-			nonce, tx_hash, signer_id, status, attempts,
-			failure_kind, next_retry_at, retry_of_id,
-			receipt_tx_hash, receipt_status::text, receipt_block_number::text,
-			receipt_gas_used::text, receipt_effective_gas_price::text,
-			receipt_gas_cost_dst_wei::text, receipt_gas_cost_src_wei::text,
-			receipt_observed_at, receipt_cost_priced_at
-		FROM tx_outbox
-		WHERE id = $1
+			o.id, o.chain_eid, o.purpose, o.guid, o.to_address, o.calldata, o.value::text,
+			a.gas_limit::text, a.max_fee_per_gas::text, a.max_priority_fee_per_gas::text,
+			o.nonce, a.tx_hash, o.signer_id, o.status, o.attempts,
+			o.failure_kind, o.next_retry_at, o.retry_of_id,
+			o.receipt_tx_hash, o.receipt_status::text, o.receipt_block_number::text,
+			o.receipt_gas_used::text, o.receipt_effective_gas_price::text,
+			o.receipt_gas_cost_dst_wei::text, o.receipt_gas_cost_src_wei::text,
+			o.receipt_observed_at, o.receipt_cost_priced_at
+		FROM tx_outbox o
+		LEFT JOIN tx_attempts a ON a.outbox_id = o.id AND a.id = o.active_attempt_id
+		WHERE o.id = $1
 	`, id).Scan(
 		&row.ID,
 		&row.ChainEID,
@@ -387,9 +390,6 @@ func (s *Store) MarkQueuedTxEstimateRevertFailed(ctx context.Context, id int64, 
 			status = $1,
 			failure_kind = $2,
 			next_retry_at = $3,
-			gas_limit = NULL,
-			max_fee_per_gas = NULL,
-			max_priority_fee_per_gas = NULL,
 			last_error = $4,
 			updated_at = now()
 		WHERE id = $5
@@ -432,7 +432,7 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 	}
 
 	if row.Nonce == nil || row.FailureKind != TxFailureReceiptFailed {
-		if err := requeueFailedTx(ctx, tx, id, true); err != nil {
+		if err := requeueFailedTx(ctx, tx, id); err != nil {
 			return 0, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -519,7 +519,7 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 	var retryID int64
 	switch {
 	case row.Nonce == nil || row.FailureKind == TxFailureEstimateGasRevert:
-		if err := requeueFailedTx(ctx, tx, row.ID, true); err != nil {
+		if err := requeueFailedTx(ctx, tx, row.ID); err != nil {
 			return 0, err
 		}
 		retryID = row.ID
@@ -546,22 +546,18 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 	return retryID, nil
 }
 
-func requeueFailedTx(ctx context.Context, tx pgx.Tx, id int64, clearGas bool) error {
+func requeueFailedTx(ctx context.Context, tx pgx.Tx, id int64) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
 		SET
 			status = $1,
-			tx_hash = NULL,
-			gas_limit = CASE WHEN $2 THEN NULL ELSE gas_limit END,
-			max_fee_per_gas = CASE WHEN $2 THEN NULL ELSE max_fee_per_gas END,
-			max_priority_fee_per_gas = CASE WHEN $2 THEN NULL ELSE max_priority_fee_per_gas END,
 			attempts = attempts + 1,
 			failure_kind = NULL,
 			next_retry_at = NULL,
 			last_error = NULL,
 			updated_at = now()
-		WHERE id = $3 AND status = $4
-	`, TxStatusQueued, clearGas, id, TxStatusFailed)
+		WHERE id = $2 AND status = $3
+	`, TxStatusQueued, id, TxStatusFailed)
 	if err != nil {
 		return err
 	}

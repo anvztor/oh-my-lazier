@@ -154,7 +154,7 @@ func (m *Manager) recoverNonceAssignedTx(ctx context.Context, target Target, sig
 }
 
 // preflight quotes fees and determines the gas limit inside the pre-sign RPC
-// deadline. reuseGasLimit keeps a previously mirrored gas limit (replacements).
+// deadline. reuseGasLimit keeps the active attempt's gas limit (replacements).
 func (m *Manager) preflight(ctx context.Context, target Target, queued db.QueuedOutboxTx, policy FeePolicy, reuseGasLimit bool) (feeQuote, uint64, error) {
 	rpcCtx, cancel := context.WithTimeout(ctx, m.options.PreSignRPCTimeout)
 	defer cancel()
@@ -388,7 +388,7 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 	// Any attempt of this row may be mined and only waiting to reach confirmation
 	// depth (the receipt gate keeps the row non-terminal). Replacing it would
 	// broadcast a doomed same-nonce tx, so check every persisted hash, not only
-	// the active mirror.
+	// the active attempt.
 	for _, hash := range candidate.AttemptHashes {
 		receipt, receiptErr := target.Client.TransactionReceipt(ctx, hash)
 		if errors.Is(receiptErr, ethereum.NotFound) {
@@ -461,7 +461,7 @@ func receiptConfirmed(head *types.Header, receipt *types.Receipt, confirmations 
 
 // applyWorkflowReceipt applies the workflow effect of a mined receipt using the
 // winning attempt's hash (a non-active attempt can win the receipt race, so the
-// outbox mirror hash must not be trusted here). Every alreadyApplied set includes
+// projected active-attempt hash must not be trusted here). Every alreadyApplied set includes
 // MANUAL_REVIEW: a crash between the workflow write and the receipt finalizer
 // replays this on the next pass, and by then the worker may have legally parked
 // the job for operator review; the replay must not wedge on that terminal state.
