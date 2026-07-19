@@ -938,3 +938,60 @@ func TestExtendNonceReconciliationRenewsHeldLeaseOnly(t *testing.T) {
 		t.Fatalf("ExtendNonceReconciliation(released) error = %v, want ErrOutboxLeaseLost", err)
 	}
 }
+
+func TestDeferCancelPushesDueRequestOutOfSelection(t *testing.T) {
+	h := newAttemptHarness(t, "0x7878787878787878787878787878787878787878", 140)
+	id := h.enqueue()
+	original := h.signAttempt(id, 140, common.HexToHash("0x7301"))
+	h.broadcastResult(original.ID, SendErrorAmbiguous)
+
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+	candidate, err := h.store.NextCancelCandidate(h.ctx, 40161, h.signerID)
+	if err != nil {
+		t.Fatalf("NextCancelCandidate: %v", err)
+	}
+	if candidate.Outbox.ID != id {
+		t.Fatalf("candidate = %d, want %d", candidate.Outbox.ID, id)
+	}
+
+	if err := h.store.DeferCancel(h.ctx, id); err != nil {
+		t.Fatalf("DeferCancel() error = %v", err)
+	}
+	if _, err := h.store.NextCancelCandidate(h.ctx, 40161, h.signerID); !errors.Is(err, ErrNoCancelWork) {
+		t.Fatalf("NextCancelCandidate(deferred) error = %v, want ErrNoCancelWork", err)
+	}
+	var requestInFuture bool
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT cancel_requested_at > now() FROM tx_outbox WHERE id = $1", id).Scan(&requestInFuture); err != nil {
+		t.Fatalf("select cancel_requested_at: %v", err)
+	}
+	if !requestInFuture {
+		t.Fatal("DeferCancel() did not push cancel_requested_at into the future")
+	}
+
+	// The deferral is a delay, not a drop: once due again the request re-selects.
+	if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_outbox SET cancel_requested_at = now() - interval '1 second' WHERE id = $1`, id); err != nil {
+		t.Fatalf("backdate cancel request: %v", err)
+	}
+	candidate, err = h.store.NextCancelCandidate(h.ctx, 40161, h.signerID)
+	if err != nil {
+		t.Fatalf("NextCancelCandidate(due again): %v", err)
+	}
+	if candidate.Outbox.ID != id {
+		t.Fatalf("due-again candidate = %d, want %d", candidate.Outbox.ID, id)
+	}
+
+	// A row without cancel intent is untouched.
+	other := h.enqueue()
+	if err := h.store.DeferCancel(h.ctx, other); err != nil {
+		t.Fatalf("DeferCancel(no intent) error = %v", err)
+	}
+	var cancelRequestedAt *time.Time
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT cancel_requested_at FROM tx_outbox WHERE id = $1", other).Scan(&cancelRequestedAt); err != nil {
+		t.Fatalf("select no-intent cancel_requested_at: %v", err)
+	}
+	if cancelRequestedAt != nil {
+		t.Fatalf("DeferCancel(no intent) set cancel_requested_at = %v, want NULL", cancelRequestedAt)
+	}
+}

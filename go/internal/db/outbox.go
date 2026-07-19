@@ -178,11 +178,6 @@ func (s *Store) EnqueueTx(ctx context.Context, request TxRequest) (int64, error)
 	return id, tx.Commit(ctx)
 }
 
-// PeekQueuedTx returns the next queued outbox row for one chain signer without reserving a nonce.
-func (s *Store) PeekQueuedTx(ctx context.Context, chainEID uint32, signerID string) (QueuedOutboxTx, error) {
-	return s.peekSendableTx(ctx, chainEID, signerID, []string{TxStatusQueued})
-}
-
 // PeekSendableTx returns the next queued or nonce-assigned outbox row that can be signed or re-signed.
 func (s *Store) PeekSendableTx(ctx context.Context, chainEID uint32, signerID string) (QueuedOutboxTx, error) {
 	return s.peekSendableTx(ctx, chainEID, signerID, []string{TxStatusQueued, TxStatusNonceAssigned})

@@ -993,3 +993,96 @@ func TestHeldStatsRepriceAgeTracksActiveAttempt(t *testing.T) {
 		t.Fatal("reprice hold not reported")
 	}
 }
+
+func TestDeferReplacementAndReceiptRefreshKeepRowOutOfStaleWindow(t *testing.T) {
+	h := newAttemptHarness(t, "0x7676767676767676767676767676767676767676", 130)
+	id := h.enqueue()
+	attempt := h.signAttempt(id, 130, common.HexToHash("0x7201"))
+	h.broadcastResult(attempt.ID, SendErrorAccepted)
+	backdate := func() {
+		t.Helper()
+		if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_outbox SET updated_at = now() - interval '16 minutes' WHERE id = $1`, id); err != nil {
+			t.Fatalf("backdate: %v", err)
+		}
+	}
+
+	backdate()
+	candidate, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("NextReplacementCandidate(stale) error = %v", err)
+	}
+	if candidate.Outbox.ID != id || candidate.ActiveAttemptID != attempt.ID {
+		t.Fatalf("candidate = %d/%d, want %d/%d", candidate.Outbox.ID, candidate.ActiveAttemptID, id, attempt.ID)
+	}
+
+	// An observed-but-shallow receipt restarts the stale clock so the mined
+	// transaction is not replaced out from under its confirmation depth.
+	if err := h.store.RefreshBroadcastReceiptObservedAt(h.ctx, id); err != nil {
+		t.Fatalf("RefreshBroadcastReceiptObservedAt() error = %v", err)
+	}
+	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("NextReplacementCandidate(refreshed) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+
+	// A preflight deferral pushes a stale candidate out of the window without
+	// inventing an operator request.
+	backdate()
+	if err := h.store.DeferReplacement(h.ctx, id); err != nil {
+		t.Fatalf("DeferReplacement() error = %v", err)
+	}
+	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("NextReplacementCandidate(deferred) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+	var replaceRequestedAt *time.Time
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT replace_requested_at FROM tx_outbox WHERE id = $1", id).Scan(&replaceRequestedAt); err != nil {
+		t.Fatalf("select replace_requested_at: %v", err)
+	}
+	if replaceRequestedAt != nil {
+		t.Fatalf("deferral of a stale candidate set replace_requested_at = %v, want NULL", replaceRequestedAt)
+	}
+
+	// A due operator request selects immediately; a deferral pushes the request
+	// itself into the future instead of dropping it.
+	if err := h.store.RequestTxReplacement(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxReplacement() error = %v", err)
+	}
+	candidate, err = h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("NextReplacementCandidate(requested) error = %v", err)
+	}
+	if candidate.Outbox.ID != id {
+		t.Fatalf("requested candidate = %d, want %d", candidate.Outbox.ID, id)
+	}
+	if err := h.store.DeferReplacement(h.ctx, id); err != nil {
+		t.Fatalf("DeferReplacement(requested) error = %v", err)
+	}
+	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("NextReplacementCandidate(deferred request) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+	var requestInFuture bool
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT replace_requested_at > now() FROM tx_outbox WHERE id = $1", id).Scan(&requestInFuture); err != nil {
+		t.Fatalf("select deferred replace_requested_at: %v", err)
+	}
+	if !requestInFuture {
+		t.Fatal("DeferReplacement() did not push the operator request into the future")
+	}
+
+	// The receipt refresh only touches signed/broadcast rows: a terminal row's
+	// updated_at stays put.
+	seedConfirmed(h.ctx, t, h.store, id, common.HexToHash("0x7201"))
+	backdate()
+	var before time.Time
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT updated_at FROM tx_outbox WHERE id = $1", id).Scan(&before); err != nil {
+		t.Fatalf("select updated_at: %v", err)
+	}
+	if err := h.store.RefreshBroadcastReceiptObservedAt(h.ctx, id); err != nil {
+		t.Fatalf("RefreshBroadcastReceiptObservedAt(confirmed) error = %v", err)
+	}
+	var after time.Time
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT updated_at FROM tx_outbox WHERE id = $1", id).Scan(&after); err != nil {
+		t.Fatalf("select updated_at after refresh: %v", err)
+	}
+	if !after.Equal(before) {
+		t.Fatalf("refresh touched a confirmed row: updated_at %v -> %v", before, after)
+	}
+}
