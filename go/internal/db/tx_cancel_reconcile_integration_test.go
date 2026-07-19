@@ -804,6 +804,74 @@ func TestReconciliationParksExhaustedReleaseAsBroadcastExhausted(t *testing.T) {
 	}
 }
 
+func TestCanceledRowReportsSupersededNotExhausted(t *testing.T) {
+	h := newAttemptHarness(t, "0x7272727272727272727272727272727272727272", 221)
+	id := h.enqueue()
+	original := h.signAttempt(id, 221, common.HexToHash("0xa721"))
+	h.broadcastResult(original.ID, SendErrorAccepted)
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+	leaseToken := uuid.New()
+	if _, err := h.store.ClaimOutboxForCancelSigning(h.ctx, id, original.ID, leaseToken, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForCancelSigning: %v", err)
+	}
+	cancelAttempt, err := h.store.InsertCancelAttempt(h.ctx, id, original.ID, leaseToken, SignedAttempt{
+		Kind: TxAttemptCancel, Nonce: 221, TxType: 2, TxHash: common.HexToHash("0xa722"),
+		RawTx: []byte{0xa7, 0x22}, GasLimit: 21000,
+		MaxFeePerGas: big.NewInt(3_000_000_000), MaxPriorityFeePerGas: big.NewInt(1_500_000_000),
+		SigningToken: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("InsertCancelAttempt: %v", err)
+	}
+	broadcastToken := uuid.New()
+	claim, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, broadcastToken, 30*time.Second)
+	if err != nil || claim.AttemptID != cancelAttempt.ID {
+		t.Fatalf("ClaimAttemptForBroadcast = (%d, %v), want %d", claim.AttemptID, err, cancelAttempt.ID)
+	}
+	if err := h.store.MarkAttemptSendResult(h.ctx, claim.AttemptID, broadcastToken, SendErrorAccepted, ""); err != nil {
+		t.Fatalf("MarkAttemptSendResult: %v", err)
+	}
+	facts := TxReceiptFacts{TxHash: cancelAttempt.TxHash, Status: 1, BlockNumber: 400, GasUsed: 21000, EffectiveGasPrice: big.NewInt(1_000_000_000), GasCostDstWei: new(big.Int).Mul(big.NewInt(21000), big.NewInt(1_000_000_000))}
+	if _, err := h.store.PrepareReceiptResolution(h.ctx, cancelAttempt.ID, facts); err != nil {
+		t.Fatalf("PrepareReceiptResolution: %v", err)
+	}
+	if _, err := h.store.FinalizeAttemptReceipt(h.ctx, cancelAttempt.ID, facts); err != nil {
+		t.Fatalf("FinalizeAttemptReceipt: %v", err)
+	}
+
+	// A mined cancel is a COMPLETED operator resolution: RetryFailedTx rejects
+	// it, so classifying it exhausted would hold /readyz red forever.
+	snapshot, err := h.store.Stats(h.ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	for _, stat := range snapshot.TxOutbox {
+		if stat.ChainEID == 40161 && stat.Status == TxStatusFailed && stat.RetryState == TxOutboxRetryStateExhausted && stat.Count > 0 {
+			var count int
+			if err := h.store.pool.QueryRow(h.ctx, `
+				SELECT count(*) FROM tx_outbox
+				WHERE id = $1 AND failure_kind = $2
+			`, id, TxFailureCanceled).Scan(&count); err != nil {
+				t.Fatalf("check canceled row: %v", err)
+			}
+			if count == 1 {
+				t.Fatalf("canceled row %d reported as exhausted", id)
+			}
+		}
+	}
+	var reported bool
+	for _, stat := range snapshot.TxOutbox {
+		if stat.ChainEID == 40161 && stat.Status == TxStatusFailed && stat.RetryState == TxOutboxRetryStateSuperseded && stat.Count > 0 {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatal("canceled row not reported under the superseded (operator-resolved) class")
+	}
+}
+
 func TestResolveExternalNonceRetryRefusesInactiveScope(t *testing.T) {
 	h := newAttemptHarness(t, "0x7373737373737373737373737373737373737373", 231)
 	restoreScopeFlags(t, h.store)

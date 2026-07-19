@@ -1681,6 +1681,158 @@ func TestExecutorReceiptTransitionsPersistTxHashes(t *testing.T) {
 	}
 }
 
+func TestExecutorReceiveFailureCountsEachTxHashOnce(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	registry, err := chain.NewRegistry(testChains(), testPathways())
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, registry); err != nil {
+		t.Fatalf("SyncConfig() error = %v", err)
+	}
+
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorLzReceiveTxEnqueued)
+	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE guid = $1", packet.GUID.Bytes()); err != nil {
+		t.Fatalf("delete tx_outbox: %v", err)
+	}
+	cleanPacketRows(ctx, t, store, packet.GUID)
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(ctx, ExecutorJobRecord{
+		GUID:        packet.GUID,
+		AssignedFee: big.NewInt(42),
+		Status:      string(packets.ExecutorLzReceiveTxEnqueued),
+	}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+
+	firstFailedHash := common.HexToHash("0x3131313131313131313131313131313131313131313131313131313131313131")
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, firstFailedHash, "lzReceive reverted"); err != nil {
+		t.Fatalf("MarkExecutorReceiveFailed() error = %v", err)
+	}
+	job, err := store.GetExecutorJob(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetExecutorJob() error = %v", err)
+	}
+	if job.RetryCount != 1 {
+		t.Fatalf("retry count = %d, want 1", job.RetryCount)
+	}
+	if job.ReceiveTxHash != firstFailedHash {
+		t.Fatalf("receive tx hash = %s, want %s", job.ReceiveTxHash, firstFailedHash)
+	}
+
+	// The deliverer re-enqueues the failed job for a fresh attempt; the counted
+	// hash stays on the row.
+	for _, table := range []string{"executor_jobs", "packets"} {
+		if _, err := store.pool.Exec(ctx, "UPDATE "+table+" SET status = $1 WHERE guid = $2", string(packets.ExecutorLzReceiveTxEnqueued), packet.GUID.Bytes()); err != nil {
+			t.Fatalf("force %s re-enqueue: %v", table, err)
+		}
+	}
+
+	// A crash-replayed receipt or lagging LzReceiveAlert for the already
+	// counted hash must not charge the retry budget again or fail the new
+	// in-flight attempt.
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, firstFailedHash, "lzReceive reverted"); err != nil {
+		t.Fatalf("replayed MarkExecutorReceiveFailed() error = %v", err)
+	}
+	job, err = store.GetExecutorJob(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetExecutorJob() error = %v", err)
+	}
+	if job.Status != string(packets.ExecutorLzReceiveTxEnqueued) {
+		t.Fatalf("job status after replay = %q, want %q", job.Status, packets.ExecutorLzReceiveTxEnqueued)
+	}
+	if job.RetryCount != 1 {
+		t.Fatalf("retry count after replay = %d, want 1", job.RetryCount)
+	}
+	var packetStatus string
+	if err := store.pool.QueryRow(ctx, "SELECT status FROM packets WHERE guid = $1", packet.GUID.Bytes()).Scan(&packetStatus); err != nil {
+		t.Fatalf("select packet status: %v", err)
+	}
+	if packetStatus != string(packets.ExecutorLzReceiveTxEnqueued) {
+		t.Fatalf("packet status after replay = %q, want %q", packetStatus, packets.ExecutorLzReceiveTxEnqueued)
+	}
+
+	// The next attempt's own failure carries a new hash and still counts.
+	secondFailedHash := common.HexToHash("0x3232323232323232323232323232323232323232323232323232323232323232")
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, secondFailedHash, "lzReceive reverted"); err != nil {
+		t.Fatalf("second MarkExecutorReceiveFailed() error = %v", err)
+	}
+	job, err = store.GetExecutorJob(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetExecutorJob() error = %v", err)
+	}
+	if job.Status != string(packets.ExecutorLzReceiveFailed) {
+		t.Fatalf("job status = %q, want %q", job.Status, packets.ExecutorLzReceiveFailed)
+	}
+	if job.RetryCount != 2 {
+		t.Fatalf("retry count = %d, want 2", job.RetryCount)
+	}
+	if job.ReceiveTxHash != secondFailedHash {
+		t.Fatalf("receive tx hash = %s, want %s", job.ReceiveTxHash, secondFailedHash)
+	}
+
+	// A counted hash is a benign no-op in any state, including already-failed.
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, secondFailedHash, "lzReceive reverted"); err != nil {
+		t.Fatalf("failed-state replay MarkExecutorReceiveFailed() error = %v", err)
+	}
+
+	// An alert can lag several attempts behind: with a third attempt in flight
+	// and the first hash long overwritten on the job row, the stale first-hash
+	// alert must still not charge the budget or fail the in-flight attempt.
+	for _, table := range []string{"executor_jobs", "packets"} {
+		if _, err := store.pool.Exec(ctx, "UPDATE "+table+" SET status = $1 WHERE guid = $2", string(packets.ExecutorLzReceiveTxEnqueued), packet.GUID.Bytes()); err != nil {
+			t.Fatalf("force %s re-enqueue: %v", table, err)
+		}
+	}
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, firstFailedHash, "lzReceive reverted"); err != nil {
+		t.Fatalf("stale first-hash MarkExecutorReceiveFailed() error = %v", err)
+	}
+	job, err = store.GetExecutorJob(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetExecutorJob() error = %v", err)
+	}
+	if job.Status != string(packets.ExecutorLzReceiveTxEnqueued) {
+		t.Fatalf("job status after stale alert = %q, want %q", job.Status, packets.ExecutorLzReceiveTxEnqueued)
+	}
+	if job.RetryCount != 2 {
+		t.Fatalf("retry count after stale alert = %d, want 2", job.RetryCount)
+	}
+
+	// An uncounted hash in the wrong state still fails loudly.
+	thirdFailedHash := common.HexToHash("0x3333333333333333333333333333333333333333333333333333333333333333")
+	if _, err := store.pool.Exec(ctx, "UPDATE executor_jobs SET status = $1 WHERE guid = $2", string(packets.ExecutorDelivered), packet.GUID.Bytes()); err != nil {
+		t.Fatalf("force delivered status: %v", err)
+	}
+	if err := store.MarkExecutorReceiveFailed(ctx, packet.GUID, thirdFailedHash, "lzReceive reverted"); err == nil {
+		t.Fatal("MarkExecutorReceiveFailed() error = nil, want wrong-state error")
+	}
+	job, err = store.GetExecutorJob(ctx, packet.GUID)
+	if err != nil {
+		t.Fatalf("GetExecutorJob() error = %v", err)
+	}
+	if job.RetryCount != 2 {
+		t.Fatalf("retry count after rejected mark = %d, want 2 (rolled back)", job.RetryCount)
+	}
+}
+
 func TestObservedDestinationTransitionsPersistTxHashesFromReplayStatuses(t *testing.T) {
 	databaseURL := os.Getenv("TEST_POSTGRES_URL")
 	if databaseURL == "" {
@@ -2638,5 +2790,295 @@ func testPathways() []config.PathwayConfig {
 			Enabled:        true,
 			MaxMessageSize: 10000,
 		},
+	}
+}
+
+func TestStatsExcludeDisabledScopeHistory(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	registry, err := chain.NewRegistry(testChains(), testPathways())
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, registry); err != nil {
+		t.Fatalf("SyncConfig() error = %v", err)
+	}
+
+	// A dedicated chain pair keeps every labeled assertion exclusive to this
+	// test; global job-status buckets are asserted as exact deltas instead.
+	const srcEID, dstEID = uint32(41000), uint32(41001)
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xd15ab1edd15ab1edd15ab1edd15ab1edd15ab1edd15ab1edd15ab1edd15ab1ed")
+	packet.SrcEID = srcEID
+	packet.DstEID = dstEID
+	packet.Status = string(packets.ExecutorManualReview)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		// The test's store is already closed when cleanups run.
+		cleanupStore, err := Connect(cleanupCtx, databaseURL)
+		if err != nil {
+			t.Fatalf("cleanup connect: %v", err)
+		}
+		defer cleanupStore.Close()
+		if _, err := cleanupStore.pool.Exec(cleanupCtx, "DELETE FROM tx_outbox WHERE chain_eid IN (41000, 41001)"); err != nil {
+			t.Fatalf("cleanup tx_outbox: %v", err)
+		}
+		for _, table := range []string{"executor_jobs", "dvn_jobs", "packets"} {
+			if _, err := cleanupStore.pool.Exec(cleanupCtx, "DELETE FROM "+table+" WHERE guid = $1", packet.GUID.Bytes()); err != nil {
+				t.Fatalf("cleanup %s: %v", table, err)
+			}
+		}
+		if _, err := cleanupStore.pool.Exec(cleanupCtx, "DELETE FROM pathways WHERE src_eid = 41000"); err != nil {
+			t.Fatalf("cleanup pathways: %v", err)
+		}
+		if _, err := cleanupStore.pool.Exec(cleanupCtx, "DELETE FROM chains WHERE eid IN (41000, 41001)"); err != nil {
+			t.Fatalf("cleanup chains: %v", err)
+		}
+	})
+	for _, eid := range []uint32{srcEID, dstEID} {
+		if _, err := store.pool.Exec(ctx, `
+			INSERT INTO chains (eid, name, chain_id, endpoint_address, enabled)
+			VALUES ($1, 'stats-scope-test', $2, '\x0000000000000000000000000000000000000001', true)
+			ON CONFLICT (eid) DO UPDATE SET enabled = true, paused = false
+		`, eid, int64(eid)); err != nil {
+			t.Fatalf("seed chain %d: %v", eid, err)
+		}
+	}
+	if _, err := store.pool.Exec(ctx, `
+		INSERT INTO pathways (src_eid, dst_eid, src_oapp, dst_oapp, send_lib, receive_lib, open_executor, open_dvn, price_feed, destination_open_dvn, max_message_size, enabled)
+		VALUES ($1, $2, $3, $4, $5, $5, $5, $5, $5, $5, 1024, true)
+		ON CONFLICT (src_eid, dst_eid, src_oapp, dst_oapp) DO UPDATE SET enabled = true, paused = false
+	`, srcEID, dstEID, packet.Sender.Bytes(), packet.Receiver.Bytes(), packet.SendLib.Bytes()); err != nil {
+		t.Fatalf("seed pathway: %v", err)
+	}
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertExecutorJob(ctx, ExecutorJobRecord{GUID: packet.GUID, Status: string(packets.ExecutorManualReview)}); err != nil {
+		t.Fatalf("UpsertExecutorJob() error = %v", err)
+	}
+	if err := store.UpsertDVNJob(ctx, DVNJobRecord{GUID: packet.GUID, ConfirmationsRequired: 12, Status: string(packets.DVNManualReview)}); err != nil {
+		t.Fatalf("UpsertDVNJob() error = %v", err)
+	}
+	if _, err := store.EnqueueTx(ctx, TxRequest{
+		ChainEID: dstEID, Purpose: "executor_lz_receive", GUID: packet.GUID.Bytes(),
+		To: common.HexToAddress("0x1234123412341234123412341234123412341234"), SignerID: "0xstats", Calldata: []byte{0x01},
+	}); err != nil {
+		t.Fatalf("EnqueueTx(packet) error = %v", err)
+	}
+	if _, err := store.EnqueueTx(ctx, TxRequest{
+		ChainEID: srcEID, Purpose: "pricing_set_price_snapshot",
+		To: common.HexToAddress("0x1234123412341234123412341234123412341234"), SignerID: "0xstats", Calldata: []byte{0x01},
+	}); err != nil {
+		t.Fatalf("EnqueueTx(pricing) error = %v", err)
+	}
+
+	statusCount := func(stats []StatusStat, status string) uint64 {
+		for _, stat := range stats {
+			if stat.Status == status {
+				return stat.Count
+			}
+		}
+		return 0
+	}
+	packetVisible := func(snapshot StatsSnapshot) bool {
+		for _, stat := range snapshot.Packets {
+			if stat.SrcEID == srcEID && stat.DstEID == dstEID {
+				return true
+			}
+		}
+		return false
+	}
+	outboxVisible := func(snapshot StatsSnapshot, chainEID uint32) bool {
+		for _, stat := range snapshot.TxOutbox {
+			if stat.ChainEID == chainEID {
+				return true
+			}
+		}
+		return false
+	}
+
+	baseline, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if !packetVisible(baseline) || !outboxVisible(baseline, dstEID) || !outboxVisible(baseline, srcEID) {
+		t.Fatalf("baseline stats missing seeded rows: packets=%v outbox_dst=%v outbox_src=%v", packetVisible(baseline), outboxVisible(baseline, dstEID), outboxVisible(baseline, srcEID))
+	}
+	baseExecutor := statusCount(baseline.ExecutorJobs, string(packets.ExecutorManualReview))
+	baseDVN := statusCount(baseline.DVNJobs, string(packets.DVNManualReview))
+	if baseExecutor == 0 || baseDVN == 0 {
+		t.Fatalf("baseline job stats missing seeded rows: executor=%d dvn=%d", baseExecutor, baseDVN)
+	}
+
+	// Removing the pathway hides its packet, job, and packet-linked outbox
+	// history; the chain-scoped pricing row stays.
+	if _, err := store.pool.Exec(ctx, "UPDATE pathways SET enabled = false WHERE src_eid = $1 AND dst_eid = $2", srcEID, dstEID); err != nil {
+		t.Fatalf("disable pathway: %v", err)
+	}
+	disabledPathway, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if packetVisible(disabledPathway) {
+		t.Fatal("packets of a disabled pathway still reported")
+	}
+	if outboxVisible(disabledPathway, dstEID) {
+		t.Fatal("packet-linked outbox rows of a disabled pathway still reported")
+	}
+	if !outboxVisible(disabledPathway, srcEID) {
+		t.Fatal("pricing outbox row disappeared with an unrelated pathway disable")
+	}
+	if got := statusCount(disabledPathway.ExecutorJobs, string(packets.ExecutorManualReview)); got != baseExecutor-1 {
+		t.Fatalf("executor MANUAL_REVIEW count = %d, want %d after pathway disable", got, baseExecutor-1)
+	}
+	if got := statusCount(disabledPathway.DVNJobs, string(packets.DVNManualReview)); got != baseDVN-1 {
+		t.Fatalf("dvn MANUAL_REVIEW count = %d, want %d after pathway disable", got, baseDVN-1)
+	}
+
+	// Removing a chain hides everything scoped to it, including the pricing row.
+	if _, err := store.pool.Exec(ctx, "UPDATE pathways SET enabled = true WHERE src_eid = $1 AND dst_eid = $2", srcEID, dstEID); err != nil {
+		t.Fatalf("re-enable pathway: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, "UPDATE chains SET enabled = false WHERE eid = $1", srcEID); err != nil {
+		t.Fatalf("disable chain: %v", err)
+	}
+	disabledChain, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if packetVisible(disabledChain) || outboxVisible(disabledChain, dstEID) || outboxVisible(disabledChain, srcEID) {
+		t.Fatal("rows scoped to a disabled chain still reported")
+	}
+
+	// Re-enabling restores visibility: the durable rows were never touched.
+	if _, err := store.pool.Exec(ctx, "UPDATE chains SET enabled = true WHERE eid = $1", srcEID); err != nil {
+		t.Fatalf("re-enable chain: %v", err)
+	}
+	restored, err := store.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if !packetVisible(restored) || !outboxVisible(restored, dstEID) || !outboxVisible(restored, srcEID) {
+		t.Fatal("re-enabled scope did not restore stats visibility")
+	}
+	if got := statusCount(restored.ExecutorJobs, string(packets.ExecutorManualReview)); got != baseExecutor {
+		t.Fatalf("executor MANUAL_REVIEW count = %d, want restored %d", got, baseExecutor)
+	}
+}
+
+func TestMarkDVNReorgDetectedWithCoordinatesIsAtomic(t *testing.T) {
+	databaseURL := os.Getenv("TEST_POSTGRES_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_POSTGRES_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	store, err := Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	registry, err := chain.NewRegistry(testChains(), testPathways())
+	if err != nil {
+		t.Fatalf("NewRegistry() error = %v", err)
+	}
+	if err := store.SyncConfig(ctx, registry); err != nil {
+		t.Fatalf("SyncConfig() error = %v", err)
+	}
+
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0x4e094e094e094e094e094e094e094e094e094e094e094e094e094e094e094e09")
+	packet.Nonce = big.NewInt(4909)
+	packet.Status = string(packets.DVNQuorumChecking)
+	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE guid = $1", packet.GUID.Bytes()); err != nil {
+		t.Fatalf("delete tx_outbox: %v", err)
+	}
+	cleanPacketRows(ctx, t, store, packet.GUID)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		cleanupStore, err := Connect(cleanupCtx, databaseURL)
+		if err != nil {
+			t.Fatalf("cleanup connect: %v", err)
+		}
+		defer cleanupStore.Close()
+		for _, table := range []string{"dvn_jobs", "packets"} {
+			if _, err := cleanupStore.pool.Exec(cleanupCtx, "DELETE FROM "+table+" WHERE guid = $1", packet.GUID.Bytes()); err != nil {
+				t.Fatalf("cleanup %s: %v", table, err)
+			}
+		}
+	})
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
+	if err := store.UpsertDVNJob(ctx, DVNJobRecord{GUID: packet.GUID, ConfirmationsRequired: 12, Status: string(packets.DVNQuorumChecking)}); err != nil {
+		t.Fatalf("UpsertDVNJob() error = %v", err)
+	}
+
+	// Wrong expected status: nothing changes.
+	if err := store.MarkDVNReorgDetectedWithCoordinates(ctx, packet.GUID, string(packets.DVNWaitingConfirmations), "reorg", []byte(`{}`), packet.SrcBlockNumber+3, packet.SrcLogIndex+5, packet.SrcBlockNumber, packet.SrcLogIndex); err == nil {
+		t.Fatal("MarkDVNReorgDetectedWithCoordinates(wrong status) error = nil, want CAS rejection")
+	}
+	var blockNumber uint64
+	var logIndex uint
+	if err := store.pool.QueryRow(ctx, "SELECT src_block_number, src_log_index FROM packets WHERE guid = $1", packet.GUID.Bytes()).Scan(&blockNumber, &logIndex); err != nil {
+		t.Fatalf("select coords: %v", err)
+	}
+	if blockNumber != packet.SrcBlockNumber || logIndex != packet.SrcLogIndex {
+		t.Fatalf("coords = %d/%d after rejected CAS, want untouched %d/%d", blockNumber, logIndex, packet.SrcBlockNumber, packet.SrcLogIndex)
+	}
+
+	// Matching CAS: transition and coordinates land together.
+	if err := store.MarkDVNReorgDetectedWithCoordinates(ctx, packet.GUID, string(packets.DVNQuorumChecking), "reorg", []byte(`{}`), packet.SrcBlockNumber+3, packet.SrcLogIndex+5, packet.SrcBlockNumber, packet.SrcLogIndex); err != nil {
+		t.Fatalf("MarkDVNReorgDetectedWithCoordinates() error = %v", err)
+	}
+	var jobStatus string
+	if err := store.pool.QueryRow(ctx, "SELECT status FROM dvn_jobs WHERE guid = $1", packet.GUID.Bytes()).Scan(&jobStatus); err != nil {
+		t.Fatalf("select job status: %v", err)
+	}
+	if jobStatus != string(packets.DVNReorgDetected) {
+		t.Fatalf("job status = %q, want REORG_DETECTED", jobStatus)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT src_block_number, src_log_index FROM packets WHERE guid = $1", packet.GUID.Bytes()).Scan(&blockNumber, &logIndex); err != nil {
+		t.Fatalf("select refreshed coords: %v", err)
+	}
+	if blockNumber != packet.SrcBlockNumber+3 || logIndex != packet.SrcLogIndex+5 {
+		t.Fatalf("coords = %d/%d, want refreshed %d/%d", blockNumber, logIndex, packet.SrcBlockNumber+3, packet.SrcLogIndex+5)
+	}
+
+	// A stale coordinate expectation (someone else refreshed first) still
+	// transitions but never clobbers the newer coordinates.
+	if _, err := store.pool.Exec(ctx, "UPDATE dvn_jobs SET status = $1 WHERE guid = $2", string(packets.DVNQuorumChecking), packet.GUID.Bytes()); err != nil {
+		t.Fatalf("reset job status: %v", err)
+	}
+	if err := store.MarkDVNReorgDetectedWithCoordinates(ctx, packet.GUID, string(packets.DVNQuorumChecking), "reorg", []byte(`{}`), packet.SrcBlockNumber+9, packet.SrcLogIndex+9, packet.SrcBlockNumber, packet.SrcLogIndex); err != nil {
+		t.Fatalf("MarkDVNReorgDetectedWithCoordinates(stale expectation) error = %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, "SELECT src_block_number, src_log_index FROM packets WHERE guid = $1", packet.GUID.Bytes()).Scan(&blockNumber, &logIndex); err != nil {
+		t.Fatalf("select final coords: %v", err)
+	}
+	if blockNumber != packet.SrcBlockNumber+3 || logIndex != packet.SrcLogIndex+5 {
+		t.Fatalf("coords = %d/%d, want the earlier refresh preserved", blockNumber, logIndex)
 	}
 }

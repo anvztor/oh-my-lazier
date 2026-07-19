@@ -95,6 +95,71 @@ func TestEvaluateIgnoresRetryingFailedOutbox(t *testing.T) {
 	}
 }
 
+// TestEvaluateRejectsOperatorActionHeldLanes covers held signer lanes: a
+// held(manual) or held(nonce_consumed_externally) row blocks every higher
+// nonce for its signer, so readiness must fail until the operator resolves it,
+// while the self-healing hold reasons and cancel intents stay green.
+func TestEvaluateRejectsOperatorActionHeldLanes(t *testing.T) {
+	base := db.StatsSnapshot{
+		Chains: []db.ChainStat{
+			{EID: 40161, Name: "ethereum-sepolia", Enabled: true},
+			{EID: 40449, Name: "hoodi", Enabled: true},
+		},
+		Pathways: []db.PathwayStat{
+			{SrcEID: 40161, DstEID: 40449, Enabled: true},
+		},
+		IndexerCursors: []db.IndexerCursorStat{
+			{ChainEID: 40161, Stream: executorSourceStream, LastBlock: 100},
+			{ChainEID: 40449, Stream: executorDestStream, LastBlock: 100},
+			{ChainEID: 40161, Stream: dvnSourceStream, LastBlock: 100},
+			{ChainEID: 40449, Stream: dvnDestStream, LastBlock: 100},
+		},
+	}
+
+	blocking := base
+	blocking.TxOutboxHeld = []db.TxOutboxHeldStat{
+		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldManual, Count: 1},
+		{ChainEID: 40449, SignerID: "0x2222", HeldReason: db.HeldNonceConsumedExternally, Count: 2},
+		{ChainEID: 40449, SignerID: "0x3333", HeldReason: db.HeldRepriceExhausted, Count: 1},
+		{ChainEID: 40449, SignerID: "0x4444", HeldReason: db.HeldBroadcastExhausted, Count: 1},
+		// An aged reprice hold cannot be self-healing: the mandatory bump is
+		// blocked (typically the fee cap) or it would have escalated already.
+		{ChainEID: 40449, SignerID: "0x5555", HeldReason: db.HeldRepriceRequired, Count: 1, OldestAgeSeconds: 3600},
+	}
+	report := Evaluate(blocking)
+	if report.Ready {
+		t.Fatal("ready = true with operator-action held lanes, want false")
+	}
+	if len(report.Issues) != 5 {
+		t.Fatalf("issues = %+v, want 5 held_signer_lane issues", report.Issues)
+	}
+	for _, issue := range report.Issues {
+		if issue.Code != "held_signer_lane" {
+			t.Fatalf("issue code = %q, want held_signer_lane", issue.Code)
+		}
+	}
+
+	selfHealing := base
+	selfHealing.TxOutboxHeld = []db.TxOutboxHeldStat{
+		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldRepriceRequired, Count: 1},
+		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldNonceReconcileRequired, Count: 1},
+		{ChainEID: 40449, SignerID: "0x1111", HeldReason: "cancel_requested", Count: 1},
+	}
+	report = Evaluate(selfHealing)
+	if !report.Ready {
+		t.Fatalf("ready = false for self-healing holds, issues = %+v", report.Issues)
+	}
+
+	inactiveChain := base
+	inactiveChain.TxOutboxHeld = []db.TxOutboxHeldStat{
+		{ChainEID: 49999, SignerID: "0x1111", HeldReason: db.HeldManual, Count: 1},
+	}
+	report = Evaluate(inactiveChain)
+	if !report.Ready {
+		t.Fatalf("ready = false for a held lane on an inactive chain, issues = %+v", report.Issues)
+	}
+}
+
 func TestEvaluateRejectsMissingOrUnstartedRequiredIndexerCursors(t *testing.T) {
 	report := Evaluate(db.StatsSnapshot{
 		Chains: []db.ChainStat{

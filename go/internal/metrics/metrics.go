@@ -89,7 +89,7 @@ type Registry struct {
 	indexers       map[indexerKey]*IndexerRuntimeStat
 	loopRetries    map[string]*LoopRetryRuntimeStat
 	signerBalances map[signerBalanceKey]*SignerBalanceRuntimeStat
-	rpcProviders   map[indexerKey][]RPCProviderRuntimeStat
+	rpcProviders   map[uint32][]RPCProviderRuntimeStat
 	now            func() time.Time
 }
 
@@ -109,7 +109,7 @@ func NewRegistry() *Registry {
 		indexers:       make(map[indexerKey]*IndexerRuntimeStat),
 		loopRetries:    make(map[string]*LoopRetryRuntimeStat),
 		signerBalances: make(map[signerBalanceKey]*SignerBalanceRuntimeStat),
-		rpcProviders:   make(map[indexerKey][]RPCProviderRuntimeStat),
+		rpcProviders:   make(map[uint32][]RPCProviderRuntimeStat),
 		now:            time.Now,
 	}
 }
@@ -147,7 +147,10 @@ func (r *Registry) RecordIndexerPoll(chainEID uint32, chainName string, observed
 }
 
 // RecordRPCProviders records one chain's latest per-provider quorum
-// classification (head status plus the sticky log-conflict dimension).
+// classification (head status plus the sticky log-conflict dimension). The
+// state is keyed by chain EID alone so multiple reporting components (indexer
+// polls, the signer balance monitor) overwrite one series per chain instead of
+// emitting duplicate gauge lines.
 func (r *Registry) RecordRPCProviders(chainEID uint32, chainName string, providers []rpcquorum.Provider) {
 	if r == nil {
 		return
@@ -164,7 +167,7 @@ func (r *Registry) RecordRPCProviders(chainEID uint32, chainName string, provide
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.rpcProviders[indexerKey{chainEID: chainEID, chainName: chainName}] = stats
+	r.rpcProviders[chainEID] = stats
 }
 
 // RecordLoopRetry records one supervisor retry after a worker loop returned an error.
@@ -346,15 +349,19 @@ func renderDBMetrics(output *strings.Builder, snapshot db.StatsSnapshot) {
 	for _, stat := range snapshot.Chains {
 		fmt.Fprintf(output, "laz_chain_enabled{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Enabled))
 	}
-	output.WriteString("# HELP laz_chain_paused Whether a chain is paused by safety logic.\n")
+	// A record removed from configuration keeps paused = true as a safety
+	// state for a possible re-enable, but readiness and the durable loops
+	// ignore disabled records entirely — exporting their pause would page
+	// operators forever about a scope nothing acts on.
+	output.WriteString("# HELP laz_chain_paused Whether an enabled chain is paused by safety logic.\n")
 	output.WriteString("# TYPE laz_chain_paused gauge\n")
 	for _, stat := range snapshot.Chains {
-		fmt.Fprintf(output, "laz_chain_paused{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Paused))
+		fmt.Fprintf(output, "laz_chain_paused{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Enabled && stat.Paused))
 	}
-	output.WriteString("# HELP laz_pathway_paused Whether a configured pathway is paused by safety logic.\n")
+	output.WriteString("# HELP laz_pathway_paused Whether an enabled pathway is paused by safety logic.\n")
 	output.WriteString("# TYPE laz_pathway_paused gauge\n")
 	for _, stat := range snapshot.Pathways {
-		fmt.Fprintf(output, "laz_pathway_paused{src_eid=%q,dst_eid=%q} %d\n", uint32Label(stat.SrcEID), uint32Label(stat.DstEID), boolGauge(stat.Paused))
+		fmt.Fprintf(output, "laz_pathway_paused{src_eid=%q,dst_eid=%q} %d\n", uint32Label(stat.SrcEID), uint32Label(stat.DstEID), boolGauge(stat.Enabled && stat.Paused))
 	}
 	output.WriteString("# HELP laz_packets_total Packets by source, destination, and status.\n")
 	output.WriteString("# TYPE laz_packets_total gauge\n")

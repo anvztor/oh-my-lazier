@@ -296,6 +296,22 @@ func (h *attemptHarness) exhaustAttempt(attemptID int64) {
 	}
 }
 
+// heldReasonReported reports whether the held-lane stats contain the given
+// reason (persistent or synthetic) for this harness signer with a non-zero count.
+func (h *attemptHarness) heldReasonReported(reason string) bool {
+	h.t.Helper()
+	snapshot, err := h.store.Stats(h.ctx)
+	if err != nil {
+		h.t.Fatalf("Stats() error = %v", err)
+	}
+	for _, stat := range snapshot.TxOutboxHeld {
+		if stat.ChainEID == 40161 && stat.SignerID == h.signerID && stat.HeldReason == reason && stat.Count > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *attemptHarness) outboxState(id int64) (status, heldReason string, activeAttemptID int64) {
 	h.t.Helper()
 	if err := h.store.pool.QueryRow(h.ctx, `
@@ -709,6 +725,113 @@ func TestMarkQueuedTxEstimateRevertFailedLosesRaces(t *testing.T) {
 	}
 }
 
+// TestHeldStatsReportRepriceExhaustion pins the readiness linkage for reprice
+// holds: below the automatic replacement cap they report reprice_required
+// (self-healing), at the cap they report the synthetic reprice_exhausted
+// reason (operator action), and cancel-intent rows stay under the cancel
+// pipeline reporting.
+func TestHeldStatsReportRepriceExhaustion(t *testing.T) {
+	h := newAttemptHarness(t, "0x6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d", 141)
+	id := h.enqueue()
+	attempt := h.signAttempt(id, 141, common.HexToHash("0x6d41"))
+	h.broadcastResult(attempt.ID, SendErrorUnderpriced)
+	if status, heldReason, _ := h.outboxState(id); status != TxStatusHeld || heldReason != HeldRepriceRequired {
+		t.Fatalf("outbox = %q/%q, want held/reprice_required", status, heldReason)
+	}
+
+	findHeld := h.heldReasonReported
+	if !findHeld(HeldRepriceRequired) {
+		t.Fatal("below the cap the hold must report reprice_required")
+	}
+	if findHeld(HeldRepriceExhausted) {
+		t.Fatal("below the cap the hold must not report reprice_exhausted")
+	}
+
+	if _, err := h.store.pool.Exec(h.ctx, `
+		INSERT INTO tx_attempts (outbox_id, kind, nonce, tx_type, tx_hash, raw_tx, gas_limit,
+			max_fee_per_gas, max_priority_fee_per_gas, state, signing_token)
+		SELECT $1, 'replacement', 141, 2, decode(lpad(to_hex(g), 64, '0'), 'hex'), '\x01',
+			21000, 1, 1, 'rejected', gen_random_uuid()
+		FROM generate_series(9200001, 9200005) AS g
+	`, id); err != nil {
+		t.Fatalf("seed replacement attempts: %v", err)
+	}
+	if !findHeld(HeldRepriceExhausted) {
+		t.Fatal("at the cap the hold must report reprice_exhausted")
+	}
+	if findHeld(HeldRepriceRequired) {
+		t.Fatal("at the cap the hold must not double-report reprice_required")
+	}
+
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+	if findHeld(HeldRepriceExhausted) {
+		t.Fatal("a cancel-intent row must not report reprice_exhausted")
+	}
+	if !findHeld(HeldRepriceRequired) {
+		t.Fatal("a cancel-intent row keeps its persistent held reason")
+	}
+	if !findHeld("cancel_requested") {
+		t.Fatal("a cancel-intent row must report cancel_requested")
+	}
+}
+
+// TestHeldStatsReportCancelRepriceExhaustion mirrors the selector's cancel
+// counting domain: an underpriced active cancel is bumped and capped by
+// cancel-kind attempts, so at that cap the lane must surface as
+// reprice_exhausted even though the row carries a cancel intent.
+func TestHeldStatsReportCancelRepriceExhaustion(t *testing.T) {
+	h := newAttemptHarness(t, "0x6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e", 151)
+	id := h.enqueue()
+	original := h.signAttempt(id, 151, common.HexToHash("0x6e51"))
+	h.broadcastResult(original.ID, SendErrorAccepted)
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+	cancelToken := uuid.New()
+	if _, err := h.store.ClaimOutboxForCancelSigning(h.ctx, id, original.ID, cancelToken, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForCancelSigning: %v", err)
+	}
+	cancelAttempt, err := h.store.InsertCancelAttempt(h.ctx, id, original.ID, cancelToken, SignedAttempt{
+		Kind: TxAttemptCancel, Nonce: 151, TxType: 2, TxHash: common.HexToHash("0x6e52"),
+		RawTx: []byte{0x6e, 0x52}, GasLimit: 21000,
+		MaxFeePerGas: big.NewInt(3_000_000_000), MaxPriorityFeePerGas: big.NewInt(1_500_000_000),
+		SigningToken: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("InsertCancelAttempt: %v", err)
+	}
+	h.broadcastResult(cancelAttempt.ID, SendErrorUnderpriced)
+	if status, heldReason, _ := h.outboxState(id); status != TxStatusHeld || heldReason != HeldRepriceRequired {
+		t.Fatalf("outbox = %q/%q, want held/reprice_required", status, heldReason)
+	}
+
+	// One cancel attempt is below the cancel bump cap: still self-healing.
+	if h.heldReasonReported(HeldRepriceExhausted) {
+		t.Fatal("below the cancel cap the hold must not report reprice_exhausted")
+	}
+	if !h.heldReasonReported(HeldRepriceRequired) || !h.heldReasonReported("cancel_requested") {
+		t.Fatal("below the cancel cap the hold must report reprice_required and cancel_requested")
+	}
+
+	if _, err := h.store.pool.Exec(h.ctx, `
+		INSERT INTO tx_attempts (outbox_id, kind, nonce, tx_type, tx_hash, raw_tx, gas_limit,
+			max_fee_per_gas, max_priority_fee_per_gas, state, signing_token)
+		SELECT $1, 'cancel', 151, 2, decode(lpad(to_hex(g), 64, '0'), 'hex'), '\x01',
+			21000, 1, 1, 'rejected', gen_random_uuid()
+		FROM generate_series(9300001, 9300004) AS g
+	`, id); err != nil {
+		t.Fatalf("seed cancel attempts: %v", err)
+	}
+	if !h.heldReasonReported(HeldRepriceExhausted) {
+		t.Fatal("at the cancel cap the hold must report reprice_exhausted")
+	}
+	if h.heldReasonReported(HeldRepriceRequired) {
+		t.Fatal("at the cancel cap the hold must not double-report reprice_required")
+	}
+}
+
 func TestRequestTxReplacementBypassesAutomaticCap(t *testing.T) {
 	h := newAttemptHarness(t, "0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c", 91)
 	id := h.enqueue()
@@ -824,5 +947,49 @@ func TestListReceiptPollTasksFairness(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].Outbox.ID != id2 {
 		t.Fatalf("tasks after touch = %+v, want only %d first", tasks, id2)
+	}
+}
+
+// TestHeldStatsRepriceAgeTracksActiveAttempt pins the stall-age basis: the
+// row's updated_at is refreshed by every underpriced result and deferral, so
+// a fee-cap-stuck reprice lane must age from its active attempt's creation
+// (the last real signing progress) or readiness stall detection never fires.
+func TestHeldStatsRepriceAgeTracksActiveAttempt(t *testing.T) {
+	h := newAttemptHarness(t, "0x7474747474747474747474747474747474747474", 241)
+	id := h.enqueue()
+	attempt := h.signAttempt(id, 241, common.HexToHash("0xa741"))
+	h.broadcastResult(attempt.ID, SendErrorUnderpriced)
+	status, heldReason, _ := h.outboxState(id)
+	if status != TxStatusHeld || heldReason != HeldRepriceRequired {
+		t.Fatalf("outbox = %q/%q, want held/reprice_required", status, heldReason)
+	}
+
+	// The stuck loop keeps refreshing the row while the attempt stays put.
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_attempts SET created_at = now() - interval '16 minutes' WHERE id = $1
+	`, attempt.ID); err != nil {
+		t.Fatalf("backdate attempt: %v", err)
+	}
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox SET updated_at = now() WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("refresh row: %v", err)
+	}
+
+	snapshot, err := h.store.Stats(h.ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	var found bool
+	for _, stat := range snapshot.TxOutboxHeld {
+		if stat.ChainEID == 40161 && stat.SignerID == h.signerID && stat.HeldReason == HeldRepriceRequired {
+			found = true
+			if stat.OldestAgeSeconds < 900 {
+				t.Fatalf("reprice hold age = %ds, want >= 900 (attempt-based, not the refreshed updated_at)", stat.OldestAgeSeconds)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("reprice hold not reported")
 	}
 }

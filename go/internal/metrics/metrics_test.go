@@ -91,9 +91,13 @@ func TestHandlerMetricsRendersPrometheusSnapshot(t *testing.T) {
 		Chains: []db.ChainStat{
 			{EID: 40161, Name: "ethereum-sepolia", Enabled: true},
 			{EID: 40449, Name: "hoodi", Enabled: true, Paused: true},
+			// Removed from configuration while paused: the retained safety
+			// state must not keep paging.
+			{EID: 49999, Name: "retired", Enabled: false, Paused: true},
 		},
 		Pathways: []db.PathwayStat{
 			{SrcEID: 40161, DstEID: 40449, Enabled: true, Paused: true},
+			{SrcEID: 40161, DstEID: 49999, Enabled: false, Paused: true},
 		},
 		Packets: []db.PacketStat{
 			{SrcEID: 40161, DstEID: 40449, Status: "MANUAL_REVIEW", Count: 2},
@@ -138,7 +142,9 @@ func TestHandlerMetricsRendersPrometheusSnapshot(t *testing.T) {
 		`laz_worker_info 1`,
 		`laz_metrics_db_snapshot_available 1`,
 		`laz_chain_paused{eid="40449",name="hoodi"} 1`,
+		`laz_chain_paused{eid="49999",name="retired"} 0`,
 		`laz_pathway_paused{src_eid="40161",dst_eid="40449"} 1`,
+		`laz_pathway_paused{src_eid="40161",dst_eid="49999"} 0`,
 		`laz_packets_total{src_eid="40161",dst_eid="40449",status="MANUAL_REVIEW"} 2`,
 		`laz_executor_jobs_total{status="LZ_RECEIVE_FAILED"} 1`,
 		`laz_dvn_jobs_total{status="QUORUM_CONFLICT"} 1`,
