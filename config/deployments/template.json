@@ -49,6 +49,7 @@
       "minCanaryTokenBalance": "1000000000000000",
       "confirmations": 12,
       "indexerQueryBlockRange": 500,
+      "indexerPollIntervalSeconds": 5,
       "externalDVNs": [],
       "includeLayerZeroLabsDVN": true,
       "pricingTxPolicy": {
@@ -85,6 +86,7 @@
       "minCanaryTokenBalance": "0",
       "confirmations": 12,
       "indexerQueryBlockRange": 500,
+      "indexerPollIntervalSeconds": 5,
       "externalDVNs": [],
       "includeLayerZeroLabsDVN": true,
       "pricingTxPolicy": {

@@ -3,6 +3,7 @@ package chain
 import (
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
@@ -18,6 +19,7 @@ type Chain struct {
 	Confirmations          uint64
 	StartBlockNumber       uint64
 	IndexerQueryBlockRange uint64
+	IndexerPollInterval    time.Duration
 	TxRoles                TxRoles
 	RPC                    *rpcquorum.Client
 }
@@ -95,6 +97,7 @@ func NewRegistry(chains []config.ChainConfig, pathways []config.PathwayConfig) (
 			Confirmations:          cfg.Confirmations,
 			StartBlockNumber:       cfg.StartBlockNumber,
 			IndexerQueryBlockRange: cfg.IndexerQueryBlockRange,
+			IndexerPollInterval:    time.Duration(cfg.IndexerPollIntervalSeconds) * time.Second,
 			TxRoles: TxRoles{
 				Executor: ExecutorTxRole{
 					SignerID:                cfg.TxRoles.Executor.Signer.Hex(),

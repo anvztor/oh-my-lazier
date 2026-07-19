@@ -110,7 +110,11 @@ groups:
           runbook: docs/runbooks/monitoring.md
 
       - alert: LazIndexerPollFailing
-        expr: laz_indexer_poll_success == 0
+        expr: |
+          laz_indexer_poll_success == 0
+          and laz_indexer_failure_since_timestamp_seconds > 0
+          and time() - laz_indexer_failure_since_timestamp_seconds
+            > laz_indexer_poll_interval_seconds
         for: 5m
         labels:
           severity: page
@@ -139,11 +143,15 @@ groups:
           summary: Too many RPC providers are unavailable for the fixed majority quorum to form
           runbook: docs/runbooks/monitoring.md
 
-      - alert: LazIndexerCursorStalled
-        expr: changes(laz_indexer_cursor_last_block[10m]) == 0
-        for: 10m
+      - alert: LazIndexerPollStalled
+        expr: |
+          time() - (
+            (laz_indexer_last_poll_timestamp_seconds > 0)
+            or laz_indexer_start_timestamp_seconds
+          ) > 2 * laz_indexer_poll_interval_seconds
+        for: 5m
         labels:
           severity: page
         annotations:
-          summary: Worker indexer cursor has not advanced
+          summary: Worker indexer has not completed a poll within twice its configured interval
           runbook: docs/runbooks/monitoring.md

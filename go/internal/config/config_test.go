@@ -128,6 +128,126 @@ func TestValidateRejectsMissingConfirmations(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDurationOverflow(t *testing.T) {
+	overflow := maxDurationSeconds + 1
+	tests := []struct {
+		name   string
+		field  string
+		mutate func(*Config)
+	}{
+		{
+			name:  "tx manager stale broadcast replacement",
+			field: "stale_broadcast_replacement_after_seconds",
+			mutate: func(cfg *Config) {
+				cfg.TxManager.StaleBroadcastReplacementAfterSeconds = overflow
+			},
+		},
+		{
+			name:  "indexer poll interval",
+			field: "indexer_poll_interval_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Chains[0].IndexerPollIntervalSeconds = overflow
+			},
+		},
+		{
+			name:  "pricing interval",
+			field: "interval_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.IntervalSeconds = overflow
+			},
+		},
+		{
+			name:  "pricing stale after",
+			field: "stale_after_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.StaleAfterSeconds = overflow
+			},
+		},
+		{
+			name:  "pricing source request timeout",
+			field: "source_request_timeout_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.SourceRequestTimeoutSeconds = overflow
+			},
+		},
+		{
+			name:  "coinmarketcap max age",
+			field: "coinmarketcap.max_age_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.CoinMarketCapAPIKeyEnv = "COINMARKETCAP_API_KEY"
+				for idx := range cfg.Pricing.Chains {
+					cfg.Pricing.Chains[idx].PrimarySource = "coinmarketcap"
+					cfg.Pricing.Chains[idx].CoinMarketCap = CoinMarketCapPricingConfig{ID: 1027, MaxAgeSeconds: 180}
+					cfg.Pricing.Chains[idx].CoinGecko = CoinGeckoPricingConfig{}
+				}
+				cfg.Pricing.Chains[0].CoinMarketCap.MaxAgeSeconds = overflow
+			},
+		},
+		{
+			name:  "coingecko max age",
+			field: "coingecko.max_age_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.Chains[0].CoinGecko.MaxAgeSeconds = overflow
+			},
+		},
+		{
+			name:  "chainlink max age",
+			field: "chainlink.max_age_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				for idx := range cfg.Pricing.Chains {
+					cfg.Pricing.Chains[idx].PrimarySource = "chainlink"
+					cfg.Pricing.Chains[idx].CoinGecko = CoinGeckoPricingConfig{}
+					cfg.Pricing.Chains[idx].Chainlink = ChainlinkPricingConfig{
+						FeedAddress:         MustEVMAddress("0x1111111111111111111111111111111111111111"),
+						ExpectedDescription: "ETH / USD",
+						MaxAgeSeconds:       3600,
+					}
+				}
+				cfg.Pricing.Chains[0].Chainlink.MaxAgeSeconds = overflow
+			},
+		},
+		{
+			name:  "uniswap max block age",
+			field: "uniswap.max_block_age_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				for idx := range cfg.Pricing.Chains {
+					cfg.Pricing.Chains[idx].SanitySources = []string{"uniswap"}
+					cfg.Pricing.Chains[idx].Uniswap = UniswapPricingConfig{
+						PoolAddress:              MustEVMAddress("0x1111111111111111111111111111111111111111"),
+						TokenIn:                  MustEVMAddress("0x2222222222222222222222222222222222222222"),
+						TokenOut:                 MustEVMAddress("0x3333333333333333333333333333333333333333"),
+						TWAPWindowSeconds:        MinUniswapTWAPWindowSeconds,
+						MaxBlockAgeSeconds:       120,
+						MinHarmonicMeanLiquidity: "1000000",
+					}
+				}
+				cfg.Pricing.Chains[0].Uniswap.MaxBlockAgeSeconds = overflow
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig()
+			test.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want duration overflow error")
+			}
+			if !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("Validate() error = %q, want field %q", err, test.field)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsMissingTxManagerStaleBroadcastReplacementAfter(t *testing.T) {
 	cfg := validConfig()
 	cfg.TxManager.StaleBroadcastReplacementAfterSeconds = 0
@@ -925,6 +1045,9 @@ pathways:
 	if staticConfig.Chains[0].IndexerQueryBlockRange != 500 {
 		t.Fatalf("LoadStatic() indexer_query_block_range = %d, want default 500", staticConfig.Chains[0].IndexerQueryBlockRange)
 	}
+	if staticConfig.Chains[0].IndexerPollIntervalSeconds != 5 {
+		t.Fatalf("LoadStatic() indexer_poll_interval_seconds = %d, want default 5", staticConfig.Chains[0].IndexerPollIntervalSeconds)
+	}
 	if staticConfig.TxManager.StaleBroadcastReplacementAfterSeconds != 900 {
 		t.Fatalf("LoadStatic() tx_manager.stale_broadcast_replacement_after_seconds = %d, want 900", staticConfig.TxManager.StaleBroadcastReplacementAfterSeconds)
 	}
@@ -940,6 +1063,113 @@ pathways:
 	}
 	if workerConfig.DatabaseURL != "postgres://env:env@localhost:5432/env?sslmode=disable" {
 		t.Fatalf("Load() database_url = %q, want env override", workerConfig.DatabaseURL)
+	}
+}
+
+func TestLoadStaticDefaultsAndAcceptsIndexerPollIntervalSeconds(t *testing.T) {
+	cfg := validConfig()
+	cfg.Chains[0].IndexerPollIntervalSeconds = 0
+	cfg.Chains[1].IndexerPollIntervalSeconds = 17
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadStatic(path)
+	if err != nil {
+		t.Fatalf("LoadStatic() error = %v", err)
+	}
+	if loaded.Chains[0].IndexerPollIntervalSeconds != 5 {
+		t.Fatalf("default indexer poll interval = %d, want 5", loaded.Chains[0].IndexerPollIntervalSeconds)
+	}
+	if loaded.Chains[1].IndexerPollIntervalSeconds != 17 {
+		t.Fatalf("custom indexer poll interval = %d, want 17", loaded.Chains[1].IndexerPollIntervalSeconds)
+	}
+}
+
+func TestLoadStaticRejectsInvalidUnsignedIntegers(t *testing.T) {
+	cfg := validConfig()
+	cfg.Pricing = validPricingConfig()
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	tests := []struct {
+		name      string
+		oldValue  string
+		newValue  string
+		wantField string
+	}{
+		{
+			name:      "negative indexer poll interval",
+			oldValue:  "indexer_poll_interval_seconds: 5",
+			newValue:  "indexer_poll_interval_seconds: -1",
+			wantField: "indexer_poll_interval_seconds",
+		},
+		{
+			name:      "floating point indexer poll interval",
+			oldValue:  "indexer_poll_interval_seconds: 5",
+			newValue:  "indexer_poll_interval_seconds: 1.5",
+			wantField: "chains[0].indexer_poll_interval_seconds",
+		},
+		{
+			name:      "string indexer poll interval",
+			oldValue:  "indexer_poll_interval_seconds: 5",
+			newValue:  `indexer_poll_interval_seconds: "5"`,
+			wantField: "chains[0].indexer_poll_interval_seconds",
+		},
+		{
+			name:      "floating point pricing source timeout",
+			oldValue:  "source_request_timeout_seconds: 10",
+			newValue:  "source_request_timeout_seconds: 1.5",
+			wantField: "pricing.source_request_timeout_seconds",
+		},
+		{
+			name:      "floating point pricing chain eid",
+			oldValue:  "eid: 40161",
+			newValue:  "eid: 40161.5",
+			wantField: "pricing.chains[0].eid",
+		},
+		{
+			name:      "floating point uint16 fee margin",
+			oldValue:  "margin_bps: 100",
+			newValue:  "margin_bps: 100.5",
+			wantField: "pathways[0].pricing.executor_fee.margin_bps",
+		},
+		{
+			name:      "floating point pointer uint64",
+			oldValue:  "data_size_overhead_bytes: 0",
+			newValue:  "data_size_overhead_bytes: 0.5",
+			wantField: "pathways[0].pricing.executor_fee.data_size_overhead_bytes",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := strings.Replace(
+				string(body),
+				test.oldValue,
+				test.newValue,
+				1,
+			)
+			if invalid == string(body) {
+				t.Fatalf("test fixture does not contain %q", test.oldValue)
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(invalid), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			_, err := LoadStatic(path)
+			if err == nil {
+				t.Fatal("LoadStatic() error = nil, want invalid unsigned integer error")
+			}
+			if !strings.Contains(err.Error(), test.wantField) {
+				t.Fatalf("LoadStatic() error = %q, want field %q", err, test.wantField)
+			}
+		})
 	}
 }
 
@@ -987,28 +1217,30 @@ func validConfig() Config {
 		},
 		Chains: []ChainConfig{
 			{
-				EID:                    40161,
-				Name:                   "ethereum-sepolia",
-				Family:                 ChainFamilyEVM,
-				ChainID:                11155111,
-				EndpointAddress:        MustEVMAddress("0x1111111111111111111111111111111111111111"),
-				Confirmations:          12,
-				IndexerQueryBlockRange: 500,
-				RPCURLs:                []string{"http://localhost:8545"},
+				EID:                        40161,
+				Name:                       "ethereum-sepolia",
+				Family:                     ChainFamilyEVM,
+				ChainID:                    11155111,
+				EndpointAddress:            MustEVMAddress("0x1111111111111111111111111111111111111111"),
+				Confirmations:              12,
+				IndexerQueryBlockRange:     500,
+				IndexerPollIntervalSeconds: 5,
+				RPCURLs:                    []string{"http://localhost:8545"},
 				TxRoles: ChainTxRolesConfig{
 					Executor: validExecutorTxRoleConfig(),
 					DVN:      validDVNTxRoleConfig(),
 				},
 			},
 			{
-				EID:                    40449,
-				Name:                   "hoodi",
-				Family:                 ChainFamilyEVM,
-				ChainID:                560048,
-				EndpointAddress:        MustEVMAddress("0x4444444444444444444444444444444444444444"),
-				Confirmations:          12,
-				IndexerQueryBlockRange: 500,
-				RPCURLs:                []string{"http://localhost:8546"},
+				EID:                        40449,
+				Name:                       "hoodi",
+				Family:                     ChainFamilyEVM,
+				ChainID:                    560048,
+				EndpointAddress:            MustEVMAddress("0x4444444444444444444444444444444444444444"),
+				Confirmations:              12,
+				IndexerQueryBlockRange:     500,
+				IndexerPollIntervalSeconds: 5,
+				RPCURLs:                    []string{"http://localhost:8546"},
 				TxRoles: ChainTxRolesConfig{
 					Executor: validExecutorTxRoleConfig(),
 					DVN:      validDVNTxRoleConfig(),

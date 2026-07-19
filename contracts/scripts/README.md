@@ -248,6 +248,9 @@ chain's configured RPC URL and writes the latest block height to
 explicitly only for a fixed historical backfill, including `0` for a full
 genesis backfill. If the worker database already has a durable indexer cursor,
 that cursor remains authoritative for subsequent worker starts.
+Set each profile chain's positive-integer `indexerPollIntervalSeconds`, within
+the worker duration range, to emit the per-chain
+`chains[].indexer_poll_interval_seconds` polling cadence.
 
 After deployment, check that the deployed contracts are still controlled by the expected operations owner and, when used, that the canary treasury has enough native token and TestOFT balance for the planned transfer:
 
@@ -345,9 +348,11 @@ The profile renderer enables the worker price bot in the generated
 `worker.yaml`. Global `pricing.sourceRequestTimeoutSeconds` and
 `pricing.maxDeviationBps` default to `10` and `500`; optional CoinMarketCap and
 CoinGecko BaseURLs and API-key environment-variable names also live under that
-profile block. Every market-data BaseURL must use HTTPS, including keyless
-CoinGecko endpoints; the renderer rejects malformed or HTTP endpoints before
-emitting worker YAML. Each chain requires its own `pricingTxPolicy`; both fee
+profile block. Runtime timeout and per-source maximum-age seconds must be
+positive integers within the worker duration range. Every market-data BaseURL
+must use HTTPS, including keyless CoinGecko endpoints; the renderer rejects
+malformed or HTTP endpoints before emitting worker YAML. Each chain requires
+its own `pricingTxPolicy`; both fee
 caps and the minimum-balance threshold must be positive, and the priority-fee
 cap must not exceed the total fee cap. Generated profiles always require a
 positive priority-fee cap even though the Go loader permits hand-authored

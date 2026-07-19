@@ -630,6 +630,7 @@ ${chainList
     confirmations: ${output.parameters.confirmations}
     start_block_number: 0
     indexer_query_block_range: 500
+    indexer_poll_interval_seconds: 5
     rpc_urls:
       - ${rpcURL(chain)}
     tx_roles:

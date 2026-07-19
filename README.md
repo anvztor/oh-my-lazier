@@ -109,6 +109,7 @@ Phase 1 is EVM-only.
 ## Runtime Notes
 
 - Startup fails before durable loops if local config is invalid or live chain state does not match the loaded YAML.
+- Unsigned worker YAML fields accept only non-negative YAML integer scalars, not decimals or quoted numeric strings. Second-based values used as runtime durations must also fit the worker's duration range.
 - Every configured RPC URL must report the configured EVM chain ID.
 - Chain head and log reads go through a fixed strict-majority quorum over all configured RPC providers (`q = floor(N/2) + 1` of the configured count, not of the reachable subset). The canonical head is the highest height a majority has reached with a majority-identical block hash, and indexer log windows require majority-identical log sequences from providers whose snapshot tip covers the window. A disagreeing minority provider is flagged (`conflict` head status, sticky log-conflict metric) without stopping progress; losing the majority stops the affected reads fail-closed. Startup establishes the head quorum before the first on-chain config read. Configured RPC endpoints must come from independent failure domains — duplicating one backend across URLs satisfies the count but silently voids the majority-safety assumption.
 - Address fields are parsed as EVM 20-byte hex addresses during config load.
@@ -121,7 +122,7 @@ Phase 1 is EVM-only.
 - Pausing a chain or pathway (safety logic or operator) is enforced across the whole send side: after the pause commits, no new nonce is added for that scope — work selection, executor/DVN/pricing transaction enqueues, outbox signing, and automatic failure retries all hold back until the scope is active again, and the enqueue/signing decisions take share locks on the pause carriers so a racing pause cannot be missed. Transactions that already held a nonce before the pause converge to a terminal state (broadcast, replacement, reprice, reconciliation, and receipt polling continue), since freezing them would wedge the shared signer lane; `txretry cancel-nonce` remains available under pause to abandon them.
 - Worker fee accounting records mined receipt gas usage, converts destination-chain gas cost back into source-chain native wei with the configured pricing sources, and exposes revenue, actual cost, gross margin, negative-margin jobs, and pending reconciliation through `/metrics`.
 - Worker metrics expose each active transaction signer's native balance against its configured `min_native_balance_wei` threshold.
-- Indexers poll confirmed block windows and persist role-specific cursors in Postgres.
+- Indexers poll confirmed block windows at each chain's `indexer_poll_interval_seconds` cadence (default 5 seconds) and persist role-specific cursors in Postgres.
 - Retryable loop errors are logged and supervised with backoff; non-retryable loop errors stop `App.Run`.
 
 ## Maintained Docs

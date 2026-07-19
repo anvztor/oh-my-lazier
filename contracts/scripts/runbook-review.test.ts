@@ -38,6 +38,54 @@ test("runbook review rejects missing indexer poll alert", () => {
   ]);
 });
 
+test("runbook review rejects a fixed-delay indexer failure alert", () => {
+  const documents = currentDocuments();
+  const alerts = documents.get("docs/monitoring/prometheus-alerts.yml");
+  assert.ok(alerts);
+  documents.set(
+    "docs/monitoring/prometheus-alerts.yml",
+    alerts.replace(
+      `        expr: |
+          laz_indexer_poll_success == 0
+          and laz_indexer_failure_since_timestamp_seconds > 0
+          and time() - laz_indexer_failure_since_timestamp_seconds
+            > laz_indexer_poll_interval_seconds
+`,
+      "        expr: laz_indexer_poll_success == 0\n",
+    ),
+  );
+
+  assert.deepEqual(validateRunbookDocuments(documents), [
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollFailing missing required anchor "laz_indexer_failure_since_timestamp_seconds > 0"',
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollFailing missing required anchor "time() - laz_indexer_failure_since_timestamp_seconds"',
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollFailing missing required anchor "> laz_indexer_poll_interval_seconds"',
+  ]);
+});
+
+test("runbook review rejects a fixed-window indexer stalled alert", () => {
+  const documents = currentDocuments();
+  const alerts = documents.get("docs/monitoring/prometheus-alerts.yml");
+  assert.ok(alerts);
+  documents.set(
+    "docs/monitoring/prometheus-alerts.yml",
+    alerts.replace(
+      `        expr: |
+          time() - (
+            (laz_indexer_last_poll_timestamp_seconds > 0)
+            or laz_indexer_start_timestamp_seconds
+          ) > 2 * laz_indexer_poll_interval_seconds
+`,
+      "        expr: changes(laz_indexer_cursor_last_block[10m]) == 0\n",
+    ),
+  );
+
+  assert.deepEqual(validateRunbookDocuments(documents), [
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollStalled missing required anchor "laz_indexer_last_poll_timestamp_seconds > 0"',
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollStalled missing required anchor "or laz_indexer_start_timestamp_seconds"',
+    'docs/monitoring/prometheus-alerts.yml: alert LazIndexerPollStalled missing required anchor "> 2 * laz_indexer_poll_interval_seconds"',
+  ]);
+});
+
 test("runbook review rejects missing runbook anchors", () => {
   const documents = currentDocuments();
   const monitoring = documents.get("docs/runbooks/monitoring.md");

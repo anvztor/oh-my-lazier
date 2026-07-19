@@ -163,12 +163,37 @@ func TestHandlerMetricsRendersPrometheusSnapshot(t *testing.T) {
 	}
 }
 
-func TestHandlerMetricsRendersRuntimeMetricsWhenStatsUnavailable(t *testing.T) {
+func TestHandlerMetricsRendersRegisteredIndexerBeforeFirstPoll(t *testing.T) {
 	registry := NewRegistry()
 	registry.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
-	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 200, 188, 2, 1, 3, 1500*time.Millisecond, nil)
+	registry.RegisterIndexer(40161, "ethereum-sepolia", 30*time.Minute)
+	handler := Handler(fakeProvider{err: errors.New("database down")}, registry)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`laz_indexer_poll_interval_seconds{chain_eid="40161",name="ethereum-sepolia"} 1800.000000`,
+		`laz_indexer_start_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1700000000`,
+		`laz_indexer_last_poll_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 0`,
+		`laz_indexer_polls_total{chain_eid="40161",name="ethereum-sepolia",result="success"} 0`,
+		`laz_indexer_polls_total{chain_eid="40161",name="ethereum-sepolia",result="error"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics body missing %q before first poll:\n%s", want, body)
+		}
+	}
+}
+
+func TestHandlerMetricsRendersRuntimeMetricsWhenStatsUnavailable(t *testing.T) {
+	registry := NewRegistry()
+	registry.now = func() time.Time { return time.Unix(1_699_999_990, 0) }
+	registry.RegisterIndexer(40161, "ethereum-sepolia", 5*time.Second)
+	registry.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 5*time.Second, 200, 188, 2, 1, 3, 1500*time.Millisecond, nil)
 	registry.now = func() time.Time { return time.Unix(1_700_000_030, 0) }
-	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 0, 0, 0, 0, 0, 250*time.Millisecond, errors.New("rpc unavailable"))
+	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 5*time.Second, 0, 0, 0, 0, 0, 250*time.Millisecond, errors.New("rpc unavailable"))
 	registry.now = func() time.Time { return time.Unix(1_700_000_040, 0) }
 	registry.RecordLoopRetry("txmgr")
 	registry.now = func() time.Time { return time.Unix(1_700_000_050, 0) }
@@ -200,9 +225,13 @@ func TestHandlerMetricsRendersRuntimeMetricsWhenStatsUnavailable(t *testing.T) {
 		`laz_worker_loop_last_retry_timestamp_seconds{name="pricing"} 1700000060`,
 		`laz_worker_loop_last_retry_timestamp_seconds{name="txmgr"} 1700000050`,
 		`laz_indexer_poll_success{chain_eid="40161",name="ethereum-sepolia"} 0`,
+		`laz_indexer_poll_interval_seconds{chain_eid="40161",name="ethereum-sepolia"} 5.000000`,
+		`laz_indexer_start_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1699999990`,
 		`laz_indexer_polls_total{chain_eid="40161",name="ethereum-sepolia",result="success"} 1`,
 		`laz_indexer_polls_total{chain_eid="40161",name="ethereum-sepolia",result="error"} 1`,
+		`laz_indexer_last_poll_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1700000030`,
 		`laz_indexer_last_success_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1700000000`,
+		`laz_indexer_failure_since_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1700000030`,
 		`laz_indexer_last_error_timestamp_seconds{chain_eid="40161",name="ethereum-sepolia"} 1700000030`,
 		`laz_indexer_last_poll_duration_seconds{chain_eid="40161",name="ethereum-sepolia"} 0.250000`,
 		`laz_indexer_processed_total{chain_eid="40161",name="ethereum-sepolia",kind="source_transactions"} 2`,
@@ -228,6 +257,51 @@ func TestHandlerMetricsRendersRuntimeMetricsWhenStatsUnavailable(t *testing.T) {
 	if strings.Contains(body, "database down") || strings.Contains(body, "rpc unavailable") || strings.Contains(body, "balance rpc unavailable") {
 		t.Fatalf("metrics body exposes raw error text:\n%s", body)
 	}
+}
+
+func TestRegistryTracksIndexerRegistrationAndFailureWindow(t *testing.T) {
+	registry := NewRegistry()
+	registry.now = func() time.Time { return time.Unix(100, 0) }
+	registry.RegisterIndexer(40161, "ethereum-sepolia", 30*time.Minute)
+
+	stat := onlyIndexerRuntimeStat(t, registry.RuntimeSnapshot())
+	if stat.StartedUnix != 100 || stat.PollIntervalSeconds != 1800 {
+		t.Fatalf("registered indexer stat = %#v", stat)
+	}
+	if stat.LastPollUnix != 0 || stat.FailureSinceUnix != 0 {
+		t.Fatalf("registered indexer has poll outcome state = %#v", stat)
+	}
+
+	registry.now = func() time.Time { return time.Unix(110, 0) }
+	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 30*time.Minute, 0, 0, 0, 0, 0, time.Second, errors.New("first failure"))
+	registry.now = func() time.Time { return time.Unix(1_910, 0) }
+	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 30*time.Minute, 0, 0, 0, 0, 0, time.Second, errors.New("second failure"))
+
+	stat = onlyIndexerRuntimeStat(t, registry.RuntimeSnapshot())
+	if stat.LastPollUnix != 1_910 || stat.FailureSinceUnix != 110 || stat.ErrorPolls != 2 {
+		t.Fatalf("failed indexer stat = %#v", stat)
+	}
+
+	registry.now = func() time.Time { return time.Unix(3_710, 0) }
+	registry.RecordIndexerPoll(40161, "ethereum-sepolia", 30*time.Minute, 200, 188, 0, 0, 0, time.Second, nil)
+	registry.now = func() time.Time { return time.Unix(3_720, 0) }
+	registry.RegisterIndexer(40161, "ethereum-sepolia", 30*time.Minute)
+
+	stat = onlyIndexerRuntimeStat(t, registry.RuntimeSnapshot())
+	if stat.StartedUnix != 100 || stat.LastPollUnix != 3_710 || stat.LastSuccessUnix != 3_710 {
+		t.Fatalf("recovered indexer stat = %#v", stat)
+	}
+	if stat.FailureSinceUnix != 0 || !stat.PollSuccess {
+		t.Fatalf("recovered indexer retains failure state = %#v", stat)
+	}
+}
+
+func onlyIndexerRuntimeStat(t *testing.T, snapshot RuntimeSnapshot) IndexerRuntimeStat {
+	t.Helper()
+	if len(snapshot.Indexers) != 1 {
+		t.Fatalf("indexer stats = %#v, want one", snapshot.Indexers)
+	}
+	return snapshot.Indexers[0]
 }
 
 type fakeProvider struct {

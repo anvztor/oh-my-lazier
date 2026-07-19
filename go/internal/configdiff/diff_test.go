@@ -52,6 +52,22 @@ func TestDiffReportsPerChainPricingTxPolicy(t *testing.T) {
 	}
 }
 
+func TestDiffReportsPerChainIndexerPollInterval(t *testing.T) {
+	before := validConfig()
+	after := validConfig()
+	after.Chains[0].IndexerPollIntervalSeconds = 9
+
+	changes := Diff(before, after)
+	if len(changes) != 1 || changes[0].Path != "chains[40161]" {
+		t.Fatalf("changes = %#v, want ethereum chain indexer poll interval change", changes)
+	}
+	output := RenderText(changes)
+	if !strings.Contains(output, `"IndexerPollIntervalSeconds":5`) ||
+		!strings.Contains(output, `"IndexerPollIntervalSeconds":9`) {
+		t.Fatalf("output missing indexer poll interval change:\n%s", output)
+	}
+}
+
 func TestRenderTextIncludesChangedPath(t *testing.T) {
 	before := validConfig()
 	after := validConfig()
@@ -445,25 +461,27 @@ func validConfig() config.Config {
 		},
 		Chains: []config.ChainConfig{
 			{
-				EID:             40161,
-				Name:            "ethereum-sepolia",
-				Family:          config.ChainFamilyEVM,
-				ChainID:         11155111,
-				EndpointAddress: config.MustEVMAddress("0x1111111111111111111111111111111111111111"),
-				Confirmations:   12,
-				RPCURLs:         []string{"http://localhost:8545"},
+				EID:                        40161,
+				Name:                       "ethereum-sepolia",
+				Family:                     config.ChainFamilyEVM,
+				ChainID:                    11155111,
+				EndpointAddress:            config.MustEVMAddress("0x1111111111111111111111111111111111111111"),
+				Confirmations:              12,
+				IndexerPollIntervalSeconds: 5,
+				RPCURLs:                    []string{"http://localhost:8545"},
 				TxRoles: config.ChainTxRolesConfig{
 					Executor: testExecutorRole(),
 				},
 			},
 			{
-				EID:             40449,
-				Name:            "hoodi",
-				Family:          config.ChainFamilyEVM,
-				ChainID:         560048,
-				EndpointAddress: config.MustEVMAddress("0x4444444444444444444444444444444444444444"),
-				Confirmations:   12,
-				RPCURLs:         []string{"http://localhost:8546"},
+				EID:                        40449,
+				Name:                       "hoodi",
+				Family:                     config.ChainFamilyEVM,
+				ChainID:                    560048,
+				EndpointAddress:            config.MustEVMAddress("0x4444444444444444444444444444444444444444"),
+				Confirmations:              12,
+				IndexerPollIntervalSeconds: 5,
+				RPCURLs:                    []string{"http://localhost:8546"},
 				TxRoles: config.ChainTxRolesConfig{
 					Executor: testExecutorRole(),
 				},

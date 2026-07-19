@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -10,9 +9,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/islishude/oh-my-lazier/go/internal/bigutil"
-	"gopkg.in/yaml.v3"
 )
 
 // ChainFamily identifies the chain runtime family for a configured LayerZero endpoint.
@@ -23,7 +22,11 @@ const (
 	ChainFamilyEVM ChainFamily = "evm"
 )
 
-const defaultTxManagerStaleBroadcastReplacementAfterSeconds = 900
+const (
+	defaultIndexerPollIntervalSeconds                     = uint64(5)
+	defaultTxManagerStaleBroadcastReplacementAfterSeconds = 900
+	maxDurationSeconds                                    = uint64(math.MaxInt64 / int64(time.Second))
+)
 
 var environmentVariableNamePattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
@@ -312,6 +315,8 @@ type ChainConfig struct {
 	StartBlockNumber uint64 `yaml:"start_block_number"`
 	// IndexerQueryBlockRange bounds each FilterLogs window and defaults to 500 when omitted.
 	IndexerQueryBlockRange uint64 `yaml:"indexer_query_block_range"`
+	// IndexerPollIntervalSeconds controls the interval between successful indexer polls and defaults to 5 when omitted.
+	IndexerPollIntervalSeconds uint64 `yaml:"indexer_poll_interval_seconds"`
 	// RPCURLs lists every RPC endpoint in the quorum; http(s), ws(s), and absolute IPC paths are supported.
 	RPCURLs []string `yaml:"rpc_urls"`
 	// TxRoles defines local send-time tx policies for worker submissions on this chain.
@@ -397,9 +402,7 @@ func load(path string, applyEnv bool) (Config, error) {
 	}
 
 	var cfg Config
-	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
+	if err := decodeConfigYAML(raw, &cfg); err != nil {
 		return Config{}, err
 	}
 	if env := os.Getenv("DATABASE_URL"); applyEnv && env != "" {
@@ -433,6 +436,9 @@ func load(path string, applyEnv bool) (Config, error) {
 		if cfg.Chains[idx].IndexerQueryBlockRange == 0 {
 			cfg.Chains[idx].IndexerQueryBlockRange = 500
 		}
+		if cfg.Chains[idx].IndexerPollIntervalSeconds == 0 {
+			cfg.Chains[idx].IndexerPollIntervalSeconds = defaultIndexerPollIntervalSeconds
+		}
 	}
 	for idx := range cfg.Pathways {
 		if cfg.Pathways[idx].DVN.Mode == "" {
@@ -458,6 +464,12 @@ func (c Config) Validate() error {
 	}
 	if c.TxManager.StaleBroadcastReplacementAfterSeconds == 0 {
 		return errors.New("tx_manager.stale_broadcast_replacement_after_seconds is required")
+	}
+	if err := validateDurationSeconds(
+		"tx_manager.stale_broadcast_replacement_after_seconds",
+		c.TxManager.StaleBroadcastReplacementAfterSeconds,
+	); err != nil {
+		return err
 	}
 	if len(c.Chains) == 0 {
 		return errors.New("at least one chain is required")
@@ -503,6 +515,15 @@ func (c Config) Validate() error {
 		}
 		if chain.IndexerQueryBlockRange == 0 {
 			return fmt.Errorf("chain %s indexer_query_block_range is required", chain.Name)
+		}
+		if chain.IndexerPollIntervalSeconds == 0 {
+			return fmt.Errorf("chain %s indexer_poll_interval_seconds is required", chain.Name)
+		}
+		if err := validateDurationSeconds(
+			fmt.Sprintf("chain %s indexer_poll_interval_seconds", chain.Name),
+			chain.IndexerPollIntervalSeconds,
+		); err != nil {
+			return err
 		}
 		if len(chain.RPCURLs) == 0 {
 			return fmt.Errorf("chain %s must configure at least one rpc url", chain.Name)
@@ -759,8 +780,14 @@ func (c Config) validatePricing(chains map[uint32]struct{}, signers map[string]s
 	if c.Pricing.IntervalSeconds == 0 {
 		return errors.New("pricing interval_seconds is required")
 	}
+	if err := validateDurationSeconds("pricing interval_seconds", c.Pricing.IntervalSeconds); err != nil {
+		return err
+	}
 	if c.Pricing.StaleAfterSeconds == 0 {
 		return errors.New("pricing stale_after_seconds is required")
+	}
+	if err := validateDurationSeconds("pricing stale_after_seconds", c.Pricing.StaleAfterSeconds); err != nil {
+		return err
 	}
 	if c.Pricing.StaleAfterSeconds > MaxPriceSnapshotStaleAfterSeconds {
 		return fmt.Errorf("pricing stale_after_seconds exceeds OpenPriceFeed maximum %d", MaxPriceSnapshotStaleAfterSeconds)
@@ -770,6 +797,9 @@ func (c Config) validatePricing(chains map[uint32]struct{}, signers map[string]s
 	}
 	if c.Pricing.SourceRequestTimeoutSeconds == 0 {
 		return errors.New("pricing source_request_timeout_seconds is required")
+	}
+	if err := validateDurationSeconds("pricing source_request_timeout_seconds", c.Pricing.SourceRequestTimeoutSeconds); err != nil {
+		return err
 	}
 	if c.Pricing.GasSpikeBps == 0 {
 		return errors.New("pricing gas_spike_bps is required")
@@ -976,12 +1006,24 @@ func validateConfiguredPricingSource(chain PricingChainConfig, source, coinMarke
 		if chain.CoinMarketCap.MaxAgeSeconds == 0 {
 			return fmt.Errorf("pricing chain %d coinmarketcap.max_age_seconds is required", chain.EID)
 		}
+		if err := validateDurationSeconds(
+			fmt.Sprintf("pricing chain %d coinmarketcap.max_age_seconds", chain.EID),
+			chain.CoinMarketCap.MaxAgeSeconds,
+		); err != nil {
+			return err
+		}
 	case "coingecko":
 		if chain.CoinGecko.ID == "" {
 			return fmt.Errorf("pricing chain %d coingecko.id is required", chain.EID)
 		}
 		if chain.CoinGecko.MaxAgeSeconds == 0 {
 			return fmt.Errorf("pricing chain %d coingecko.max_age_seconds is required", chain.EID)
+		}
+		if err := validateDurationSeconds(
+			fmt.Sprintf("pricing chain %d coingecko.max_age_seconds", chain.EID),
+			chain.CoinGecko.MaxAgeSeconds,
+		); err != nil {
+			return err
 		}
 	case "chainlink":
 		if err := validateChainlinkPricingSource(chain); err != nil {
@@ -1007,6 +1049,12 @@ func validateChainlinkPricingSource(chain PricingChainConfig) error {
 	}
 	if chain.Chainlink.MaxAgeSeconds == 0 {
 		return fmt.Errorf("pricing chain %d chainlink.max_age_seconds is required", chain.EID)
+	}
+	if err := validateDurationSeconds(
+		fmt.Sprintf("pricing chain %d chainlink.max_age_seconds", chain.EID),
+		chain.Chainlink.MaxAgeSeconds,
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1036,11 +1084,24 @@ func validateUniswapPricingSource(chain PricingChainConfig) error {
 	if chain.Uniswap.MaxBlockAgeSeconds == 0 {
 		return fmt.Errorf("pricing chain %d uniswap.max_block_age_seconds is required", chain.EID)
 	}
+	if err := validateDurationSeconds(
+		fmt.Sprintf("pricing chain %d uniswap.max_block_age_seconds", chain.EID),
+		chain.Uniswap.MaxBlockAgeSeconds,
+	); err != nil {
+		return err
+	}
 	if chain.Uniswap.MinHarmonicMeanLiquidity == "" {
 		return fmt.Errorf("pricing chain %d uniswap.min_harmonic_mean_liquidity is required", chain.EID)
 	}
 	if _, err := bigutil.ParsePositiveDecimal(fmt.Sprintf("pricing chain %d uniswap.min_harmonic_mean_liquidity", chain.EID), chain.Uniswap.MinHarmonicMeanLiquidity); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateDurationSeconds(field string, seconds uint64) error {
+	if seconds > maxDurationSeconds {
+		return fmt.Errorf("%s must be at most %d", field, maxDurationSeconds)
 	}
 	return nil
 }

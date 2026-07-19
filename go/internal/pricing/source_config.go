@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -39,8 +39,7 @@ func newPriceSourceConfigurationError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var existing *priceSourceConfigurationError
-	if errors.As(err, &existing) {
+	if _, ok := errors.AsType[*priceSourceConfigurationError](err); ok {
 		return err
 	}
 	return &priceSourceConfigurationError{cause: err}
@@ -209,7 +208,7 @@ func sourceConfigurationChecks(sources map[uint32]ChainSources) []sourceConfigur
 	for eid := range sources {
 		eids = append(eids, eid)
 	}
-	sort.Slice(eids, func(i, j int) bool { return eids[i] < eids[j] })
+	slices.Sort(eids)
 
 	var checks []sourceConfigurationCheck
 	for _, eid := range eids {

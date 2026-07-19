@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -197,10 +198,8 @@ func redactEndpointURL(raw string, allowedSchemes ...string) string {
 		return "[REDACTED]"
 	}
 	scheme := strings.ToLower(parsed.Scheme)
-	for _, allowed := range allowedSchemes {
-		if scheme == allowed {
-			return scheme + "://[REDACTED]"
-		}
+	if slices.Contains(allowedSchemes, scheme) {
+		return scheme + "://[REDACTED]"
 	}
 	return "[REDACTED]"
 }

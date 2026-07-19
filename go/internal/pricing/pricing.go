@@ -762,8 +762,7 @@ func ChainNativePrice(ctx context.Context, sources map[uint32]ChainSources, eid 
 		return nil, fmt.Errorf("%s primary source for chain %d: %w", chainSources.Primary.Name, eid, primaryErr)
 	}
 	for _, err := range sanityErrs {
-		var sourceErr sanitySourceError
-		if errors.As(err, &sourceErr) {
+		if sourceErr, ok := errors.AsType[sanitySourceError](err); ok {
 			notifyPriceSourceFailure(policy, PriceSourceFailure{
 				EID: eid, Source: sourceErr.source, Role: "sanity", Category: priceSourceFailureCategory(sourceErr.err), Err: sourceErr.err,
 			})

@@ -77,6 +77,7 @@ chains:
     confirmations: 12
     start_block_number: 0
     indexer_query_block_range: 500
+    indexer_poll_interval_seconds: 5
     # Supports http(s), ws(s), and absolute IPC socket paths.
     rpc_urls:
       - http://localhost:8545
@@ -99,6 +100,7 @@ chains:
     confirmations: 12
     start_block_number: 0
     indexer_query_block_range: 500
+    indexer_poll_interval_seconds: 5
     rpc_urls:
       - http://localhost:8546
     tx_roles:

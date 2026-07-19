@@ -2,6 +2,7 @@ package chain
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
@@ -28,6 +29,9 @@ func TestRegistryIndexesChainsAndPathways(t *testing.T) {
 	}
 	if ethereum.IndexerQueryBlockRange != 250 {
 		t.Fatalf("IndexerQueryBlockRange = %d, want 250", ethereum.IndexerQueryBlockRange)
+	}
+	if ethereum.IndexerPollInterval != 7*time.Second {
+		t.Fatalf("IndexerPollInterval = %s, want 7s", ethereum.IndexerPollInterval)
 	}
 	pathway, err := registry.Pathway(
 		40161,
@@ -77,15 +81,16 @@ func TestRegistryRejectsUnknownPathway(t *testing.T) {
 func testChains() []config.ChainConfig {
 	return []config.ChainConfig{
 		{
-			EID:                    40161,
-			Name:                   "ethereum-sepolia",
-			Family:                 config.ChainFamilyEVM,
-			ChainID:                11155111,
-			EndpointAddress:        config.MustEVMAddress("0x1111111111111111111111111111111111111111"),
-			Confirmations:          12,
-			StartBlockNumber:       12345,
-			IndexerQueryBlockRange: 250,
-			RPCURLs:                []string{"http://localhost:8545"},
+			EID:                        40161,
+			Name:                       "ethereum-sepolia",
+			Family:                     config.ChainFamilyEVM,
+			ChainID:                    11155111,
+			EndpointAddress:            config.MustEVMAddress("0x1111111111111111111111111111111111111111"),
+			Confirmations:              12,
+			StartBlockNumber:           12345,
+			IndexerQueryBlockRange:     250,
+			IndexerPollIntervalSeconds: 7,
+			RPCURLs:                    []string{"http://localhost:8545"},
 			TxRoles: config.ChainTxRolesConfig{
 				Executor: testExecutorRole(),
 				DVN: config.DVNTxRoleConfig{
@@ -97,13 +102,14 @@ func testChains() []config.ChainConfig {
 			},
 		},
 		{
-			EID:             40449,
-			Name:            "hoodi",
-			Family:          config.ChainFamilyEVM,
-			ChainID:         560048,
-			EndpointAddress: config.MustEVMAddress("0x4444444444444444444444444444444444444444"),
-			Confirmations:   12,
-			RPCURLs:         []string{"http://localhost:8546"},
+			EID:                        40449,
+			Name:                       "hoodi",
+			Family:                     config.ChainFamilyEVM,
+			ChainID:                    560048,
+			EndpointAddress:            config.MustEVMAddress("0x4444444444444444444444444444444444444444"),
+			Confirmations:              12,
+			IndexerPollIntervalSeconds: 11,
+			RPCURLs:                    []string{"http://localhost:8546"},
 			TxRoles: config.ChainTxRolesConfig{
 				Executor: testExecutorRole(),
 				DVN: config.DVNTxRoleConfig{

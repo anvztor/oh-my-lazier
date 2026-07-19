@@ -53,6 +53,7 @@ go run ./go/cmd/configdiff \
 Review checklist:
 
 - Confirm both configs validate successfully.
+- Confirm unsigned numeric values are non-negative YAML integers rather than decimals or quoted numeric strings; second-based runtime durations must remain within the worker's accepted range.
 - Confirm `services.executor.enabled` and `services.dvn.enabled` changes are intentional. These are process-level switches for loops, signer requirements, tx targets, and indexer streams; pathway worker contract addresses still remain required in every config.
 - Confirm `tx_manager.stale_broadcast_replacement_after_seconds` changes are intentional.
 - Confirm chain `eid`, `family`, `chain_id`, endpoint, transaction roles, and RPC changes are intentional. Phase-1 configs must use `family: evm`.

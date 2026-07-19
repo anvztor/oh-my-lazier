@@ -24,7 +24,6 @@ import (
 )
 
 const (
-	defaultPollInterval    = 5 * time.Second
 	defaultBackfillRange   = uint64(500)
 	defaultQueryBlockRange = uint64(500)
 )
@@ -104,9 +103,10 @@ type LogClient interface {
 	FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]gethtypes.Log, error)
 }
 
-// MetricsRecorder records process-local indexer polling outcomes.
+// MetricsRecorder records process-local indexer lifecycle and polling outcomes.
 type MetricsRecorder interface {
-	RecordIndexerPoll(chainEID uint32, chainName string, observedHeadBlock uint64, confirmedToBlock uint64, sourceTransactions int, dvnTransactions int, destinationLogs int, duration time.Duration, err error)
+	RegisterIndexer(chainEID uint32, chainName string, pollInterval time.Duration)
+	RecordIndexerPoll(chainEID uint32, chainName string, pollInterval time.Duration, observedHeadBlock uint64, confirmedToBlock uint64, sourceTransactions int, dvnTransactions int, destinationLogs int, duration time.Duration, err error)
 }
 
 // Indexer watches one chain for LayerZero and worker contract events.
@@ -156,7 +156,7 @@ func NewWithClient(configuredChain chain.Chain, pathways []chain.Pathway, store 
 		destinationEID:      configuredChain.EID,
 		store:               store,
 		client:              client,
-		pollInterval:        defaultPollInterval,
+		pollInterval:        configuredChain.IndexerPollInterval,
 		backfillRange:       defaultBackfillRange,
 		queryBlockRange:     queryBlockRange,
 		progressLogInterval: DefaultProgressLogInterval,
@@ -187,7 +187,12 @@ func (i *Indexer) WithProgressLogInterval(interval time.Duration) *Indexer {
 
 // Run starts the chain indexer loop until the context is canceled.
 func (i *Indexer) Run(ctx context.Context) error {
-	i.logger.Info("indexer loop started", "chain", i.chain.Name, "eid", i.chain.EID)
+	i.logger.Info(
+		"indexer loop started",
+		"chain", i.chain.Name,
+		"eid", i.chain.EID,
+		"poll_interval", i.pollInterval,
+	)
 	return i.runPollingLoop(ctx)
 }
 
@@ -809,6 +814,9 @@ func (i *Indexer) runPollingLoop(ctx context.Context) error {
 	if i.client == nil {
 		return workerloop.Fatal(errors.New("indexer log client is required"))
 	}
+	if i.metrics != nil {
+		i.metrics.RegisterIndexer(i.chain.EID, i.chain.Name, i.pollInterval)
+	}
 	if err := i.pollOnce(ctx); err != nil {
 		return err
 	}
@@ -834,6 +842,7 @@ func (i *Indexer) pollOnce(ctx context.Context) error {
 		i.metrics.RecordIndexerPoll(
 			i.chain.EID,
 			i.chain.Name,
+			i.pollInterval,
 			result.ObservedHeadBlock,
 			result.ConfirmedToBlock,
 			result.SourceTransactions,

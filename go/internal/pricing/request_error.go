@@ -47,8 +47,7 @@ func isPriceSourceContractRevert(err error) bool {
 	if errors.As(err, &rpcError) && rpcError.ErrorCode() == 3 {
 		return true
 	}
-	var dataError rpc.DataError
-	if errors.As(err, &dataError) {
+	if dataError, ok := errors.AsType[rpc.DataError](err); ok {
 		switch data := dataError.ErrorData().(type) {
 		case string:
 			normalized := strings.ToLower(strings.TrimSpace(data))
@@ -70,8 +69,7 @@ func isPriceSourceContractRevert(err error) bool {
 }
 
 func isPriceSourceContractRevertReason(err error, expected string) bool {
-	var dataError rpc.DataError
-	if errors.As(err, &dataError) {
+	if dataError, ok := errors.AsType[rpc.DataError](err); ok {
 		if reason, ok := priceSourceContractRevertReasonData(dataError.ErrorData()); ok && reason == expected {
 			return true
 		}

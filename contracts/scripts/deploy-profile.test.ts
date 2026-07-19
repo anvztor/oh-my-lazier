@@ -37,6 +37,7 @@ test("normalizeProfile validates rehearsal mode and generic external DVNs", () =
   assert.equal(profile.chains[0].eid, 40161);
   assert.equal(profile.chains[0].nativeAssetId, "eth");
   assert.equal(profile.chains[0].startBlockNumber, undefined);
+  assert.equal(profile.chains[0].indexerPollIntervalSeconds, 5);
   assert.deepEqual(profile.chains[0].externalDVNs, [
     "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa",
   ]);
@@ -47,10 +48,60 @@ test("normalizeProfile validates rehearsal mode and generic external DVNs", () =
   );
   assert.equal(profile.chains[1].eid, 40449);
   assert.equal(profile.chains[1].nativeAssetId, "eth");
+  assert.equal(profile.chains[1].indexerPollIntervalSeconds, 5);
   assert.deepEqual(profile.chains[1].externalDVNs, [
     "0x9999999999999999999999999999999999999999",
   ]);
   assert.equal(profile.chains[1].includeLayerZeroLabsDVN, false);
+});
+
+test("normalizeProfile rejects non-positive or non-integer indexer poll intervals", () => {
+  for (const value of [
+    undefined,
+    0,
+    -1,
+    1.5,
+    "5",
+    9_223_372_037,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
+    const input = baseProfile();
+    (input.chains[0] as Record<string, unknown>).indexerPollIntervalSeconds =
+      value;
+
+    assert.throws(
+      () => normalizeProfile(input),
+      /profile\.chains\[0\]\.indexerPollIntervalSeconds must be (?:an integer|a safe integer|>= 1|<= 9223372036)/,
+    );
+  }
+});
+
+test("normalizeProfile rejects runtime duration overflow", () => {
+  const sourceTimeout = baseProfile();
+  (sourceTimeout as Record<string, unknown>).pricing = {
+    sourceRequestTimeoutSeconds: 9_223_372_037,
+  };
+  assert.throws(
+    () => normalizeProfile(sourceTimeout),
+    /profile\.pricing\.sourceRequestTimeoutSeconds must be <= 9223372036/,
+  );
+
+  const sourceMaxAge = baseProfile();
+  (sourceMaxAge.chains[1] as Record<string, unknown>).nativeAssetId =
+    "hoodi-eth";
+  for (const [idx, chain] of sourceMaxAge.chains.entries()) {
+    (chain as Record<string, unknown>).priceSources = {
+      primarySource: "coingecko",
+      coinGecko: {
+        id: "ethereum",
+        maxAgeSeconds: idx === 0 ? 9_223_372_037 : 180,
+      },
+    };
+  }
+  assert.throws(
+    () => normalizeProfile(sourceMaxAge),
+    /profile\.chains\[0\]\.priceSources\.coinGecko\.maxAgeSeconds must be <= 9223372036/,
+  );
 });
 
 test("normalizeProfile rejects legacy LayerZero Labs DVN profile fields", () => {
@@ -845,6 +896,7 @@ test("renderWorkerConfig emits external OApps, active DVN signer, and worker con
   assert.match(yaml, /source_request_timeout_seconds: 10/);
   assert.match(yaml, /start_block_number: 123456/);
   assert.match(yaml, /start_block_number: 654321/);
+  assert.match(yaml, /indexer_poll_interval_seconds: 5/);
 });
 
 test("renderWorkerConfig emits only referenced optional price sources", () => {
@@ -1252,6 +1304,7 @@ function baseProfile() {
         minCanaryTokenBalance: "1000000000000000",
         confirmations: 12,
         indexerQueryBlockRange: 500,
+        indexerPollIntervalSeconds: 5,
         externalDVNs: ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         pricingTxPolicy: {
           maxFeePerGasWei: "100000000000",
@@ -1286,6 +1339,7 @@ function baseProfile() {
         minCanaryTokenBalance: "0",
         confirmations: 12,
         indexerQueryBlockRange: 500,
+        indexerPollIntervalSeconds: 5,
         externalDVNs: ["0x9999999999999999999999999999999999999999"],
         pricingTxPolicy: {
           maxFeePerGasWei: "100000000000",

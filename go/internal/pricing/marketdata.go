@@ -115,8 +115,7 @@ func (r *CoinMarketCapPriceReader) PriceUSD(ctx context.Context) (SourcePrice, e
 
 func (r *CoinMarketCapPriceReader) validateSourceConfiguration(ctx context.Context) error {
 	_, err := r.PriceUSD(ctx)
-	var inconclusive *inconclusivePriceSourceConfigurationError
-	if errors.As(err, &inconclusive) {
+	if _, ok := errors.AsType[*inconclusivePriceSourceConfigurationError](err); ok {
 		return err
 	}
 	if isDeterministicMarketDataError(err) {
@@ -287,8 +286,7 @@ func (r *CoinGeckoPriceReader) PriceUSD(ctx context.Context) (SourcePrice, error
 
 func (r *CoinGeckoPriceReader) validateSourceConfiguration(ctx context.Context) error {
 	_, err := r.PriceUSD(ctx)
-	var inconclusive *inconclusivePriceSourceConfigurationError
-	if errors.As(err, &inconclusive) {
+	if _, ok := errors.AsType[*inconclusivePriceSourceConfigurationError](err); ok {
 		return err
 	}
 	if isDeterministicMarketDataError(err) {

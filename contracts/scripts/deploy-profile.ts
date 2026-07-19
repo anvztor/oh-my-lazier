@@ -29,6 +29,8 @@ import {
 } from "./oft-pathway-ignition.js";
 
 const maxPriceSnapshotStaleAfter = 86_400n;
+// Keep generated worker durations within Go's signed 64-bit nanosecond range.
+const maxDurationSeconds = 9_223_372_036;
 const minUniswapTWAPWindowSeconds = 1_800;
 const maxUniswapTWAPWindowSeconds = 0xffff_ffff;
 
@@ -91,6 +93,7 @@ export type ChainProfile = {
   confirmations: number;
   startBlockNumber?: number;
   indexerQueryBlockRange: number;
+  indexerPollIntervalSeconds: number;
   externalDVNs: Address[];
   includeLayerZeroLabsDVN: boolean;
   txRoles: {
@@ -1544,6 +1547,12 @@ function normalizeChain(
       "indexerQueryBlockRange",
       `${pathLabel}.indexerQueryBlockRange`,
     ),
+    indexerPollIntervalSeconds: integerField(
+      input,
+      "indexerPollIntervalSeconds",
+      `${pathLabel}.indexerPollIntervalSeconds`,
+      { max: maxDurationSeconds },
+    ),
     externalDVNs: optionalAddressArrayField(
       input,
       "externalDVNs",
@@ -1575,6 +1584,7 @@ function normalizePricingProfile(value: unknown): PricingProfile {
         input,
         "sourceRequestTimeoutSeconds",
         "profile.pricing.sourceRequestTimeoutSeconds",
+        { max: maxDurationSeconds },
       ) ?? 10,
     maxDeviationBps:
       optionalIntegerField(
@@ -1700,7 +1710,12 @@ function normalizeOptionalCoinMarketCapSource(
   const input = object(value, label);
   return {
     id: integerField(input, "id", `${label}.id`),
-    maxAgeSeconds: integerField(input, "maxAgeSeconds", `${label}.maxAgeSeconds`),
+    maxAgeSeconds: integerField(
+      input,
+      "maxAgeSeconds",
+      `${label}.maxAgeSeconds`,
+      { max: maxDurationSeconds },
+    ),
   };
 }
 
@@ -1712,7 +1727,12 @@ function normalizeOptionalCoinGeckoSource(
   const input = object(value, label);
   return {
     id: stringField(input, "id", `${label}.id`),
-    maxAgeSeconds: integerField(input, "maxAgeSeconds", `${label}.maxAgeSeconds`),
+    maxAgeSeconds: integerField(
+      input,
+      "maxAgeSeconds",
+      `${label}.maxAgeSeconds`,
+      { max: maxDurationSeconds },
+    ),
   };
 }
 
@@ -1729,7 +1749,12 @@ function normalizeOptionalChainlinkSource(
       "expectedDescription",
       `${label}.expectedDescription`,
     ),
-    maxAgeSeconds: integerField(input, "maxAgeSeconds", `${label}.maxAgeSeconds`),
+    maxAgeSeconds: integerField(
+      input,
+      "maxAgeSeconds",
+      `${label}.maxAgeSeconds`,
+      { max: maxDurationSeconds },
+    ),
   };
 }
 
@@ -1766,6 +1791,7 @@ function normalizeOptionalUniswapSource(
       input,
       "maxBlockAgeSeconds",
       `${label}.maxBlockAgeSeconds`,
+      { max: maxDurationSeconds },
     ),
     minHarmonicMeanLiquidity: positiveDecimalField(
       input,
@@ -2181,6 +2207,7 @@ function renderWorkerChain(
     confirmations: ${chain.confirmations}
     start_block_number: ${startBlockNumber}
     indexer_query_block_range: ${chain.indexerQueryBlockRange}
+    indexer_poll_interval_seconds: ${chain.indexerPollIntervalSeconds}
     rpc_urls:
       - ${yamlString(rpcURL)}
     tx_roles:
@@ -2844,15 +2871,21 @@ function integerField(
   input: Record<string, unknown>,
   field: string,
   label: string,
-  options?: { allowZero?: boolean },
+  options?: { allowZero?: boolean; max?: number },
 ): number {
   const value = input[field];
   if (!Number.isInteger(value)) {
     throw new Error(`${label} must be an integer`);
   }
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${label} must be a safe integer`);
+  }
   const min = options?.allowZero === true ? 0 : 1;
   if ((value as number) < min) {
     throw new Error(`${label} must be >= ${min}`);
+  }
+  if (options?.max !== undefined && (value as number) > options.max) {
+    throw new Error(`${label} must be <= ${options.max}`);
   }
   return value as number;
 }
@@ -2861,7 +2894,7 @@ function optionalIntegerField(
   input: Record<string, unknown>,
   field: string,
   label: string,
-  options?: { allowZero?: boolean },
+  options?: { allowZero?: boolean; max?: number },
 ): number | undefined {
   const value = input[field];
   if (value === undefined) {
