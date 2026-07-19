@@ -13,6 +13,7 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	gethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -175,12 +176,32 @@ func TestTransactionReceiptPartialNotFoundRedactsProviderURLs(t *testing.T) {
 		{url: firstURL, status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: receipt})},
 		{url: secondURL, status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
 	}}
+	// Both providers are known caught up, so the NotFound is a genuine dissent.
+	client.storeHeadSnapshot(&headSnapshot{
+		number: big.NewInt(0).Add(receipt.BlockNumber, big.NewInt(1)),
+		tips:   map[int]*big.Int{0: big.NewInt(0).Add(receipt.BlockNumber, big.NewInt(1)), 1: big.NewInt(0).Add(receipt.BlockNumber, big.NewInt(1))},
+	})
 
 	_, err := client.TransactionReceipt(context.Background(), receipt.TxHash)
 	if err == nil || !IsReceiptConflict(err) {
 		t.Fatalf("TransactionReceipt() error = %v, want partial not-found conflict", err)
 	}
 	assertRedactedProviderError(t, err, []string{firstURL, secondURL, "first-password", "second-api-key"}, "provider[1]")
+}
+
+func TestTransactionReceiptUnknownTipNotFoundIsUnavailable(t *testing.T) {
+	receipt := testReceipt()
+	// Without any head snapshot the dissenting provider's tip is unknown: it
+	// cannot be proven caught up, so the round is undecided, not a conflict
+	// that would pause a pathway.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: receipt})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+	}}
+	_, err := client.TransactionReceipt(context.Background(), receipt.TxHash)
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("TransactionReceipt(unknown tip) error = %v, want quorum unavailable", err)
+	}
 }
 
 func TestTransactionReceiptTransientErrorRedactsProviderURL(t *testing.T) {
@@ -195,6 +216,71 @@ func TestTransactionReceiptTransientErrorRedactsProviderURL(t *testing.T) {
 		t.Fatal("TransactionReceipt() error = nil, want transient failure")
 	}
 	assertRedactedProviderError(t, err, []string{secretURL, "rpc-password", "rpc-api-key"}, "provider[0]", "eth_getTransactionReceipt")
+}
+
+func TestTransactionReceiptRequiresMajorityAgreement(t *testing.T) {
+	honest := testReceipt()
+	fabricated := testReceipt()
+	fabricated.Status = gethtypes.ReceiptStatusFailed
+	// One endpoint fabricating receipt content for a canonical block is
+	// outvoted by the fixed majority, even though it is classified healthy.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: honest})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: honest})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: fabricated})},
+	}}
+	receipt, err := client.TransactionReceipt(context.Background(), honest.TxHash)
+	if err != nil {
+		t.Fatalf("TransactionReceipt() error = %v", err)
+	}
+	if receipt.Status != honest.Status {
+		t.Fatalf("receipt status = %d, want the majority answer", receipt.Status)
+	}
+
+	// The vote spans every CONFIGURED provider: a degraded classification must
+	// not shrink the trust set to a single endpoint.
+	loneHealthy := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderUnavailable, client: newTestEthClient(t, testEthService{receipt: honest})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: fabricated})},
+		{url: "c", status: ProviderUnavailable, client: newTestEthClient(t, testEthService{receipt: honest})},
+	}}
+	receipt, err = loneHealthy.TransactionReceipt(context.Background(), honest.TxHash)
+	if err != nil {
+		t.Fatalf("TransactionReceipt(lone healthy) error = %v", err)
+	}
+	if receipt.Status != honest.Status {
+		t.Fatalf("receipt status = %d, want the configured majority to outvote the lone healthy fabricator", receipt.Status)
+	}
+}
+
+func TestTransactionReceiptExcusesLaggingNotFound(t *testing.T) {
+	receipt := testReceipt()
+	receipt.BlockNumber = big.NewInt(120)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: receipt})},
+		{url: "b", status: ProviderLagging, client: newTestEthClient(t, testEthService{})},
+	}}
+	// The laggard's tip is below the receipt's block: its NotFound is excused
+	// lag, so the round is undecided (retry later), not a conflict that would
+	// pause a pathway.
+	client.storeHeadSnapshot(&headSnapshot{
+		number: big.NewInt(119),
+		tips:   map[int]*big.Int{0: big.NewInt(125), 1: big.NewInt(110)},
+	})
+	_, err := client.TransactionReceipt(context.Background(), receipt.TxHash)
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("TransactionReceipt(lagging dissent) error = %v, want quorum unavailable", err)
+	}
+
+	// A caught-up provider claiming NotFound is a genuine dissent.
+	client.storeHeadSnapshot(&headSnapshot{
+		number: big.NewInt(130),
+		tips:   map[int]*big.Int{0: big.NewInt(130), 1: big.NewInt(130)},
+	})
+	_, err = client.TransactionReceipt(context.Background(), receipt.TxHash)
+	if !IsReceiptConflict(err) {
+		t.Fatalf("TransactionReceipt(caught-up dissent) error = %v, want receipt conflict", err)
+	}
 }
 
 func TestCheckHeadUsesMajorityReachedHeight(t *testing.T) {
@@ -367,6 +453,192 @@ func TestCheckHeadClassifiesLaggingProvider(t *testing.T) {
 	providers := client.Providers()
 	if providers[2].Status != ProviderLagging {
 		t.Fatalf("provider[2] status = %q, want lagging", providers[2].Status)
+	}
+}
+
+func TestCheckHeadStepsDownToHonestMajorityHeight(t *testing.T) {
+	honestTip := testHeaderAt(100, 0x01)
+	honestPrev := testHeaderAt(99, 0x02)
+	forkTip := testHeaderAt(100, 0x03)
+	forkPrev := testHeaderAt(99, 0x04)
+	// One forked endpoint claims the top height while an honest provider lags
+	// one block: the 1-1 split at 100 must fall through to the honest
+	// majority agreement at 99 instead of pausing the chain.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: honestTip, headers: map[int64]*gethtypes.Header{99: honestPrev}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: honestPrev})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: forkTip, headers: map[int64]*gethtypes.Header{99: forkPrev}})},
+	}}
+
+	head, err := client.CheckHead(context.Background())
+	if err != nil {
+		t.Fatalf("CheckHead() error = %v", err)
+	}
+	if head.Number.Uint64() != 99 {
+		t.Fatalf("head number = %s, want the honest-majority 99", head.Number)
+	}
+	if head.Hash != honestPrev.Hash().Hex() {
+		t.Fatalf("head hash = %s, want the honest %s", head.Hash, honestPrev.Hash().Hex())
+	}
+	providers := client.Providers()
+	// The round proved the chain only through 99: the honest-but-ahead
+	// provider's tip is an unverified descendant and must not stay healthy
+	// serving single-source latest reads — only the fully verified tip does.
+	if providers[0].Status != ProviderUnavailable {
+		t.Fatalf("ahead provider status = %q, want unavailable after a step-down", providers[0].Status)
+	}
+	if providers[1].Status != ProviderHealthy {
+		t.Fatalf("verified-tip provider status = %q, want healthy", providers[1].Status)
+	}
+	if providers[2].Status != ProviderConflict {
+		t.Fatalf("forked provider status = %q, want conflict", providers[2].Status)
+	}
+}
+
+func TestCanonicalHashAtRequiresMajorityAgreement(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	fork := testHeaderAt(42, 0x02)
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: fork}})},
+	}}
+	hash, err := client.CanonicalHashAt(context.Background(), big.NewInt(42))
+	if err != nil {
+		t.Fatalf("CanonicalHashAt() error = %v", err)
+	}
+	if hash != canonical.Hash() {
+		t.Fatalf("hash = %s, want the majority %s", hash, canonical.Hash())
+	}
+
+	split := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: fork}})},
+	}}
+	if _, err := split.CanonicalHashAt(context.Background(), big.NewInt(42)); !IsHeadConflict(err) {
+		t.Fatalf("CanonicalHashAt(split) error = %v, want head conflict", err)
+	}
+
+	failing := testEthService{err: testRPCError{message: "boom", code: -32000}}
+	degraded := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{headers: map[int64]*gethtypes.Header{42: canonical}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+	}}
+	if _, err := degraded.CanonicalHashAt(context.Background(), big.NewInt(42)); !IsQuorumUnavailable(err) {
+		t.Fatalf("CanonicalHashAt(degraded) error = %v, want quorum unavailable", err)
+	}
+}
+
+func TestCheckHeadStillConflictsWithoutAgreementAtAnyHeight(t *testing.T) {
+	chainATip := testHeaderAt(100, 0x01)
+	chainAPrev := testHeaderAt(99, 0x02)
+	chainBTip := testHeaderAt(100, 0x03)
+	chainBPrev := testHeaderAt(99, 0x04)
+	chainCTip := testHeaderAt(99, 0x05)
+	// Three providers on three different chains never agree at any candidate
+	// height; the conflict classification must survive the step-down search.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: chainATip, headers: map[int64]*gethtypes.Header{99: chainAPrev}})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: chainBTip, headers: map[int64]*gethtypes.Header{99: chainBPrev}})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{header: chainCTip})},
+	}}
+
+	_, err := client.CheckHead(context.Background())
+	if !IsHeadConflict(err) {
+		t.Fatalf("CheckHead() error = %v, want head conflict", err)
+	}
+	// The failed round must not leave any provider healthy: the sub-top-level
+	// responder was never majority-verified, and a stale healthy status would
+	// hand it the single-source reads that follow.
+	for index, provider := range client.Providers() {
+		if provider.Status == ProviderHealthy {
+			t.Fatalf("provider[%d] status = healthy after an unresolved conflict, want conflict or unavailable", index)
+		}
+	}
+}
+
+func TestNonceAtRequiresMajorityAgreement(t *testing.T) {
+	account := common.HexToAddress("0x4141414141414141414141414141414141414141")
+	// A single provider lying about the confirmed nonce is outvoted; the
+	// reconciler must never park lanes from a fabricated value.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 900})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+	}}
+	nonce, err := client.NonceAt(context.Background(), account, big.NewInt(42))
+	if err != nil {
+		t.Fatalf("NonceAt() error = %v", err)
+	}
+	if nonce != 7 {
+		t.Fatalf("nonce = %d, want the majority 7", nonce)
+	}
+}
+
+func TestNonceAtConflictWithoutMajorityValue(t *testing.T) {
+	account := common.HexToAddress("0x4141414141414141414141414141414141414141")
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 8})},
+	}}
+	_, err := client.NonceAt(context.Background(), account, big.NewInt(42))
+	if !IsNonceConflict(err) {
+		t.Fatalf("NonceAt() error = %v, want nonce quorum conflict", err)
+	}
+	for _, detail := range []string{"provider[0] returned nonce 7", "provider[1] returned nonce 8"} {
+		if !strings.Contains(err.Error(), detail) {
+			t.Fatalf("error = %q, want detail %q", err, detail)
+		}
+	}
+}
+
+func TestNonceAtQuorumUnavailableOnInsufficientResponders(t *testing.T) {
+	account := common.HexToAddress("0x4141414141414141414141414141414141414141")
+	failing := testEthService{nonceErr: testRPCError{message: "boom with rpc-secret", code: -32000}}
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+	}}
+	_, err := client.NonceAt(context.Background(), account, big.NewInt(42))
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("NonceAt() error = %v, want quorum unavailable", err)
+	}
+	if strings.Contains(err.Error(), "rpc-secret") {
+		t.Fatalf("error leaked provider failure detail: %q", err)
+	}
+}
+
+func TestNonceAtSingleProviderDegenerate(t *testing.T) {
+	account := common.HexToAddress("0x4141414141414141414141414141414141414141")
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+	}}
+	nonce, err := client.NonceAt(context.Background(), account, big.NewInt(42))
+	if err != nil || nonce != 7 {
+		t.Fatalf("NonceAt() = (%d, %v), want (7, nil)", nonce, err)
+	}
+}
+
+func TestNonceAtReturnsOnMajorityWithoutWaitingForHangingProvider(t *testing.T) {
+	account := common.HexToAddress("0x4141414141414141414141414141414141414141")
+	// The probe deadline is deliberately long: only the early return on q
+	// identical votes can finish this test quickly. The reconciler shares one
+	// RPC budget across the whole pass, so waiting out a hung straggler here
+	// would starve its receipt reads.
+	client := &Client{chainName: "testnet", probeTimeout: 30 * time.Second, providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{nonce: 7})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{hang: true})},
+	}}
+	start := time.Now()
+	nonce, err := client.NonceAt(context.Background(), account, big.NewInt(42))
+	if err != nil || nonce != 7 {
+		t.Fatalf("NonceAt() = (%d, %v), want (7, nil)", nonce, err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("NonceAt() took %s, a satisfied majority must not wait for the hanging probe", elapsed)
 	}
 }
 
@@ -625,12 +897,14 @@ func TestFilterLogsQuorumUnavailableWhenTooFewReachedWindow(t *testing.T) {
 }
 
 type testEthService struct {
-	header  *gethtypes.Header
-	headers map[int64]*gethtypes.Header
-	receipt *gethtypes.Receipt
-	logs    []gethtypes.Log
-	logsErr error
-	err     error
+	header   *gethtypes.Header
+	headers  map[int64]*gethtypes.Header
+	receipt  *gethtypes.Receipt
+	logs     []gethtypes.Log
+	logsErr  error
+	err      error
+	nonce    uint64
+	nonceErr error
 	// hang blocks header requests until the caller's context expires.
 	hang bool
 	// logsScript overrides logs/logsErr with per-call scripted answers.
@@ -706,6 +980,17 @@ func (s testEthService) GetTransactionReceipt(context.Context, common.Hash) (any
 	return s.receipt, nil
 }
 
+func (s testEthService) GetTransactionCount(ctx context.Context, _ common.Address, _ rpc.BlockNumberOrHash) (hexutil.Uint64, error) {
+	if s.hang {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	if s.nonceErr != nil {
+		return 0, s.nonceErr
+	}
+	return hexutil.Uint64(s.nonce), nil
+}
+
 func newTestEthClient(t *testing.T, service testEthService) *ethclient.Client {
 	t.Helper()
 	server := rpc.NewServer()
@@ -774,5 +1059,92 @@ func testReceipt() *gethtypes.Receipt {
 			BlockHash:   common.HexToHash("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
 			Index:       7,
 		}},
+	}
+}
+
+func TestTransactionReceiptNotFoundMajorityBeatsDivergentMinorities(t *testing.T) {
+	first := testReceipt()
+	second := testReceipt()
+	second.Status = gethtypes.ReceiptStatusFailed
+	// A caught-up fixed majority saying "absent" must win even when the two
+	// dissenters return DIFFERENT fabricated receipts — otherwise a minority
+	// could manufacture a pathway-pausing conflict at will.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "d", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: first})},
+		{url: "e", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: second})},
+	}}
+	caughtUp := big.NewInt(0).Add(first.BlockNumber, big.NewInt(2))
+	client.storeHeadSnapshot(&headSnapshot{
+		number: caughtUp,
+		tips:   map[int]*big.Int{0: caughtUp, 1: caughtUp, 2: caughtUp, 3: caughtUp, 4: caughtUp},
+	})
+	_, err := client.TransactionReceipt(context.Background(), first.TxHash)
+	if !errors.Is(err, ethereum.NotFound) {
+		t.Fatalf("TransactionReceipt() error = %v, want the NotFound majority", err)
+	}
+}
+
+func TestTransactionReceiptInflatedCandidateBlockDegradesToUnavailable(t *testing.T) {
+	first := testReceipt()
+	inflated := testReceipt()
+	inflated.Status = gethtypes.ReceiptStatusFailed
+	inflated.BlockNumber = big.NewInt(10_000)
+	// A minority fabricating a receipt at an absurd height excuses every
+	// honest NotFound (their tips cannot cover it). That must drain the
+	// comparable-evidence pool into unavailability — never manufacture a
+	// pathway-pausing conflict.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "d", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: first})},
+		{url: "e", status: ProviderHealthy, client: newTestEthClient(t, testEthService{receipt: inflated})},
+	}}
+	honestTip := big.NewInt(1_000)
+	client.storeHeadSnapshot(&headSnapshot{
+		number: honestTip,
+		tips:   map[int]*big.Int{0: honestTip, 1: honestTip, 2: honestTip, 3: honestTip, 4: honestTip},
+	})
+	_, err := client.TransactionReceipt(context.Background(), first.TxHash)
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("TransactionReceipt(inflated candidate) error = %v, want quorum unavailable", err)
+	}
+	if IsReceiptConflict(err) {
+		t.Fatal("an inflated candidate block manufactured a receipt conflict")
+	}
+}
+
+func TestTransactionReceiptAtExcludesLaggingNegatives(t *testing.T) {
+	failing := testEthService{err: testRPCError{message: "boom", code: -32000}}
+	// No receipt candidate at all: two lagging NotFounds plus one caught-up
+	// NotFound and two transient failures must NOT produce an authoritative
+	// absence for a tx known to live at block 500 — only caught-up providers
+	// can vote it absent.
+	client := &Client{chainName: "testnet", providers: []configuredProvider{
+		{url: "a", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "b", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "c", status: ProviderHealthy, client: newTestEthClient(t, testEthService{})},
+		{url: "d", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+		{url: "e", status: ProviderHealthy, client: newTestEthClient(t, failing)},
+	}}
+	client.storeHeadSnapshot(&headSnapshot{
+		number: big.NewInt(600),
+		tips:   map[int]*big.Int{0: big.NewInt(400), 1: big.NewInt(450), 2: big.NewInt(600), 3: big.NewInt(600), 4: big.NewInt(600)},
+	})
+	minBlock := big.NewInt(500)
+	if _, err := client.TransactionReceiptAt(context.Background(), common.HexToHash("0x5001"), minBlock); errors.Is(err, ethereum.NotFound) {
+		t.Fatal("lagging NotFounds formed an authoritative absence")
+	}
+
+	// With every responder caught up, the same answers ARE authoritative.
+	client.storeHeadSnapshot(&headSnapshot{
+		number: big.NewInt(600),
+		tips:   map[int]*big.Int{0: big.NewInt(600), 1: big.NewInt(600), 2: big.NewInt(600), 3: big.NewInt(600), 4: big.NewInt(600)},
+	})
+	if _, err := client.TransactionReceiptAt(context.Background(), common.HexToHash("0x5001"), minBlock); !errors.Is(err, ethereum.NotFound) {
+		t.Fatalf("caught-up NotFound majority = %v, want ethereum.NotFound", err)
 	}
 }

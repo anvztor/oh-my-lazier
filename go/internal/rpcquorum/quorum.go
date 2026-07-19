@@ -236,6 +236,32 @@ func IsReceiptConflict(err error) bool {
 	return errors.As(err, &conflict)
 }
 
+// NonceConflictError reports that responding providers disagreed on an account
+// nonce and no fixed configured majority value emerged. The nonce reconciler
+// treats any error as a failed read and leaves durable lane state untouched.
+type NonceConflictError struct {
+	ChainName string
+	Account   common.Address
+	Details   []string
+}
+
+// Error returns the provider disagreement details.
+func (e *NonceConflictError) Error() string {
+	if e == nil {
+		return "rpc nonce quorum conflict"
+	}
+	if len(e.Details) == 0 {
+		return fmt.Sprintf("rpc nonce quorum conflict for chain %s account %s", e.ChainName, e.Account)
+	}
+	return fmt.Sprintf("rpc nonce quorum conflict for chain %s account %s: %s", e.ChainName, e.Account, strings.Join(e.Details, "; "))
+}
+
+// IsNonceConflict reports whether err is a nonce quorum conflict.
+func IsNonceConflict(err error) bool {
+	var conflict *NonceConflictError
+	return errors.As(err, &conflict)
+}
+
 // ChainIDMismatchError reports configured RPC providers that do not match the expected EVM chain ID.
 type ChainIDMismatchError struct {
 	ChainName string
@@ -297,17 +323,20 @@ func (c *Client) Close() {
 }
 
 // CheckHead establishes the quorum head: the canonical number is the height a
-// fixed configured majority of providers has reached (the q-th highest tip,
-// q = floor(N/2)+1 over the CONFIGURED provider count, never recomputed from
-// this round's responders), and the canonical hash must be reported at that
-// height by at least q providers. A single provider can therefore neither lift
-// the trusted head with an inflated tip nor stall it, and a minority fork
-// dissenter is marked conflicted without failing the chain; only the absence
-// of any majority hash is a HeadConflictError. Too few usable responses is a
-// QuorumUnavailableError, not a fork. Provider health is reclassified on every
-// call (request failures never retain a stale healthy status), and the
-// resulting snapshot pins the tips used to prefer near-canonical providers for
-// single-source reads.
+// fixed configured majority of providers has reached (at most the q-th highest
+// tip, q = floor(N/2)+1 over the CONFIGURED provider count, never recomputed
+// from this round's responders), and the canonical hash must be reported at
+// the accepted height by at least q providers. When the hash vote fails at the
+// top candidate height, the vote steps down through the lower distinct
+// responder tips until a majority hash emerges — a minority fork plus ordinary
+// honest lag must not manufacture a conflict. A single provider can therefore
+// neither lift the trusted head with an inflated tip nor stall it, and a
+// minority fork dissenter is marked conflicted without failing the chain; only
+// the absence of any majority hash at every candidate height is a
+// HeadConflictError. Too few usable responses is a QuorumUnavailableError, not
+// a fork. Provider health is reclassified on every call (request failures
+// never retain a stale healthy status), and the resulting snapshot pins the
+// tips used to prefer near-canonical providers for single-source reads.
 func (c *Client) CheckHead(ctx context.Context) (HeadResult, error) {
 	c.headMu.Lock()
 	defer c.headMu.Unlock()
@@ -361,96 +390,152 @@ func (c *Client) CheckHead(ctx context.Context) (HeadResult, error) {
 		}
 	}
 
-	// Canonical number: the height a configured majority has reached.
+	// Candidate heights: the q-th highest tip first (the highest height a
+	// configured majority has reached), then every lower distinct responder
+	// tip. If the hash vote fails at one height, the vote retries at the next
+	// lower candidate before declaring a conflict: a minority fork claiming
+	// the top height plus ordinary lag among honest providers must not pause
+	// the chain when the honest majority still agrees on a slightly older
+	// block. Honest same-chain providers always agree at their lowest common
+	// tip — a member of this candidate set — so stepping down finds every
+	// recoverable agreement without weakening the hash-quorum requirement.
 	numbers := make([]*big.Int, 0, len(tips))
 	for _, tip := range tips {
 		numbers = append(numbers, tip)
 	}
 	sort.Slice(numbers, func(i, j int) bool { return numbers[i].Cmp(numbers[j]) > 0 })
-	canonicalNumber := new(big.Int).Set(numbers[quorum-1])
-
-	// Canonical hash: every responder at or above the canonical height votes
-	// with its block hash at exactly that height (tips reuse the probe header;
-	// higher tips fetch the historical header concurrently into per-slot
-	// results, merged only after Wait).
-	votes := make(map[int]common.Hash, len(tips))
-	var fetchIndices []int
-	for index, tip := range tips {
-		switch tip.Cmp(canonicalNumber) {
-		case -1:
-			statuses[index] = ProviderLagging
-		case 0:
-			votes[index] = tipHashes[index]
-		default:
-			fetchIndices = append(fetchIndices, index)
+	var candidateHeights []*big.Int
+	for _, number := range numbers[quorum-1:] {
+		if len(candidateHeights) == 0 || candidateHeights[len(candidateHeights)-1].Cmp(number) != 0 {
+			candidateHeights = append(candidateHeights, new(big.Int).Set(number))
 		}
 	}
-	fetchedHeaders := make([]*gethtypes.Header, len(fetchIndices))
-	fetchedErrs := make([]error, len(fetchIndices))
-	var voteWG sync.WaitGroup
-	for slot, index := range fetchIndices {
-		voteWG.Add(1)
-		go func(slot, index int) {
-			defer voteWG.Done()
-			probeCtx, cancel := c.probeContext(ctx)
-			defer cancel()
-			fetchedHeaders[slot], fetchedErrs[slot] = c.headerByNumberFromProvider(probeCtx, index, canonicalNumber)
-		}(slot, index)
-	}
-	voteWG.Wait()
-	for slot, index := range fetchIndices {
-		if fetchedErrs[slot] != nil || fetchedHeaders[slot] == nil {
-			statuses[index] = ProviderUnavailable
-			failureDetails = append(failureDetails, fmt.Sprintf("%s canonical header unavailable", providerID(index)))
+
+	// Availability and conflict classification stay anchored at the first
+	// candidate height, matching the pre-step-down semantics.
+	var firstLevelVotes map[int]common.Hash
+	var firstLevelFailures []string
+	for level, height := range candidateHeights {
+		// Every responder at or above this height votes with its block hash at
+		// exactly this height (tips reuse the probe header; higher tips fetch
+		// the historical header concurrently into per-slot results, merged
+		// only after Wait).
+		votes := make(map[int]common.Hash, len(tips))
+		var levelFailures []string
+		var fetchIndices []int
+		for index, tip := range tips {
+			switch tip.Cmp(height) {
+			case -1:
+			case 0:
+				votes[index] = tipHashes[index]
+			default:
+				fetchIndices = append(fetchIndices, index)
+			}
+		}
+		fetchedHeaders := make([]*gethtypes.Header, len(fetchIndices))
+		fetchedErrs := make([]error, len(fetchIndices))
+		var voteWG sync.WaitGroup
+		for slot, index := range fetchIndices {
+			voteWG.Add(1)
+			go func(slot, index int) {
+				defer voteWG.Done()
+				probeCtx, cancel := c.probeContext(ctx)
+				defer cancel()
+				fetchedHeaders[slot], fetchedErrs[slot] = c.headerByNumberFromProvider(probeCtx, index, height)
+			}(slot, index)
+		}
+		voteWG.Wait()
+		for slot, index := range fetchIndices {
+			if fetchedErrs[slot] != nil || fetchedHeaders[slot] == nil {
+				levelFailures = append(levelFailures, fmt.Sprintf("%s canonical header unavailable", providerID(index)))
+				continue
+			}
+			votes[index] = fetchedHeaders[slot].Hash()
+		}
+		if level == 0 {
+			firstLevelVotes = votes
+			firstLevelFailures = levelFailures
+		}
+		if len(votes) < quorum {
 			continue
 		}
-		votes[index] = fetchedHeaders[slot].Hash()
+		voteCounts := make(map[common.Hash]int, len(votes))
+		for _, hash := range votes {
+			voteCounts[hash]++
+		}
+		var canonicalHash common.Hash
+		best := 0
+		for hash, count := range voteCounts {
+			if count > best {
+				best = count
+				canonicalHash = hash
+			}
+		}
+		if best < quorum {
+			continue
+		}
+		for index, hash := range votes {
+			if hash == canonicalHash {
+				statuses[index] = ProviderHealthy
+			} else {
+				statuses[index] = ProviderConflict
+			}
+		}
+		for _, index := range fetchIndices {
+			if _, voted := votes[index]; !voted {
+				statuses[index] = ProviderUnavailable
+			}
+		}
+		for index, tip := range tips {
+			if tip.Cmp(height) < 0 {
+				statuses[index] = ProviderLagging
+			}
+		}
+		if level > 0 {
+			// The vote only reached quorum below the top candidate, so every
+			// tip above the accepted height is a divergent, unverified
+			// descendant — the round proves the chain through this height and
+			// nothing above it. Those providers keep their verified vote, but
+			// they must not stay healthy and serve single-source latest reads
+			// (eth_call, pending nonce, sends) from an arbitrary branch. A
+			// provider ahead of a first-candidate quorum is untouched: that is
+			// ordinary propagation lead, not divergence.
+			for index, tip := range tips {
+				if tip.Cmp(height) > 0 && statuses[index] == ProviderHealthy {
+					statuses[index] = ProviderUnavailable
+				}
+			}
+		}
+		c.applyProviderStatuses(statuses)
+		c.storeHeadSnapshot(&headSnapshot{number: new(big.Int).Set(height), hash: canonicalHash, tips: tips})
+		return HeadResult{Number: new(big.Int).Set(height), Hash: canonicalHash.Hex()}, nil
 	}
-	if len(votes) < quorum {
+
+	if len(firstLevelVotes) < quorum {
 		markUnverifiedUnavailable(statuses, total)
 		c.applyProviderStatuses(statuses)
 		return HeadResult{}, &QuorumUnavailableError{
 			ChainName: c.chainName,
-			Details:   append(failureDetails, fmt.Sprintf("%d of %d configured providers served the canonical height, quorum is %d", len(votes), total, quorum)),
+			Details:   append(append(failureDetails, firstLevelFailures...), fmt.Sprintf("%d of %d configured providers served the canonical height, quorum is %d", len(firstLevelVotes), total, quorum)),
 		}
 	}
-	voteCounts := make(map[common.Hash]int, len(votes))
-	for _, hash := range votes {
-		voteCounts[hash]++
+	details := make([]string, 0, len(firstLevelVotes))
+	for index, hash := range firstLevelVotes {
+		details = append(details, fmt.Sprintf("%s returned %s", providerID(index), hash))
+		statuses[index] = ProviderConflict
 	}
-	var canonicalHash common.Hash
-	best := 0
-	for hash, count := range voteCounts {
-		if count > best {
-			best = count
-			canonicalHash = hash
-		}
-	}
-	if best < quorum {
-		details := make([]string, 0, len(votes))
-		for index, hash := range votes {
-			details = append(details, fmt.Sprintf("%s returned %s", providerID(index), hash))
-			statuses[index] = ProviderConflict
-		}
-		sort.Strings(details)
-		c.applyProviderStatuses(statuses)
-		return HeadResult{}, &HeadConflictError{
-			ChainName: c.chainName,
-			Number:    new(big.Int).Set(canonicalNumber),
-			Details:   details,
-		}
-	}
-	for index, hash := range votes {
-		if hash == canonicalHash {
-			statuses[index] = ProviderHealthy
-		} else {
-			statuses[index] = ProviderConflict
-		}
-	}
-
+	sort.Strings(details)
+	// A failed round must not leave anyone unclassified: a provider that
+	// failed the first-level fetch or lagged below it was never
+	// majority-verified and must not keep a stale healthy status serving
+	// single-source reads after the conflict.
+	markUnverifiedUnavailable(statuses, total)
 	c.applyProviderStatuses(statuses)
-	c.storeHeadSnapshot(&headSnapshot{number: new(big.Int).Set(canonicalNumber), hash: canonicalHash, tips: tips})
-	return HeadResult{Number: new(big.Int).Set(canonicalNumber), Hash: canonicalHash.Hex()}, nil
+	return HeadResult{}, &HeadConflictError{
+		ChainName: c.chainName,
+		Number:    new(big.Int).Set(candidateHeights[0]),
+		Details:   details,
+	}
 }
 
 // markUnverifiedUnavailable downgrades every provider a failed quorum round
@@ -658,18 +743,30 @@ func (c *Client) FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]
 	// instead of being flagged; errors already had their bounded retry inside
 	// queryLogWindow.
 	majority, best := majorityLogFingerprint(results)
-	retried := false
-	for slot, index := range participants {
+	var retrySlots []int
+	for slot := range participants {
 		if results[slot].err != nil {
 			continue
 		}
 		if best >= quorum && results[slot].fingerprint == majority {
 			continue
 		}
-		results[slot] = c.queryLogWindow(ctx, index, query)
-		retried = true
+		retrySlots = append(retrySlots, slot)
 	}
-	if retried {
+	if len(retrySlots) > 0 {
+		// The re-queries run concurrently like round 1: each can spend up to
+		// two probe deadlines, and a serial sweep over several divergent,
+		// stalling providers would multiply that into one very long indexer
+		// poll instead of being bounded by the slowest single provider.
+		var retryWG sync.WaitGroup
+		for _, slot := range retrySlots {
+			retryWG.Add(1)
+			go func(slot, index int) {
+				defer retryWG.Done()
+				results[slot] = c.queryLogWindow(ctx, index, query)
+			}(slot, participants[slot])
+		}
+		retryWG.Wait()
 		majority, best = majorityLogFingerprint(results)
 	}
 
@@ -921,13 +1018,165 @@ func (c *Client) PendingNonceAt(ctx context.Context, account common.Address) (ui
 	return result, wrapProviderOperationError(index, "eth_getTransactionCount", err)
 }
 
-// NonceAt returns the first healthy provider's account nonce at the given block
-// (nil means latest); the nonce reconciler pins it to a confirmed block.
+// NonceAt returns the account nonce at the given block (nil means latest)
+// agreed by the fixed configured majority of providers (q = floor(N/2)+1 over
+// the CONFIGURED provider count). The nonce reconciler mutates durable
+// signer-lane state from this value — parking rows as externally consumed and
+// fast-forwarding the nonce cursor — so a single corrupted or hostile provider
+// must not be able to fabricate it. Callers should pin a confirmed block:
+// at the tip, honest providers can transiently disagree. Too few usable
+// responses is a QuorumUnavailableError; enough responders without a majority
+// value is a NonceConflictError. Either way the read fails closed.
 func (c *Client) NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error) {
-	index, err := c.firstHealthyProvider()
-	if err != nil {
-		return 0, err
+	providers := c.snapshotProviders()
+	total := len(providers)
+	if total == 0 {
+		return 0, errors.New("no rpc providers configured")
 	}
+	quorum := total/2 + 1
+
+	type nonceProbe struct {
+		nonce uint64
+		err   error
+	}
+	probes := make([]nonceProbe, total)
+	// The vote returns the moment q identical nonces are in, canceling the
+	// remaining probes: a hung minority provider must only be able to delay
+	// this read when its answer could still change the outcome. The nonce
+	// reconciler runs the whole pass — header, nonce, and every receipt
+	// lookup — under one shared RPC budget, and burning a full probe deadline
+	// here on an irrelevant straggler starves the receipt reads and wedges the
+	// held lane permanently.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+	completions := make(chan int, total)
+	for index := range providers {
+		go func(index int) {
+			perProbeCtx, cancel := c.probeContext(probeCtx)
+			defer cancel()
+			nonce, err := c.nonceAtFromProvider(perProbeCtx, index, account, blockNumber)
+			probes[index] = nonceProbe{nonce: nonce, err: err}
+			completions <- index
+		}(index)
+	}
+
+	votes := make(map[uint64]int, total)
+	responded := 0
+	var failureDetails []string
+	for completed := 0; completed < total; completed++ {
+		index := <-completions
+		probe := probes[index]
+		if probe.err != nil {
+			failureDetails = append(failureDetails, fmt.Sprintf("%s eth_getTransactionCount failed", providerID(index)))
+			continue
+		}
+		responded++
+		votes[probe.nonce]++
+		if votes[probe.nonce] >= quorum {
+			return probe.nonce, nil
+		}
+	}
+	if responded < quorum {
+		return 0, &QuorumUnavailableError{
+			ChainName: c.chainName,
+			Details:   append(failureDetails, fmt.Sprintf("%d of %d configured providers returned an account nonce, quorum is %d", responded, total, quorum)),
+		}
+	}
+	details := make([]string, 0, responded)
+	for index, probe := range probes {
+		if probe.err == nil {
+			details = append(details, fmt.Sprintf("%s returned nonce %d", providerID(index), probe.nonce))
+		}
+	}
+	sort.Strings(details)
+	return 0, &NonceConflictError{
+		ChainName: c.chainName,
+		Account:   account,
+		Details:   details,
+	}
+}
+
+// CanonicalHashAt returns the block hash at the given height agreed by the
+// fixed configured majority of providers (q = floor(N/2)+1 over the CONFIGURED
+// provider count). Receipt terminalization uses it to prove a mined receipt's
+// block is on the majority chain before applying irreversible workflow state:
+// a height-only confirmation check could pair a receipt from one branch with a
+// head from another across a reorg. Too few usable responses is a
+// QuorumUnavailableError; enough responders without a majority hash is a
+// HeadConflictError. Either way the read fails closed.
+func (c *Client) CanonicalHashAt(ctx context.Context, blockNumber *big.Int) (common.Hash, error) {
+	if blockNumber == nil {
+		return common.Hash{}, errors.New("canonical hash lookup requires a block number")
+	}
+	providers := c.snapshotProviders()
+	total := len(providers)
+	if total == 0 {
+		return common.Hash{}, errors.New("no rpc providers configured")
+	}
+	quorum := total/2 + 1
+
+	type hashProbe struct {
+		hash common.Hash
+		err  error
+	}
+	probes := make([]hashProbe, total)
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+	completions := make(chan int, total)
+	for index := range providers {
+		go func(index int) {
+			perProbeCtx, cancel := c.probeContext(probeCtx)
+			defer cancel()
+			header, err := c.headerByNumberFromProvider(perProbeCtx, index, blockNumber)
+			if err == nil && header == nil {
+				err = fmt.Errorf("%s returned no header", providerID(index))
+			}
+			if err != nil {
+				probes[index] = hashProbe{err: err}
+			} else {
+				probes[index] = hashProbe{hash: header.Hash()}
+			}
+			completions <- index
+		}(index)
+	}
+
+	votes := make(map[common.Hash]int, total)
+	responded := 0
+	var failureDetails []string
+	for completed := 0; completed < total; completed++ {
+		index := <-completions
+		probe := probes[index]
+		if probe.err != nil {
+			failureDetails = append(failureDetails, fmt.Sprintf("%s header unavailable", providerID(index)))
+			continue
+		}
+		responded++
+		votes[probe.hash]++
+		if votes[probe.hash] >= quorum {
+			return probe.hash, nil
+		}
+	}
+	if responded < quorum {
+		return common.Hash{}, &QuorumUnavailableError{
+			ChainName: c.chainName,
+			Details:   append(failureDetails, fmt.Sprintf("%d of %d configured providers served block %s, quorum is %d", responded, total, blockNumber, quorum)),
+		}
+	}
+	details := make([]string, 0, responded)
+	for index, probe := range probes {
+		if probe.err == nil {
+			details = append(details, fmt.Sprintf("%s returned %s", providerID(index), probe.hash))
+		}
+	}
+	sort.Strings(details)
+	return common.Hash{}, &HeadConflictError{
+		ChainName: c.chainName,
+		Number:    new(big.Int).Set(blockNumber),
+		Details:   details,
+	}
+}
+
+func (c *Client) nonceAtFromProvider(ctx context.Context, index int, account common.Address, blockNumber *big.Int) (uint64, error) {
 	client, err := c.providerClient(ctx, index)
 	if err != nil {
 		return 0, err
@@ -950,58 +1199,188 @@ func (c *Client) SendTransaction(ctx context.Context, tx *gethtypes.Transaction)
 }
 
 // TransactionReceipt returns a receipt only when healthy providers agree on the receipt.
+// TransactionReceipt returns the receipt agreed by the fixed configured
+// majority of providers (q = floor(N/2)+1 over the CONFIGURED count). Receipt
+// content — status, logs, gas — drives irreversible workflow terminalization
+// and DVN verification, so it must never rest on one endpoint's answer: a
+// classification-based trust set can shrink to a single provider after a head
+// step-down or degradation, and that lone endpoint could fabricate a receipt
+// for a majority-canonical block. A NotFound from a provider whose last
+// observed tip is below the candidate receipt's block is excused lag (it
+// cannot know the block yet) and reads as unavailability, not disagreement; a
+// NotFound at or above that block is a real dissent and, without a majority,
+// a ReceiptConflictError. A majority of NotFound answers is ethereum.NotFound.
 func (c *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*gethtypes.Receipt, error) {
-	var canonical *gethtypes.Receipt
-	var canonicalFingerprint string
-	canonicalProviderIndex := -1
+	return c.TransactionReceiptAt(ctx, txHash, nil)
+}
+
+// TransactionReceiptAt is TransactionReceipt with a caller-known minimum block
+// the transaction could live at (for a DVN packet its indexed source block;
+// for nonce reconciliation the confirmed block). Providers whose last observed
+// tip is below that block cannot authoritatively deny the transaction, so
+// their NotFound answers are excused from the negative quorum even when no
+// receipt candidate arrived — without this, lagging NotFounds during partial
+// RPC failure could produce an authoritative absence and misroute a valid
+// packet into reorg handling. Callers whose NotFound consumption is
+// non-destructive (receipt polling just polls again) may pass nil.
+func (c *Client) TransactionReceiptAt(ctx context.Context, txHash common.Hash, minBlock *big.Int) (*gethtypes.Receipt, error) {
+	providers := c.snapshotProviders()
+	total := len(providers)
+	if total == 0 {
+		return nil, errors.New("no rpc providers configured")
+	}
+	quorum := total/2 + 1
+
+	type receiptProbe struct {
+		receipt  *gethtypes.Receipt
+		notFound bool
+		err      error
+	}
+	probes := make([]receiptProbe, total)
+	// A satisfied receipt majority returns immediately and cancels the
+	// stragglers: a hung minority provider must not add a full probe deadline
+	// to every lookup of a mined receipt. NotFound never returns early — a
+	// premature NotFound would feed reorg detection and nonce reconciliation,
+	// so the negative answer waits for every responder and the excusal logic
+	// below.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+	completions := make(chan int, total)
+	for index := range providers {
+		go func(index int) {
+			perProbeCtx, cancel := c.probeContext(probeCtx)
+			defer cancel()
+			receipt, err := c.transactionReceiptFromProvider(perProbeCtx, index, txHash)
+			switch {
+			case errors.Is(err, ethereum.NotFound):
+				probes[index] = receiptProbe{notFound: true}
+			case err != nil:
+				probes[index] = receiptProbe{err: err}
+			case receipt == nil:
+				probes[index] = receiptProbe{notFound: true}
+			default:
+				probes[index] = receiptProbe{receipt: receipt}
+			}
+			completions <- index
+		}(index)
+	}
+
+	votes := make(map[string]int, total)
+	receiptsByFingerprint := make(map[string]*gethtypes.Receipt, total)
+	notFoundTotal := 0
+	responded := 0
 	var transientErrs []error
-	var notFoundProviders []string
-	for index, provider := range c.snapshotProviders() {
-		if provider.status != ProviderHealthy {
-			continue
-		}
-		receipt, err := c.transactionReceiptFromProvider(ctx, index, txHash)
-		if err != nil {
-			if errors.Is(err, ethereum.NotFound) {
-				notFoundProviders = append(notFoundProviders, providerID(index))
-				continue
-			}
-			transientErrs = append(transientErrs, err)
-			continue
-		}
-		fingerprint := receiptFingerprint(receipt)
-		if canonical == nil {
-			canonical = receipt
-			canonicalFingerprint = fingerprint
-			canonicalProviderIndex = index
-			continue
-		}
-		if fingerprint != canonicalFingerprint {
-			return nil, &ReceiptConflictError{
-				TxHash: txHash,
-				Details: []string{
-					fmt.Sprintf("%s returned %s", providerID(index), fingerprint),
-					fmt.Sprintf("%s returned %s", providerID(canonicalProviderIndex), canonicalFingerprint),
-				},
+	for completed := 0; completed < total; completed++ {
+		index := <-completions
+		probe := probes[index]
+		switch {
+		case probe.err != nil:
+			transientErrs = append(transientErrs, probe.err)
+		case probe.notFound:
+			responded++
+			notFoundTotal++
+		default:
+			responded++
+			fingerprint := receiptFingerprint(probe.receipt)
+			votes[fingerprint]++
+			receiptsByFingerprint[fingerprint] = probe.receipt
+			if votes[fingerprint] >= quorum {
+				return probe.receipt, nil
 			}
 		}
 	}
-	if canonical != nil && len(notFoundProviders) > 0 {
-		return nil, &ReceiptConflictError{
-			TxHash:  txHash,
-			Details: []string{fmt.Sprintf("providers missing mined receipt: %s", strings.Join(notFoundProviders, ", "))},
+
+	// No receipt majority. With no candidate at all, a NotFound majority is
+	// simply "not mined". With candidates, only providers KNOWN to have
+	// reached every candidate's block can vote against them: a NotFound from a
+	// provider whose last observed tip is below the highest candidate block —
+	// or whose tip is unknown — cannot distinguish "absent" from "not yet
+	// visible" and reads as unavailability. The NotFound majority is evaluated
+	// regardless of how many receipt variants dissent: a caught-up fixed
+	// majority saying "absent" must beat any minority's fabricated receipts
+	// instead of letting them manufacture a pathway-pausing conflict.
+	if len(votes) == 0 {
+		notFoundQuorumVotes := notFoundTotal
+		if minBlock != nil {
+			snapshot := c.headSnapshotRef()
+			notFoundQuorumVotes = 0
+			for index, probe := range probes {
+				if !probe.notFound {
+					continue
+				}
+				var tip *big.Int
+				if snapshot != nil {
+					tip = snapshot.tips[index]
+				}
+				if tip != nil && tip.Cmp(minBlock) >= 0 {
+					notFoundQuorumVotes++
+				}
+			}
 		}
-	}
-	if len(transientErrs) > 0 {
-		return nil, errors.Join(transientErrs...)
-	}
-	if canonical == nil {
-		if len(notFoundProviders) > 0 {
+		if notFoundQuorumVotes >= quorum {
 			return nil, ethereum.NotFound
 		}
-		return nil, errors.New("no healthy rpc providers configured")
+		if len(transientErrs) > 0 {
+			return nil, errors.Join(transientErrs...)
+		}
+		return nil, &QuorumUnavailableError{
+			ChainName: c.chainName,
+			Details:   []string{fmt.Sprintf("%d of %d configured providers gave a comparable receipt answer, quorum is %d", notFoundQuorumVotes, total, quorum)},
+		}
 	}
-	return canonical, nil
+	var highestCandidateBlock *big.Int
+	receiptVotes := 0
+	for _, receipt := range receiptsByFingerprint {
+		if receipt.BlockNumber != nil && (highestCandidateBlock == nil || receipt.BlockNumber.Cmp(highestCandidateBlock) > 0) {
+			highestCandidateBlock = receipt.BlockNumber
+		}
+	}
+	if minBlock != nil && (highestCandidateBlock == nil || minBlock.Cmp(highestCandidateBlock) > 0) {
+		highestCandidateBlock = minBlock
+	}
+	for _, count := range votes {
+		receiptVotes += count
+	}
+	snapshot := c.headSnapshotRef()
+	unexcusedNotFound := 0
+	for index, probe := range probes {
+		if !probe.notFound {
+			continue
+		}
+		var tip *big.Int
+		if snapshot != nil {
+			tip = snapshot.tips[index]
+		}
+		if highestCandidateBlock != nil && tip != nil && tip.Cmp(highestCandidateBlock) >= 0 {
+			unexcusedNotFound++
+		}
+	}
+	if unexcusedNotFound >= quorum {
+		return nil, ethereum.NotFound
+	}
+	// A conflict needs a fixed majority of COMPARABLE evidence — receipt votes
+	// plus NotFounds proven to cover every candidate block. A minority can
+	// inflate the excusal bar by fabricating a receipt at an absurd height,
+	// but that only drains the comparable pool and degrades the round to
+	// unavailability; it must never manufacture a pathway-pausing conflict.
+	if receiptVotes+unexcusedNotFound >= quorum && (len(votes) > 1 || unexcusedNotFound > 0) {
+		details := make([]string, 0, responded)
+		for index, probe := range probes {
+			switch {
+			case probe.err != nil:
+			case probe.notFound:
+				details = append(details, fmt.Sprintf("%s returned not found", providerID(index)))
+			default:
+				details = append(details, fmt.Sprintf("%s returned %s", providerID(index), receiptFingerprint(probe.receipt)))
+			}
+		}
+		sort.Strings(details)
+		return nil, &ReceiptConflictError{TxHash: txHash, Details: details}
+	}
+	return nil, &QuorumUnavailableError{
+		ChainName: c.chainName,
+		Details:   []string{fmt.Sprintf("receipt for tx %s lacks a comparable-evidence majority", txHash)},
+	}
 }
 
 func (c *Client) transactionReceiptFromProvider(ctx context.Context, index int, txHash common.Hash) (*gethtypes.Receipt, error) {
@@ -1120,6 +1499,15 @@ func receiptFingerprint(receipt *gethtypes.Receipt) string {
 	}
 	builder.WriteString("|block_hash=")
 	builder.WriteString(receipt.BlockHash.Hex())
+	// Gas facts are persisted and drive cost accounting; leaving them out of
+	// the vote would let a minority provider control them while agreeing on
+	// everything else.
+	builder.WriteString("|gas_used=")
+	fmt.Fprint(&builder, receipt.GasUsed)
+	builder.WriteString("|effective_gas_price=")
+	if receipt.EffectiveGasPrice != nil {
+		builder.WriteString(receipt.EffectiveGasPrice.String())
+	}
 	builder.WriteString("|logs=")
 	fmt.Fprint(&builder, len(receipt.Logs))
 	for _, log := range receipt.Logs {
