@@ -127,6 +127,18 @@ groups:
           summary: RPC provider disagrees with the majority quorum on canonical chain data
           runbook: docs/runbooks/monitoring.md
 
+      # Grouped by scrape identity as well: each worker instance has its own
+      # independent provider set, and merging instances would let a healthy
+      # instance's providers mask another instance's lost majority.
+      - alert: LazRPCQuorumUnavailable
+        expr: 2 * count by (chain_eid, job, instance) (laz_rpc_provider_status{status="unavailable"}) >= count by (chain_eid, job, instance) (laz_rpc_provider_status)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Too many RPC providers are unavailable for the fixed majority quorum to form
+          runbook: docs/runbooks/monitoring.md
+
       - alert: LazIndexerCursorStalled
         expr: changes(laz_indexer_cursor_last_block[10m]) == 0
         for: 10m

@@ -53,6 +53,7 @@ const requiredDocs: RequiredDoc[] = [
       "LazIndexerPollFailing",
       "LazIndexerCursorStalled",
       "LazRPCProviderConflict",
+      "LazRPCQuorumUnavailable",
       "laz_chain_paused == 1",
       "laz_pathway_paused == 1",
       "laz_indexer_poll_success",
@@ -213,6 +214,13 @@ const requiredAlertRules: RequiredAlertRule[] = [
     alert: "LazRPCProviderConflict",
     anchors: [
       'laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1',
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazRPCQuorumUnavailable",
+    anchors: [
+      '2 * count by (chain_eid, job, instance) (laz_rpc_provider_status{status="unavailable"}) >= count by (chain_eid, job, instance) (laz_rpc_provider_status)',
       "severity: page",
     ],
   },
