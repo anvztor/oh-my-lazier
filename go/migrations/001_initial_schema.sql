@@ -68,6 +68,16 @@ CREATE TABLE IF NOT EXISTS executor_jobs (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Every lzReceive failure hash charged against a job's retry budget. Insert
+-- success is the counting condition, so a crash-replayed receipt or lagging
+-- LzReceiveAlert for an already-counted hash can never charge the budget twice.
+CREATE TABLE IF NOT EXISTS executor_receive_failures (
+  guid BYTEA NOT NULL REFERENCES executor_jobs(guid) ON DELETE CASCADE,
+  tx_hash BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (guid, tx_hash)
+);
+
 CREATE TABLE IF NOT EXISTS dvn_jobs (
   guid BYTEA PRIMARY KEY REFERENCES packets(guid),
   assigned BOOLEAN NOT NULL DEFAULT false,
@@ -140,7 +150,7 @@ CREATE TABLE IF NOT EXISTS tx_outbox (
   held_reason TEXT
     CHECK (held_reason IS NULL OR held_reason IN
       ('nonce_reconcile_required', 'reprice_required', 'manual',
-       'nonce_consumed_externally')),
+       'nonce_consumed_externally', 'broadcast_exhausted')),
   -- Operator cancel intent (txretry cancel-nonce). It persists until the final
   -- receipt terminalization: every send/replacement entry point must refuse to
   -- advance the original task while it is set, and only cancel attempts fly.

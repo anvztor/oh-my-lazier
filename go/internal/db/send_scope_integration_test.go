@@ -643,3 +643,61 @@ func TestSyncConfigConcurrentFirstStartupDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("SyncConfig after lock release error = %v", err)
 	}
 }
+
+func TestEstimateRevertRetryDefersWhileScopePausedAndResumes(t *testing.T) {
+	h := newAttemptHarness(t, "0x5c0be000000000000000000000000000000000a7", 760)
+	restoreScopeFlags(t, h.store)
+	id := h.enqueue()
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox
+		SET status = 'failed', failure_kind = 'estimate_gas_revert', attempts = 4,
+			next_retry_at = now() - interval '1 second', updated_at = now()
+		WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("seed estimate-revert row: %v", err)
+	}
+	setChainFlags(t, h, 40161, true, true)
+
+	// Requeueing charges attempts + 1 and clears failure metadata, so a paused
+	// scope must defer the retry without mutating anything: otherwise every
+	// pause cycle burns an automatic retry for free.
+	if _, err := h.store.RetryFailedTx(h.ctx, id); !errors.Is(err, ErrTxSendScopeInactive) {
+		t.Fatalf("RetryFailedTx(paused chain) error = %v, want ErrTxSendScopeInactive", err)
+	}
+	if _, err := h.store.PrepareNextFailedTxRetry(h.ctx, 40161, h.signerID); !errors.Is(err, ErrNoFailedTxRetry) {
+		t.Fatalf("PrepareNextFailedTxRetry(paused chain) error = %v, want ErrNoFailedTxRetry", err)
+	}
+	var status, failureKind string
+	var attempts int
+	var nextRetryAt time.Time
+	if err := h.store.pool.QueryRow(h.ctx, `
+		SELECT status, failure_kind, attempts, next_retry_at FROM tx_outbox WHERE id = $1
+	`, id).Scan(&status, &failureKind, &attempts, &nextRetryAt); err != nil {
+		t.Fatalf("read deferred row: %v", err)
+	}
+	if status != TxStatusFailed || failureKind != TxFailureEstimateGasRevert || attempts != 4 {
+		t.Fatalf("deferred row = %s/%s attempts=%d, want untouched failed/estimate_gas_revert attempts=4", status, failureKind, attempts)
+	}
+	if !nextRetryAt.After(time.Now()) {
+		t.Fatalf("next_retry_at = %s, want pushed into the future while paused", nextRetryAt)
+	}
+
+	// Unpause: the requeue proceeds and charges the budget exactly once.
+	if _, err := h.store.pool.Exec(h.ctx, "UPDATE tx_outbox SET next_retry_at = now() - interval '1 second' WHERE id = $1", id); err != nil {
+		t.Fatalf("make row due: %v", err)
+	}
+	setChainFlags(t, h, 40161, true, false)
+	retryID, err := h.store.RetryFailedTx(h.ctx, id)
+	if err != nil {
+		t.Fatalf("RetryFailedTx(active again) error = %v", err)
+	}
+	if retryID != id {
+		t.Fatalf("retry id = %d, want in-place requeue of %d", retryID, id)
+	}
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT status, attempts FROM tx_outbox WHERE id = $1", id).Scan(&status, &attempts); err != nil {
+		t.Fatalf("read requeued row: %v", err)
+	}
+	if status != TxStatusQueued || attempts != 5 {
+		t.Fatalf("requeued row = %s attempts=%d, want queued attempts=5", status, attempts)
+	}
+}

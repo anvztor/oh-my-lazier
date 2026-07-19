@@ -48,9 +48,13 @@ var txCancelableStatuses = []string{TxStatusQueued, TxStatusNonceAssigned, TxSta
 // until the final receipt terminalization, and each explicit request resets the
 // signing-failure budget for one more cycle; re-requesting a row whose active
 // attempt is already a cancel additionally authorizes one cancel fee bump
-// through the replacement path. A row with a pinned receipt resolution is about
-// to terminalize and can no longer be canceled, and an externally consumed
-// nonce needs resolve-external-nonce instead.
+// through the replacement path. On the first cancel of a task attempt any
+// pending operator replacement request is cleared instead: the operator just
+// abandoned that intent, and leaving it would let the replacement path sign an
+// unrequested bumped cancel as soon as the first cancel attempt is active. A
+// row with a pinned receipt resolution is about to terminalize and can no
+// longer be canceled, and an externally consumed nonce needs
+// resolve-external-nonce instead.
 func (s *Store) RequestTxCancel(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("outbox tx id is required")
@@ -63,7 +67,7 @@ func (s *Store) RequestTxCancel(ctx context.Context, id int64) error {
 			replace_requested_at = CASE WHEN EXISTS (
 				SELECT 1 FROM tx_attempts a
 				WHERE a.outbox_id = o.id AND a.id = o.active_attempt_id AND a.kind = $4
-			) THEN now() ELSE o.replace_requested_at END,
+			) THEN now() ELSE NULL END,
 			lease_token = NULL, lease_until = NULL, updated_at = now()
 		WHERE o.id = $1
 			AND o.nonce IS NOT NULL
@@ -92,7 +96,9 @@ type CancelCandidate struct {
 }
 
 // NextCancelCandidate peeks (without reserving) the next row with a due cancel
-// request whose active attempt is not yet a cancel.
+// request whose active attempt is not yet a cancel. Rows scheduled for a
+// pre-sign failure backoff (next_sign_at in the future) are skipped so a bare
+// nonce_assigned cancel cannot burn its signing budget in a hot loop.
 func (s *Store) NextCancelCandidate(ctx context.Context, chainEID uint32, signerID string) (CancelCandidate, error) {
 	if chainEID == 0 || signerID == "" {
 		return CancelCandidate{}, errors.New("chain and signer are required")
@@ -121,6 +127,7 @@ func (s *Store) NextCancelCandidate(ctx context.Context, chainEID uint32, signer
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
 			AND (a.id IS NULL OR a.kind <> $5)
 			AND o.pre_sign_failure_count < $6
+			AND (o.next_sign_at IS NULL OR o.next_sign_at <= now())
 			AND o.receipt_outcome IS NULL
 		ORDER BY o.cancel_requested_at, o.id
 		LIMIT 1
@@ -158,10 +165,13 @@ func (s *Store) NextCancelCandidate(ctx context.Context, chainEID uint32, signer
 	return candidate, nil
 }
 
+// attemptPollHashes returns the hashes worth checking on chain: only sent
+// attempts qualify. A signed-state attempt was never handed to any node (the
+// broadcast claim flips it to ambiguous first), so its hash cannot be mined.
 func (s *Store) attemptPollHashes(ctx context.Context, outboxID int64) ([]common.Hash, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT tx_hash FROM tx_attempts
-		WHERE outbox_id = $1 AND state IN ('signed', 'submitted', 'ambiguous')
+		WHERE outbox_id = $1 AND state IN ('submitted', 'ambiguous')
 		ORDER BY id ASC
 	`, outboxID)
 	if err != nil {
@@ -375,6 +385,32 @@ type NonceReconcileHold struct {
 	AttemptHashes   []common.Hash
 }
 
+// ExtendNonceReconciliation renews a still-held reconciliation lease in place
+// (token CAS). The receipt-probe phase is bounded only by real work, so a
+// large backlog could otherwise outlive the initial lease and the final
+// publish — which CASes on the same lease — would discard the whole pass and
+// restart it from scratch every round. A lost or expired lease returns
+// ErrOutboxLeaseLost so the pass aborts instead of probing for a publish that
+// can never land.
+func (s *Store) ExtendNonceReconciliation(ctx context.Context, chainEID uint32, signerID string, token uuid.UUID, leaseTTL time.Duration) error {
+	if chainEID == 0 || signerID == "" || leaseTTL <= 0 {
+		return errors.New("nonce reconciliation extension requires chain, signer, and a positive ttl")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tx_nonce_cursors
+		SET reconcile_lease_until = now() + $1::interval, updated_at = now()
+		WHERE chain_eid = $2 AND signer_id = $3
+			AND reconcile_lease_token = $4::uuid AND reconcile_lease_until > now()
+	`, pgInterval(leaseTTL), chainEID, signerID, token.String())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrOutboxLeaseLost
+	}
+	return nil
+}
+
 // ClaimNonceReconciliation claims the signer lane's reconciliation lease when at
 // least one held(nonce_reconcile_required) row exists and the backoff has
 // expired, and returns the held rows with their poll-worthy attempt hashes. The
@@ -432,14 +468,40 @@ func (s *Store) ClaimNonceReconciliation(ctx context.Context, chainEID uint32, s
 	if tag.RowsAffected() != 1 {
 		return nil, ErrNoNonceReconcileWork
 	}
-	for i := range holds {
-		hashes, err := s.attemptPollHashes(ctx, holds[i].ID)
-		if err != nil {
+	// AttemptHashes are deliberately NOT loaded here: the lease clock started
+	// above, and the caller must be able to start its heartbeat before any
+	// backlog-proportional work — load them afterwards through
+	// LoadNonceReconcileAttemptHashes.
+	return holds, nil
+}
+
+// LoadNonceReconcileAttemptHashes returns each held row's poll-worthy attempt
+// hashes (sent attempts only) in one set-based query, keyed by outbox id. The
+// reconciler calls this after its lease heartbeat is running, so a
+// backlog-proportional result set can never expire the lease unattended.
+func (s *Store) LoadNonceReconcileAttemptHashes(ctx context.Context, holdIDs []int64) (map[int64][]common.Hash, error) {
+	hashes := make(map[int64][]common.Hash, len(holdIDs))
+	if len(holdIDs) == 0 {
+		return hashes, nil
+	}
+	hashRows, err := s.pool.Query(ctx, `
+		SELECT outbox_id, tx_hash FROM tx_attempts
+		WHERE outbox_id = ANY($1) AND state IN ('submitted', 'ambiguous')
+		ORDER BY outbox_id ASC, id ASC
+	`, holdIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer hashRows.Close()
+	for hashRows.Next() {
+		var outboxID int64
+		var hashBytes []byte
+		if err := hashRows.Scan(&outboxID, &hashBytes); err != nil {
 			return nil, err
 		}
-		holds[i].AttemptHashes = hashes
+		hashes[outboxID] = append(hashes[outboxID], common.BytesToHash(hashBytes))
 	}
-	return holds, nil
+	return hashes, hashRows.Err()
 }
 
 // FinishNonceReconciliation releases the reconciliation lease and schedules the
@@ -546,12 +608,23 @@ func (s *Store) ApplyNonceReconciliation(ctx context.Context, chainEID uint32, s
 	for _, decision := range decisions {
 		switch decision.Action {
 		case NonceReconcileRelease:
+			// A released row goes back to broadcast only while its active
+			// attempt can still be replayed. An attempt whose broadcast
+			// budget is exhausted would sit in broadcast unclaimable and
+			// unparkable — outside the lower-nonce barrier — letting higher
+			// nonces sign past a nonce that never reached the chain, so it
+			// parks as held(broadcast_exhausted) for an operator replace
+			// (fresh attempt, fresh budget) or cancel instead.
 			tag, err := tx.Exec(ctx, `
-				UPDATE tx_outbox
-				SET status = $1, held_reason = NULL, updated_at = now()
-				WHERE id = $2 AND status = $3 AND held_reason = $4
-					AND receipt_outcome IS NULL
-			`, TxStatusBroadcast, decision.ID, TxStatusHeld, HeldNonceReconcileRequired)
+				UPDATE tx_outbox o
+				SET status = CASE WHEN a.state IN ($5, $6) AND a.broadcast_count >= $7 THEN o.status ELSE $1 END,
+					held_reason = CASE WHEN a.state IN ($5, $6) AND a.broadcast_count >= $7 THEN $8 ELSE NULL END,
+					updated_at = now()
+				FROM tx_attempts a
+				WHERE o.id = $2 AND a.id = o.active_attempt_id
+					AND o.status = $3 AND o.held_reason = $4
+					AND o.receipt_outcome IS NULL
+			`, TxStatusBroadcast, decision.ID, TxStatusHeld, HeldNonceReconcileRequired, TxAttemptSigned, TxAttemptAmbiguous, TxMaxBroadcasts, HeldBroadcastExhausted)
 			if err != nil {
 				return NonceReconcileResult{}, err
 			}
@@ -592,13 +665,26 @@ func (s *Store) ResolveExternalNonceRetry(ctx context.Context, id int64) (int64,
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var chainEID uint32
 	var purpose string
 	var guid *[]byte
 	if err := tx.QueryRow(ctx, `
-		SELECT purpose, guid FROM tx_outbox WHERE id = $1 FOR UPDATE
-	`, id).Scan(&purpose, &guid); errors.Is(err, pgx.ErrNoRows) {
+		SELECT chain_eid, purpose, guid FROM tx_outbox WHERE id = $1 FOR UPDATE
+	`, id).Scan(&chainEID, &purpose, &guid); errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("outbox tx %d not found", id)
 	} else if err != nil {
+		return 0, err
+	}
+	// Cloning is new spend for the scope: while its pathway or chain is paused
+	// or disabled the operator command is refused without mutating anything —
+	// terminalizing the evidence row and queueing a clone here would schedule
+	// automatic re-execution the moment the scope unpauses, which every other
+	// retry path refuses to do.
+	scopeGUID := []byte(nil)
+	if guid != nil {
+		scopeGUID = *guid
+	}
+	if err := lockTxSendScope(ctx, tx, chainEID, purpose, scopeGUID); err != nil {
 		return 0, err
 	}
 	// A clone only makes sense while the owning workflow still waits on this

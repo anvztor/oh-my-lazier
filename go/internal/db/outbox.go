@@ -471,6 +471,26 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 	}
 
 	if row.Nonce == nil || row.FailureKind != TxFailureReceiptFailed {
+		// Same scope gate as the clone path below: requeueing charges the
+		// retry budget and clears failure metadata while a paused scope cannot
+		// sign the queued row — the operator retry is refused instead of
+		// silently burning an attempt.
+		guid := []byte(nil)
+		if row.GUID != nil {
+			guid = *row.GUID
+		}
+		if err := lockTxSendScope(ctx, tx, row.ChainEID, row.Purpose, guid); err != nil {
+			if !errors.Is(err, ErrTxSendScopeInactive) {
+				return 0, err
+			}
+			if deferErr := deferFailedTxRetry(ctx, tx, id); deferErr != nil {
+				return 0, deferErr
+			}
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return 0, commitErr
+			}
+			return 0, ErrTxSendScopeInactive
+		}
 		if err := requeueFailedTx(ctx, tx, id); err != nil {
 			return 0, err
 		}
@@ -584,6 +604,29 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 	var retryID int64
 	switch {
 	case row.Nonce == nil || row.FailureKind == TxFailureEstimateGasRevert:
+		// Requeueing charges the retry budget (attempts + 1) and clears the
+		// failure metadata, and the signing gate cannot act on the queued row
+		// while its scope is paused — so a pause must defer the retry without
+		// mutating anything, exactly like the receipt-failed branch, or every
+		// pause cycle would burn an automatic retry for free.
+		{
+			guid := []byte(nil)
+			if row.GUID != nil {
+				guid = *row.GUID
+			}
+			if err := lockTxSendScope(ctx, tx, row.ChainEID, row.Purpose, guid); err != nil {
+				if !errors.Is(err, ErrTxSendScopeInactive) {
+					return 0, err
+				}
+				if deferErr := deferFailedTxRetry(ctx, tx, row.ID); deferErr != nil {
+					return 0, deferErr
+				}
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return 0, commitErr
+				}
+				return 0, ErrNoFailedTxRetry
+			}
+		}
 		if err := requeueFailedTx(ctx, tx, row.ID); err != nil {
 			return 0, err
 		}

@@ -134,6 +134,54 @@ func TestCancelRequestRevokesSigningLease(t *testing.T) {
 	}
 }
 
+// TestBareNonceCancelHonorsPreSignBackoff pins the regression where a cancel
+// signing failure on a bare nonce_assigned row scheduled next_sign_at but the
+// cancel selector ignored it, burning the whole signing budget in a hot loop.
+func TestBareNonceCancelHonorsPreSignBackoff(t *testing.T) {
+	h := newAttemptHarness(t, "0x6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c", 131)
+	id := h.enqueue()
+	token := uuid.New()
+	if _, err := h.store.ClaimOutboxForSigning(h.ctx, id, 40161, h.signerID, token, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForSigning: %v", err)
+	}
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+
+	candidate, err := h.store.NextCancelCandidate(h.ctx, 40161, h.signerID)
+	if err != nil {
+		t.Fatalf("NextCancelCandidate: %v", err)
+	}
+	if candidate.Outbox.ID != id || candidate.ActiveAttemptID != 0 {
+		t.Fatalf("candidate = %d/%d, want bare row %d", candidate.Outbox.ID, candidate.ActiveAttemptID, id)
+	}
+	cancelToken := uuid.New()
+	if _, err := h.store.ClaimOutboxForCancelSigning(h.ctx, id, 0, cancelToken, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForCancelSigning: %v", err)
+	}
+	parked, err := h.store.RecordPreSignFailure(h.ctx, id, cancelToken)
+	if err != nil {
+		t.Fatalf("RecordPreSignFailure: %v", err)
+	}
+	if parked {
+		t.Fatal("parked after the first signing failure, want a scheduled retry")
+	}
+	// The scheduled backoff must gate re-selection instead of a hot-loop retry.
+	if _, err := h.store.NextCancelCandidate(h.ctx, 40161, h.signerID); !errors.Is(err, ErrNoCancelWork) {
+		t.Fatalf("NextCancelCandidate(during backoff) error = %v, want ErrNoCancelWork", err)
+	}
+	if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_outbox SET next_sign_at = now() - interval '1 second' WHERE id = $1`, id); err != nil {
+		t.Fatalf("elapse backoff: %v", err)
+	}
+	candidate, err = h.store.NextCancelCandidate(h.ctx, 40161, h.signerID)
+	if err != nil {
+		t.Fatalf("NextCancelCandidate(after backoff): %v", err)
+	}
+	if candidate.Outbox.ID != id {
+		t.Fatalf("candidate after backoff = %d, want %d", candidate.Outbox.ID, id)
+	}
+}
+
 func TestTaskReceiptFailureUnderCancelIntentIsCanceled(t *testing.T) {
 	h := newAttemptHarness(t, "0x6363636363636363636363636363636363636363", 121)
 	id := h.enqueue()
@@ -189,8 +237,16 @@ func TestNonceReconciliationClaimReleaseAndExternalConsumption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimNonceReconciliation: %v", err)
 	}
-	if len(holds) != 1 || holds[0].ID != transientID || holds[0].Nonce != 131 || len(holds[0].AttemptHashes) != 1 {
-		t.Fatalf("holds = %+v, want the held row with its attempt hash", holds)
+	if len(holds) != 1 || holds[0].ID != transientID || holds[0].Nonce != 131 {
+		t.Fatalf("holds = %+v, want the held row", holds)
+	}
+	// Hashes load separately AFTER the caller's heartbeat is running.
+	hashesByHold, err := h.store.LoadNonceReconcileAttemptHashes(h.ctx, []int64{transientID})
+	if err != nil {
+		t.Fatalf("LoadNonceReconcileAttemptHashes: %v", err)
+	}
+	if len(hashesByHold[transientID]) != 1 {
+		t.Fatalf("hashes = %+v, want the held row's sent attempt hash", hashesByHold)
 	}
 	// The lease excludes a concurrent reconciler.
 	if _, err := h.store.ClaimNonceReconciliation(h.ctx, 40161, h.signerID, uuid.New(), 30*time.Second); !errors.Is(err, ErrNoNonceReconcileWork) {
@@ -600,5 +656,217 @@ func TestResolveExternalNonceAbandonParksWorkflow(t *testing.T) {
 	}
 	if jobStatus != "MANUAL_REVIEW" || packetStatus != "MANUAL_REVIEW" {
 		t.Fatalf("workflow = %q/%q, want MANUAL_REVIEW for the abandoned task", jobStatus, packetStatus)
+	}
+}
+
+func TestCancelClearsStaleReplacementRequest(t *testing.T) {
+	h := newAttemptHarness(t, "0x7070707070707070707070707070707070707070", 181)
+	id := h.enqueue()
+	original := h.signAttempt(id, 181, common.HexToHash("0xa701"))
+	h.broadcastResult(original.ID, SendErrorAccepted)
+
+	// The operator asks for a replacement, then abandons the task before it is
+	// processed: the stale intent must not survive into the cancel pipeline.
+	if err := h.store.RequestTxReplacement(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxReplacement: %v", err)
+	}
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel: %v", err)
+	}
+	var replaceRequestedAt *time.Time
+	if err := h.store.pool.QueryRow(h.ctx, `SELECT replace_requested_at FROM tx_outbox WHERE id = $1`, id).Scan(&replaceRequestedAt); err != nil {
+		t.Fatalf("select replace intent: %v", err)
+	}
+	if replaceRequestedAt != nil {
+		t.Fatal("replace intent survived the cancel request; the first cancel attempt would be bumped without a re-request")
+	}
+	// And a NEW replace request on the canceling row is rejected outright: it
+	// would sit dormant and authorize an unintended cancel bump later.
+	if err := h.store.RequestTxReplacement(h.ctx, id); err == nil {
+		t.Fatal("RequestTxReplacement(cancel-pending) succeeded, want rejection")
+	}
+
+	candidate, err := h.store.NextCancelCandidate(h.ctx, 40161, h.signerID)
+	if err != nil {
+		t.Fatalf("NextCancelCandidate: %v", err)
+	}
+	leaseToken := uuid.New()
+	if _, err := h.store.ClaimOutboxForCancelSigning(h.ctx, id, candidate.ActiveAttemptID, leaseToken, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForCancelSigning: %v", err)
+	}
+	cancelAttempt, err := h.store.InsertCancelAttempt(h.ctx, id, original.ID, leaseToken, SignedAttempt{
+		Kind: TxAttemptCancel, Nonce: 181, TxType: 2, TxHash: common.HexToHash("0xa702"),
+		RawTx: []byte{0xa7, 0x02}, GasLimit: 21000,
+		MaxFeePerGas: big.NewInt(3_000_000_000), MaxPriorityFeePerGas: big.NewInt(1_500_000_000),
+		SigningToken: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("InsertCancelAttempt: %v", err)
+	}
+	broadcastToken := uuid.New()
+	claim, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, broadcastToken, 30*time.Second)
+	if err != nil || claim.AttemptID != cancelAttempt.ID {
+		t.Fatalf("ClaimAttemptForBroadcast(cancel) = (%d, %v), want %d", claim.AttemptID, err, cancelAttempt.ID)
+	}
+	if err := h.store.MarkAttemptSendResult(h.ctx, claim.AttemptID, broadcastToken, SendErrorAccepted, ""); err != nil {
+		t.Fatalf("MarkAttemptSendResult: %v", err)
+	}
+
+	// With the stale intent cleared, the active cancel gets no unrequested bump.
+	if _, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute); !errors.Is(err, ErrNoStaleBroadcastReplacement) {
+		t.Fatalf("NextReplacementCandidate(fresh cancel) error = %v, want ErrNoStaleBroadcastReplacement", err)
+	}
+
+	// An explicit cancel re-request still authorizes exactly one bump.
+	if err := h.store.RequestTxCancel(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxCancel(re-request): %v", err)
+	}
+	bumpCandidate, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("NextReplacementCandidate(re-requested cancel): %v", err)
+	}
+	if bumpCandidate.Outbox.ID != id || bumpCandidate.ActiveKind != TxAttemptCancel {
+		t.Fatalf("candidate = %d kind %q, want the re-requested cancel lane", bumpCandidate.Outbox.ID, bumpCandidate.ActiveKind)
+	}
+}
+
+func TestReconciliationParksExhaustedReleaseAsBroadcastExhausted(t *testing.T) {
+	h := newAttemptHarness(t, "0x7171717171717171717171717171717171717171", 211)
+	id := h.enqueue()
+	original := h.signAttempt(id, 211, common.HexToHash("0xa711"))
+	// The raw hits a stale node: nonce too low parks the lane for
+	// reconciliation. By then the attempt's broadcast budget is exhausted.
+	h.broadcastResult(original.ID, SendErrorNonceTooLow)
+	if _, err := h.store.pool.Exec(h.ctx, `UPDATE tx_attempts SET broadcast_count = $1 WHERE id = $2`, TxMaxBroadcasts, original.ID); err != nil {
+		t.Fatalf("exhaust broadcast budget: %v", err)
+	}
+
+	token := uuid.New()
+	holds, err := h.store.ClaimNonceReconciliation(h.ctx, 40161, h.signerID, token, 30*time.Second)
+	if err != nil || len(holds) != 1 {
+		t.Fatalf("ClaimNonceReconciliation = (%+v, %v), want the hold", holds, err)
+	}
+	// Releasing to broadcast would strand the row: the claim ignores attempts
+	// at the cap, the parking sweep only covers signed rows, and broadcast is
+	// outside the lower-nonce barrier — higher nonces would sign past a nonce
+	// that never reached the chain. The release must park it for the operator.
+	result, err := h.store.ApplyNonceReconciliation(h.ctx, 40161, h.signerID, token, 211, 9_100, time.Minute,
+		[]NonceReconcileDecision{{ID: id, Action: NonceReconcileRelease}})
+	if err != nil || result.Changed != 1 {
+		t.Fatalf("ApplyNonceReconciliation = (%+v, %v), want one change", result, err)
+	}
+	status, heldReason, _ := h.outboxState(id)
+	if status != TxStatusHeld || heldReason != HeldBroadcastExhausted {
+		t.Fatalf("outbox = %q/%q, want held/broadcast_exhausted for an exhausted release", status, heldReason)
+	}
+	if _, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, uuid.New(), 30*time.Second); !errors.Is(err, ErrNoBroadcastCandidate) {
+		t.Fatalf("ClaimAttemptForBroadcast error = %v, want ErrNoBroadcastCandidate", err)
+	}
+	// The parked row keeps the lane barrier: fresh work must not sign past it.
+	nextID := h.enqueue()
+	if _, err := h.store.ClaimOutboxForSigning(h.ctx, nextID, 40161, h.signerID, uuid.New(), 30*time.Second); err == nil || err.Error() != ErrSignerLaneBlocked.Error() {
+		t.Fatalf("ClaimOutboxForSigning(next) error = %v, want ErrSignerLaneBlocked", err)
+	}
+
+	// The operator recovery is a replace: it authorizes a fresh attempt with a
+	// fresh broadcast budget for the same intent and unblocks the lane.
+	if err := h.store.RequestTxReplacement(h.ctx, id); err != nil {
+		t.Fatalf("RequestTxReplacement(parked) error = %v", err)
+	}
+	candidate, err := h.store.NextReplacementCandidate(h.ctx, 40161, h.signerID, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("NextReplacementCandidate(broadcast_exhausted): %v", err)
+	}
+	if candidate.Outbox.ID != id || candidate.ActiveKind == TxAttemptCancel {
+		t.Fatalf("candidate = %d kind %q, want the parked task lane", candidate.Outbox.ID, candidate.ActiveKind)
+	}
+	bumpLease := uuid.New()
+	if _, err := h.store.ClaimOutboxForReplacementSigning(h.ctx, id, original.ID, bumpLease, 30*time.Second); err != nil {
+		t.Fatalf("ClaimOutboxForReplacementSigning(broadcast_exhausted): %v", err)
+	}
+	replacement, err := h.store.InsertReplacementAttempt(h.ctx, id, original.ID, bumpLease, SignedAttempt{
+		Kind: TxAttemptReplacement, Nonce: 211, TxType: 2, TxHash: common.HexToHash("0xa712"),
+		RawTx: []byte{0xa7, 0x12}, GasLimit: 21000,
+		MaxFeePerGas: big.NewInt(4_000_000_000), MaxPriorityFeePerGas: big.NewInt(2_000_000_000),
+		SigningToken: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("InsertReplacementAttempt(broadcast_exhausted): %v", err)
+	}
+	status, heldReason, _ = h.outboxState(id)
+	if status != TxStatusSigned || heldReason != "" {
+		t.Fatalf("outbox after replacement = %q/%q, want signed with no hold", status, heldReason)
+	}
+	broadcastToken := uuid.New()
+	claim, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, broadcastToken, 30*time.Second)
+	if err != nil || claim.AttemptID != replacement.ID {
+		t.Fatalf("ClaimAttemptForBroadcast = (%d, %v), want the fresh replacement %d", claim.AttemptID, err, replacement.ID)
+	}
+}
+
+func TestResolveExternalNonceRetryRefusesInactiveScope(t *testing.T) {
+	h := newAttemptHarness(t, "0x7373737373737373737373737373737373737373", 231)
+	restoreScopeFlags(t, h.store)
+	id := h.enqueue()
+	original := h.signAttempt(id, 231, common.HexToHash("0xa731"))
+	h.broadcastResult(original.ID, SendErrorNonceTooLow)
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox SET held_reason = $1, last_error = 'evidence' WHERE id = $2
+	`, HeldNonceConsumedExternally, id); err != nil {
+		t.Fatalf("park externally consumed: %v", err)
+	}
+
+	// Cloning is new spend: a paused scope refuses the operator retry without
+	// terminalizing the evidence row or queueing anything.
+	setChainFlags(t, h, 40161, true, true)
+	if _, err := h.store.ResolveExternalNonceRetry(h.ctx, id); !errors.Is(err, ErrTxSendScopeInactive) {
+		t.Fatalf("ResolveExternalNonceRetry(paused chain) error = %v, want ErrTxSendScopeInactive", err)
+	}
+	status, heldReason, _ := h.outboxState(id)
+	if status != TxStatusHeld || heldReason != HeldNonceConsumedExternally {
+		t.Fatalf("row = %q/%q, want untouched held/nonce_consumed_externally", status, heldReason)
+	}
+	var clones int
+	if err := h.store.pool.QueryRow(h.ctx, "SELECT count(*) FROM tx_outbox WHERE retry_of_id = $1", id).Scan(&clones); err != nil {
+		t.Fatalf("count clones: %v", err)
+	}
+	if clones != 0 {
+		t.Fatalf("clones = %d, want none while the scope is paused", clones)
+	}
+
+	// Unpause: the retry clones normally.
+	setChainFlags(t, h, 40161, true, false)
+	cloneID, err := h.store.ResolveExternalNonceRetry(h.ctx, id)
+	if err != nil {
+		t.Fatalf("ResolveExternalNonceRetry(active) error = %v", err)
+	}
+	if cloneID == 0 || cloneID == id {
+		t.Fatalf("clone id = %d, want a fresh clone", cloneID)
+	}
+}
+
+func TestExtendNonceReconciliationRenewsHeldLeaseOnly(t *testing.T) {
+	h := newAttemptHarness(t, "0x7575757575757575757575757575757575757575", 251)
+	id := h.enqueue()
+	original := h.signAttempt(id, 251, common.HexToHash("0xa751"))
+	h.broadcastResult(original.ID, SendErrorNonceTooLow)
+
+	token := uuid.New()
+	if _, err := h.store.ClaimNonceReconciliation(h.ctx, 40161, h.signerID, token, 30*time.Second); err != nil {
+		t.Fatalf("ClaimNonceReconciliation: %v", err)
+	}
+	// The held token renews in place; a foreign token cannot.
+	if err := h.store.ExtendNonceReconciliation(h.ctx, 40161, h.signerID, token, 30*time.Second); err != nil {
+		t.Fatalf("ExtendNonceReconciliation: %v", err)
+	}
+	if err := h.store.ExtendNonceReconciliation(h.ctx, 40161, h.signerID, uuid.New(), 30*time.Second); !errors.Is(err, ErrOutboxLeaseLost) {
+		t.Fatalf("ExtendNonceReconciliation(foreign token) error = %v, want ErrOutboxLeaseLost", err)
+	}
+	// A finished (released) lease cannot be renewed either.
+	if err := h.store.FinishNonceReconciliation(h.ctx, 40161, h.signerID, token, time.Minute); err != nil {
+		t.Fatalf("FinishNonceReconciliation: %v", err)
+	}
+	if err := h.store.ExtendNonceReconciliation(h.ctx, 40161, h.signerID, token, 30*time.Second); !errors.Is(err, ErrOutboxLeaseLost) {
+		t.Fatalf("ExtendNonceReconciliation(released) error = %v, want ErrOutboxLeaseLost", err)
 	}
 }

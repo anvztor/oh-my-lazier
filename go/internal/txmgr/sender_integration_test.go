@@ -996,6 +996,9 @@ func TestProcessOnceReceiptWinsOverStaleBroadcastReplacement(t *testing.T) {
 	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() error = %v", err)
@@ -1892,39 +1895,50 @@ func TestNonceReconciliationPartialRPCFailureChangesNothing(t *testing.T) {
 		}
 	}
 
-	// The second hold's receipt lookup fails mid-pass: nothing may change, not
-	// even the first hold whose reads succeeded.
-	client.confirmedNonce = 200
-	client.receiptErrs[client.sent[1].Hash()] = errors.New("rpc receipt outage")
-	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err == nil {
-		t.Fatal("ProcessNonceReconciliation succeeded despite a receipt RPC failure")
+	reasonPool, err := pgxpool.New(t.Context(), os.Getenv("TEST_POSTGRES_URL"))
+	if err != nil {
+		t.Fatalf("pgxpool.New() error = %v", err)
 	}
-	for _, id := range ids {
-		after, err := store.GetOutboxTx(t.Context(), id)
+	t.Cleanup(reasonPool.Close)
+	heldReasonOf := func(id int64) string {
+		t.Helper()
+		row, err := store.GetOutboxTx(t.Context(), id)
 		if err != nil {
-			t.Fatalf("GetOutboxTx(after %d) error = %v", id, err)
+			t.Fatalf("GetOutboxTx(%d) error = %v", id, err)
 		}
-		if after.Status != db.TxStatusHeld {
-			t.Fatalf("row %d = %q, want untouched held", id, after.Status)
+		if row.Status != db.TxStatusHeld {
+			t.Fatalf("row %d status = %q, want held", id, row.Status)
 		}
+		var reason string
+		if err := reasonPool.QueryRow(t.Context(), `SELECT held_reason FROM tx_outbox WHERE id = $1`, id).Scan(&reason); err != nil {
+			t.Fatalf("select held_reason(%d): %v", id, err)
+		}
+		return reason
 	}
 
-	// After the outage clears (and the backoff), the pass publishes atomically.
+	// The second hold's receipt lookup fails mid-pass: that hold alone is
+	// skipped and stays put, while the first hold's fully resolved reads still
+	// publish — one failing hash must not starve the whole lane's progress.
+	client.confirmedNonce = 200
+	client.receiptErrs[client.sent[1].Hash()] = errors.New("rpc receipt outage")
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation(partial outage) error = %v", err)
+	}
+	if reason := heldReasonOf(ids[0]); reason != db.HeldNonceConsumedExternally {
+		t.Fatalf("resolved hold reason = %q, want nonce_consumed_externally", reason)
+	}
+	if reason := heldReasonOf(ids[1]); reason != db.HeldNonceReconcileRequired {
+		t.Fatalf("skipped hold reason = %q, want untouched nonce_reconcile_required", reason)
+	}
+
+	// After the outage clears (and the backoff), the skipped hold catches up.
 	forceReconcileDue(t, signer.Address().Hex())
 	delete(client.receiptErrs, client.sent[1].Hash())
 	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
 		t.Fatalf("ProcessNonceReconciliation(retry) error = %v", err)
 	}
-	for _, id := range ids {
-		after, err := store.GetOutboxTx(t.Context(), id)
-		if err != nil {
-			t.Fatalf("GetOutboxTx(final %d) error = %v", id, err)
-		}
-		if after.Status != db.TxStatusHeld || after.FailureKind != "" {
-			// confirmedNonce=200 passed both nonces with no receipts: both park as
-			// externally consumed, still held for the operator.
-			t.Fatalf("row %d = %q, want held (externally consumed)", id, after.Status)
-		}
+	if reason := heldReasonOf(ids[1]); reason != db.HeldNonceConsumedExternally {
+		t.Fatalf("caught-up hold reason = %q, want nonce_consumed_externally", reason)
 	}
 }
 
@@ -1968,11 +1982,17 @@ func TestNonceReconciliationReleasesAndParksExternally(t *testing.T) {
 	}
 
 	// Transient case: the confirmed nonce has not passed the held nonce, so the
-	// hold releases back to broadcast and the raw keeps replaying.
+	// hold releases back to broadcast and the raw keeps replaying. The confirmed
+	// nonce must be read at head - confirmations, the indexer's confirmed window.
 	client.header = &types.Header{Number: big.NewInt(5_000_000), BaseFee: big.NewInt(500_000_000)}
 	client.confirmedNonce = held.Nonce
-	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+	confirmedTarget := target
+	confirmedTarget.Confirmations = 12
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), confirmedTarget); err != nil {
 		t.Fatalf("ProcessNonceReconciliation(release) error = %v", err)
+	}
+	if client.lastNonceAtBlock == nil || client.lastNonceAtBlock.Int64() != 5_000_000-12 {
+		t.Fatalf("NonceAt block = %v, want %d (head - confirmations)", client.lastNonceAtBlock, 5_000_000-12)
 	}
 	released, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -2103,6 +2123,9 @@ func TestProcessReceiptsMarksBroadcastTxConfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() error = %v", err)
@@ -2166,8 +2189,9 @@ func TestProcessReceiptsDefersReceiptBelowConfirmationDepth(t *testing.T) {
 	client := &fakeChainClient{
 		pendingNonce: 33,
 		receipts:     make(map[common.Hash]*types.Receipt),
-		// Head is the receipt's own block, so the receipt is only 1 block deep.
-		header:             &types.Header{Number: big.NewInt(1_234_567), BaseFee: big.NewInt(500_000_000)},
+		// Head is 11 blocks past the receipt: one short of the 12-confirmation
+		// boundary (head >= receipt + confirmations), so the receipt must wait.
+		header:             &types.Header{Number: big.NewInt(1_234_567 + 11), BaseFee: big.NewInt(500_000_000)},
 		suggestedGasTipCap: big.NewInt(1_000_000_000),
 	}
 	manager := New(store, discardLogger())
@@ -2220,8 +2244,10 @@ func TestProcessReceiptsConfirmsReceiptAtConfirmationDepth(t *testing.T) {
 	client := &fakeChainClient{
 		pendingNonce: 34,
 		receipts:     make(map[common.Hash]*types.Receipt),
-		// Head is 11 blocks past the receipt, so it is exactly 12 blocks deep.
-		header:             &types.Header{Number: big.NewInt(1_234_567 + 11), BaseFee: big.NewInt(500_000_000)},
+		// Head is 12 blocks past the receipt, exactly at the confirmation
+		// boundary (head >= receipt + confirmations), matching the indexer's
+		// confirmed window head - confirmations.
+		header:             &types.Header{Number: big.NewInt(1_234_567 + 12), BaseFee: big.NewInt(500_000_000)},
 		suggestedGasTipCap: big.NewInt(1_000_000_000),
 	}
 	manager := New(store, discardLogger())
@@ -2263,6 +2289,77 @@ func TestProcessReceiptsConfirmsReceiptAtConfirmationDepth(t *testing.T) {
 	confirmed, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() after receipt error = %v", err)
+	}
+	if confirmed.Status != db.TxStatusConfirmed {
+		t.Fatalf("status = %q, want %q", confirmed.Status, db.TxStatusConfirmed)
+	}
+}
+
+func TestProcessReceiptsDefersReceiptOffTheCanonicalChain(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       44,
+		receipts:           make(map[common.Hash]*types.Receipt),
+		header:             &types.Header{Number: big.NewInt(1_234_567 + 12), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+	}
+	manager := New(store, discardLogger())
+
+	if _, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x06, 0x07},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	}); err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	id, err := manager.ProcessNext(t.Context(), testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy()))
+	if err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	outboxTx, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	if outboxTx.Nonce >= client.pendingNonce {
+		client.pendingNonce = outboxTx.Nonce + 1
+	}
+	// The receipt is depth-buried, but its block hash is not the majority
+	// canonical hash at that height: the chain reorged between the receipt and
+	// head reads. Terminalizing would pin an orphaned transaction.
+	receipt := testReceipt(outboxTx.TxHash, types.ReceiptStatusSuccessful)
+	receipt.BlockHash = common.HexToHash("0x0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e")
+	client.receipts[outboxTx.TxHash] = receipt
+	client.canonicalHashes = map[uint64]common.Hash{
+		receipt.BlockNumber.Uint64(): common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"),
+	}
+
+	target := Target{ChainEID: 40161, ChainID: big.NewInt(11155111), Signer: signer, Client: client, Confirmations: 12}
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); !errors.Is(err, ErrNoReceiptUpdate) {
+		t.Fatalf("ProcessReceipts() error = %v, want ErrNoReceiptUpdate (deferred)", err)
+	}
+	after, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(after) error = %v", err)
+	}
+	if after.Status != db.TxStatusBroadcast {
+		t.Fatalf("status = %q, want broadcast (still polling, not terminalized)", after.Status)
+	}
+
+	// Once the canonical chain includes the receipt's block, it terminalizes.
+	client.canonicalHashes[receipt.BlockNumber.Uint64()] = receipt.BlockHash
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); err != nil {
+		t.Fatalf("ProcessReceipts(canonical) error = %v", err)
+	}
+	confirmed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(final) error = %v", err)
 	}
 	if confirmed.Status != db.TxStatusConfirmed {
 		t.Fatalf("status = %q, want %q", confirmed.Status, db.TxStatusConfirmed)
@@ -2365,6 +2462,9 @@ func TestProcessReceiptsMarksExecutorLzReceiveDelivered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() error = %v", err)
@@ -2433,6 +2533,9 @@ func TestProcessReceiptsMarksExecutorLzReceiveFailed(t *testing.T) {
 	id, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -2511,6 +2614,9 @@ func TestProcessReceiptsResolvesRevertedLzReceiveAfterThirdPartyDelivery(t *test
 	id, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -2680,6 +2786,9 @@ func TestProcessFailedRetryClonesLzReceiveReceiptFailureAndRestoresWorkflow(t *t
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() error = %v", err)
@@ -2720,6 +2829,9 @@ func TestProcessFailedRetryClonesLzReceiveReceiptFailureAndRestoresWorkflow(t *t
 	retryProcessedID, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext(retry) error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	if retryProcessedID != retryID {
 		t.Fatalf("processed retry id = %d, want %d", retryProcessedID, retryID)
@@ -2795,6 +2907,9 @@ func TestProcessFailedRetryIgnoresStaleLzReceiveFailureAfterWorkflowAdvanced(t *
 	id, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -2893,6 +3008,9 @@ func TestProcessReceiptsMarksDVNVerifyTxVerified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
 		t.Fatalf("GetOutboxTx() error = %v", err)
@@ -2950,6 +3068,9 @@ func TestProcessReceiptsFailedDVNVerifyOnlyFailsOutbox(t *testing.T) {
 	id, err := manager.ProcessNext(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(packet.DstEID, big.NewInt(560048), signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -3084,6 +3205,9 @@ func processQueuedSuccess(t *testing.T, manager *Manager, store *db.Store, clien
 	id, err := manager.ProcessNext(t.Context(), testTarget(chainEID, chainID, signer, client, defaultFeePolicy()))
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), testTarget(chainEID, chainID, signer, client, defaultFeePolicy())); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
 	}
 	outboxTx, err := store.GetOutboxTx(t.Context(), id)
 	if err != nil {
@@ -3448,6 +3572,7 @@ type fakeChainClient struct {
 	estimateGasErr        error
 	estimateGasCalls      []ethereum.CallMsg
 	header                *types.Header
+	headerDelay           time.Duration
 	headerErr             error
 	suggestedGasPrice     *big.Int
 	suggestGasPriceErr    error
@@ -3462,8 +3587,30 @@ type fakeChainClient struct {
 	confirmedNonce        uint64
 	nonceAtErr            error
 	nonceAtCalls          int
+	lastNonceAtBlock      *big.Int
 	balance               *big.Int
 	balanceErr            error
+	// canonicalHashes overrides CanonicalHashAt per height; unset heights fall
+	// back to the stored receipt at that height, mimicking a consistent chain.
+	canonicalHashes  map[uint64]common.Hash
+	canonicalHashErr error
+}
+
+func (f *fakeChainClient) CanonicalHashAt(_ context.Context, blockNumber *big.Int) (common.Hash, error) {
+	if f.canonicalHashErr != nil {
+		return common.Hash{}, f.canonicalHashErr
+	}
+	if f.canonicalHashes != nil {
+		if hash, ok := f.canonicalHashes[blockNumber.Uint64()]; ok {
+			return hash, nil
+		}
+	}
+	for _, receipt := range f.receipts {
+		if receipt != nil && receipt.BlockNumber != nil && receipt.BlockNumber.Uint64() == blockNumber.Uint64() {
+			return receipt.BlockHash, nil
+		}
+	}
+	return common.Hash{}, nil
 }
 
 func (f *fakeChainClient) BalanceAt(context.Context, common.Address, *big.Int) (*big.Int, error) {
@@ -3488,6 +3635,9 @@ func (f *fakeChainClient) EstimateGas(_ context.Context, call ethereum.CallMsg) 
 }
 
 func (f *fakeChainClient) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	if f.headerDelay > 0 {
+		time.Sleep(f.headerDelay)
+	}
 	if f.headerErr != nil {
 		return nil, f.headerErr
 	}
@@ -3498,8 +3648,9 @@ func (f *fakeChainClient) HeaderByNumber(context.Context, *big.Int) (*types.Head
 	return dynamicHeader(), nil
 }
 
-func (f *fakeChainClient) NonceAt(context.Context, common.Address, *big.Int) (uint64, error) {
+func (f *fakeChainClient) NonceAt(_ context.Context, _ common.Address, block *big.Int) (uint64, error) {
 	f.nonceAtCalls++
+	f.lastNonceAtBlock = block
 	if f.nonceAtErr != nil {
 		return 0, f.nonceAtErr
 	}
@@ -3539,6 +3690,10 @@ func (f *fakeChainClient) SendTransaction(_ context.Context, tx *types.Transacti
 		return f.sendErr
 	}
 	return nil
+}
+
+func (f *fakeChainClient) TransactionReceiptAt(ctx context.Context, txHash common.Hash, _ *big.Int) (*types.Receipt, error) {
+	return f.TransactionReceipt(ctx, txHash)
 }
 
 func (f *fakeChainClient) TransactionReceipt(_ context.Context, txHash common.Hash) (*types.Receipt, error) {
@@ -3717,5 +3872,434 @@ func testPathways() []config.PathwayConfig {
 			Enabled:        true,
 			MaxMessageSize: 10000,
 		},
+	}
+}
+
+func TestStaleBroadcastReplacementIgnoresOrphanedReceipt(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       47,
+		estimatedGas:       123_456,
+		header:             &types.Header{Number: big.NewInt(1_234_567 + 12), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+	}
+	manager := NewWithOptions(store, discardLogger(), Options{
+		StaleBroadcastReplacementAfter: 2 * time.Second,
+	})
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x0a, 0x0b},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	target.Confirmations = 12
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	original, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(original) error = %v", err)
+	}
+	// A provider keeps serving a receipt whose block the majority chain has
+	// orphaned. It must not count as mined: nothing can build on this nonce,
+	// so suppressing the replacement would wedge the lane forever.
+	receipt := testReceipt(original.TxHash, types.ReceiptStatusSuccessful)
+	receipt.BlockHash = common.HexToHash("0x0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e")
+	client.receipts[original.TxHash] = receipt
+	client.canonicalHashes = map[uint64]common.Hash{
+		receipt.BlockNumber.Uint64(): common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"),
+	}
+	forceBroadcastAgeSeconds(t, id, 3)
+
+	// Mirror the real processOnce ordering: receipt polling runs first. The
+	// orphaned receipt must defer WITHOUT refreshing the stale timer, or the
+	// replacement below would never see a stale row and the lane would wedge.
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); !errors.Is(err, ErrNoReceiptUpdate) {
+		t.Fatalf("ProcessReceipts() error = %v, want ErrNoReceiptUpdate (deferred)", err)
+	}
+
+	replacedID, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target)
+	if err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement() error = %v", err)
+	}
+	if replacedID != id {
+		t.Fatalf("replaced id = %d, want %d", replacedID, id)
+	}
+	after, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(after) error = %v", err)
+	}
+	if after.TxHash == original.TxHash {
+		t.Fatal("orphaned receipt suppressed the same-nonce replacement")
+	}
+}
+
+func TestNonceReconciliationIgnoresOrphanedReceipt(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       97,
+		estimatedGas:       111_111,
+		header:             &types.Header{Number: big.NewInt(6_000_000), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+		receiptErrs:        make(map[common.Hash]error),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	target.Confirmations = 12
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x0c},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	client.sendErr = errors.New("connection glitch before acknowledgement")
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	forceAttemptBroadcastDue(t, id)
+	token := uuid.New()
+	claim, err := store.ClaimAttemptForBroadcast(t.Context(), 40161, signer.Address().Hex(), token, 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimAttemptForBroadcast() error = %v", err)
+	}
+	if err := store.MarkAttemptSendResult(t.Context(), claim.AttemptID, token, db.SendErrorNonceTooLow, "nonce too low"); err != nil {
+		t.Fatalf("MarkAttemptSendResult() error = %v", err)
+	}
+	held, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(held) error = %v", err)
+	}
+	if held.Status != db.TxStatusHeld {
+		t.Fatalf("status = %q, want held", held.Status)
+	}
+
+	// The stale-view node also serves an orphaned receipt for the attempt. It
+	// must not defer the reconciliation forever: the nonce is unspent on the
+	// majority chain, so the hold releases and the raw resumes replaying.
+	receipt := testReceipt(held.TxHash, types.ReceiptStatusSuccessful)
+	receipt.BlockHash = common.HexToHash("0x0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e")
+	client.receipts[held.TxHash] = receipt
+	client.canonicalHashes = map[uint64]common.Hash{
+		receipt.BlockNumber.Uint64(): common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"),
+	}
+	client.confirmedNonce = held.Nonce
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation() error = %v", err)
+	}
+	released, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(released) error = %v", err)
+	}
+	if released.Status != db.TxStatusBroadcast {
+		t.Fatalf("status = %q, want broadcast (orphaned receipt must not defer the release)", released.Status)
+	}
+}
+
+func TestProcessReceiptsSkipsOrphanedCandidateForCanonicalWinner(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       57,
+		estimatedGas:       123_456,
+		header:             &types.Header{Number: big.NewInt(1_234_568 + 12), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+	}
+	manager := NewWithOptions(store, discardLogger(), Options{
+		StaleBroadcastReplacementAfter: 2 * time.Second,
+	})
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	target.Confirmations = 12
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x0d, 0x0e},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	original, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(original) error = %v", err)
+	}
+	forceBroadcastAgeSeconds(t, id, 3)
+	if _, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target); err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(replacement) error = %v", err)
+	}
+	replaced, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(replacement) error = %v", err)
+	}
+	if replaced.TxHash == original.TxHash {
+		t.Fatal("replacement did not switch the active attempt")
+	}
+
+	// The older attempt keeps a persistently served orphaned receipt while the
+	// replacement's receipt is canonical one block later. The ascending scan
+	// must skip the orphan and terminalize with the canonical winner.
+	orphaned := testReceipt(original.TxHash, types.ReceiptStatusSuccessful)
+	orphaned.BlockHash = common.HexToHash("0x0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e")
+	client.receipts[original.TxHash] = orphaned
+	canonical := testReceipt(replaced.TxHash, types.ReceiptStatusSuccessful)
+	canonical.BlockNumber = big.NewInt(1_234_568)
+	client.receipts[replaced.TxHash] = canonical
+	client.canonicalHashes = map[uint64]common.Hash{
+		orphaned.BlockNumber.Uint64():  common.HexToHash("0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"),
+		canonical.BlockNumber.Uint64(): canonical.BlockHash,
+	}
+
+	processedID, err := manager.ProcessReceipts(t.Context(), target, 1)
+	if err != nil {
+		t.Fatalf("ProcessReceipts() error = %v", err)
+	}
+	if processedID != id {
+		t.Fatalf("processed id = %d, want %d", processedID, id)
+	}
+	confirmed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(final) error = %v", err)
+	}
+	if confirmed.Status != db.TxStatusConfirmed {
+		t.Fatalf("status = %q, want confirmed via the canonical replacement receipt", confirmed.Status)
+	}
+	if confirmed.ReceiptBlockNumber == nil || *confirmed.ReceiptBlockNumber != 1_234_568 {
+		t.Fatalf("receipt block = %v, want the canonical replacement block 1234568", confirmed.ReceiptBlockNumber)
+	}
+}
+
+func TestProcessReceiptsSkipsUnsentSignedAttempt(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       67,
+		estimatedGas:       123_456,
+		header:             dynamicHeader(),
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+		receiptErrs:        make(map[common.Hash]error),
+	}
+	manager := New(store, discardLogger())
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x0f},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	signed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx() error = %v", err)
+	}
+	// The signed raw was never handed to a node; a broken receipt endpoint for
+	// its hash must not be consulted at all, or a receipts-first processOnce
+	// would starve the first broadcast forever.
+	client.receiptErrs[signed.TxHash] = errors.New("receipt endpoint down")
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); !errors.Is(err, ErrNoReceiptUpdate) {
+		t.Fatalf("ProcessReceipts(unsent) error = %v, want ErrNoReceiptUpdate without touching the receipt endpoint", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	// Once sent the task is polled, but a failing endpoint only skips it —
+	// aborting the pass would starve the broadcast/replacement stages behind
+	// receipts in processOnce.
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); !errors.Is(err, ErrNoReceiptUpdate) {
+		t.Fatalf("ProcessReceipts(sent) error = %v, want ErrNoReceiptUpdate (task skipped, pass alive)", err)
+	}
+	// With the endpoint healthy again, the receipt lands normally.
+	delete(client.receiptErrs, signed.TxHash)
+	client.receipts[signed.TxHash] = testReceipt(signed.TxHash, types.ReceiptStatusSuccessful)
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); err != nil {
+		t.Fatalf("ProcessReceipts(recovered) error = %v", err)
+	}
+}
+
+func TestProcessReceiptsScansPastFailingOldHash(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       77,
+		estimatedGas:       123_456,
+		header:             &types.Header{Number: big.NewInt(1_234_568 + 12), BaseFee: big.NewInt(500_000_000)},
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+		receiptErrs:        make(map[common.Hash]error),
+	}
+	manager := NewWithOptions(store, discardLogger(), Options{
+		StaleBroadcastReplacementAfter: 2 * time.Second,
+	})
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+	target.Confirmations = 12
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x1a, 0x1b},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	original, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(original) error = %v", err)
+	}
+	forceBroadcastAgeSeconds(t, id, 3)
+	if _, err := manager.ProcessStaleBroadcastReplacement(t.Context(), target); err != nil {
+		t.Fatalf("ProcessStaleBroadcastReplacement() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast(replacement) error = %v", err)
+	}
+	replaced, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(replacement) error = %v", err)
+	}
+
+	// The superseded old hash answers with a persistent error while the
+	// replacement's receipt is canonical: the scan must reach the later
+	// attempt — one nonce mines at most once, so the canonical receipt is
+	// authoritative regardless of the old hash's answer.
+	client.receiptErrs[original.TxHash] = errors.New("hash-specific lookup failure")
+	canonical := testReceipt(replaced.TxHash, types.ReceiptStatusSuccessful)
+	canonical.BlockNumber = big.NewInt(1_234_568)
+	client.receipts[replaced.TxHash] = canonical
+	client.canonicalHashes = map[uint64]common.Hash{
+		canonical.BlockNumber.Uint64(): canonical.BlockHash,
+	}
+
+	if _, err := manager.ProcessReceipts(t.Context(), target, 1); err != nil {
+		t.Fatalf("ProcessReceipts() error = %v", err)
+	}
+	confirmed, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(final) error = %v", err)
+	}
+	if confirmed.Status != db.TxStatusConfirmed {
+		t.Fatalf("status = %q, want confirmed via the canonical replacement receipt", confirmed.Status)
+	}
+}
+
+// TestNonceReconciliationHeartbeatOutlivesSlowRPC pins the lease lifecycle:
+// the heartbeat starts as soon as the lease is held, so slow RPC phases (a
+// hanging head read here) cannot expire the lease before the final publish
+// that CASes on it.
+func TestNonceReconciliationHeartbeatOutlivesSlowRPC(t *testing.T) {
+	store := openTestStore(t)
+	signer := newTestKeystoreSigner(t)
+	client := &fakeChainClient{
+		pendingNonce:       117,
+		estimatedGas:       111_111,
+		header:             &types.Header{Number: big.NewInt(6_000_000), BaseFee: big.NewInt(500_000_000)},
+		headerDelay:        600 * time.Millisecond,
+		suggestedGasTipCap: big.NewInt(1_000_000_000),
+		receipts:           make(map[common.Hash]*types.Receipt),
+		receiptErrs:        make(map[common.Hash]error),
+	}
+	manager := NewWithOptions(store, discardLogger(), Options{
+		SigningLeaseTTL: 200 * time.Millisecond,
+	})
+	target := testTarget(40161, big.NewInt(11155111), signer, client, defaultFeePolicy())
+
+	id, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x1c},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueTx() error = %v", err)
+	}
+	client.sendErr = errors.New("connection glitch before acknowledgement")
+	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNext() error = %v", err)
+	}
+	if _, err := manager.ProcessBroadcast(t.Context(), target); err != nil {
+		t.Fatalf("ProcessBroadcast() error = %v", err)
+	}
+	forceAttemptBroadcastDue(t, id)
+	token := uuid.New()
+	claim, err := store.ClaimAttemptForBroadcast(t.Context(), 40161, signer.Address().Hex(), token, 30*time.Second)
+	if err != nil {
+		t.Fatalf("ClaimAttemptForBroadcast() error = %v", err)
+	}
+	if err := store.MarkAttemptSendResult(t.Context(), claim.AttemptID, token, db.SendErrorNonceTooLow, "nonce too low"); err != nil {
+		t.Fatalf("MarkAttemptSendResult() error = %v", err)
+	}
+	held, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(held) error = %v", err)
+	}
+	if held.Status != db.TxStatusHeld {
+		t.Fatalf("status = %q, want held", held.Status)
+	}
+
+	// The 600ms head read alone outlives the 200ms lease; only the heartbeat
+	// keeps the final publish's lease CAS satisfiable.
+	client.confirmedNonce = held.Nonce
+	if _, err := manager.ProcessNonceReconciliation(t.Context(), target); err != nil {
+		t.Fatalf("ProcessNonceReconciliation() error = %v", err)
+	}
+	released, err := store.GetOutboxTx(t.Context(), id)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(released) error = %v", err)
+	}
+	if released.Status != db.TxStatusBroadcast {
+		t.Fatalf("status = %q, want broadcast (lease survived the slow RPC)", released.Status)
 	}
 }

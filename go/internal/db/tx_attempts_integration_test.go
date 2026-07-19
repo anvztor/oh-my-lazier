@@ -319,8 +319,8 @@ func TestClaimAttemptForBroadcastParksExhaustedSignedLane(t *testing.T) {
 		t.Fatalf("ClaimAttemptForBroadcast error = %v, want ErrBroadcastLaneHeld", err)
 	}
 	status, heldReason, _ := h.outboxState(id)
-	if status != TxStatusHeld || heldReason != HeldManual {
-		t.Fatalf("outbox status=%q held_reason=%q, want held/manual", status, heldReason)
+	if status != TxStatusHeld || heldReason != HeldBroadcastExhausted {
+		t.Fatalf("outbox status=%q held_reason=%q, want held/broadcast_exhausted", status, heldReason)
 	}
 	// The park is the only state change; the next claim reports no candidate.
 	if _, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, uuid.New(), 30*time.Second); !errors.Is(err, ErrNoBroadcastCandidate) {
@@ -788,7 +788,19 @@ func TestListReceiptPollTasksFairness(t *testing.T) {
 	id2 := h.enqueue()
 	attempt2 := h.signAttempt(id2, 62, common.HexToHash("0xb2b2"))
 
+	// A signed-but-never-sent attempt is not poll-worthy: its hash cannot be
+	// on chain, and polling it before the first broadcast could starve the
+	// send when the receipt endpoint is failing.
 	tasks, err := h.store.ListReceiptPollTasks(h.ctx, 40161, h.signerID, 10)
+	if err != nil {
+		t.Fatalf("ListReceiptPollTasks: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].Outbox.ID != id1 {
+		t.Fatalf("tasks = %+v, want only the sent row %d", tasks, id1)
+	}
+	h.broadcastResult(attempt2.ID, SendErrorAmbiguous)
+
+	tasks, err = h.store.ListReceiptPollTasks(h.ctx, 40161, h.signerID, 10)
 	if err != nil {
 		t.Fatalf("ListReceiptPollTasks: %v", err)
 	}
@@ -799,7 +811,7 @@ func TestListReceiptPollTasksFairness(t *testing.T) {
 		t.Fatalf("task 1 attempts = %+v, want the accepted attempt hash", tasks[0].Attempts)
 	}
 	if len(tasks[1].Attempts) != 1 || tasks[1].Attempts[0].TxHash != attempt2.TxHash {
-		t.Fatalf("task 2 attempts = %+v, want the signed attempt hash", tasks[1].Attempts)
+		t.Fatalf("task 2 attempts = %+v, want the sent attempt hash", tasks[1].Attempts)
 	}
 
 	// Touching the first row rotates it behind the never-polled one.

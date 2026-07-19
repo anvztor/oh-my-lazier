@@ -49,6 +49,45 @@ func TestClassifyBroadcastError(t *testing.T) {
 	}
 }
 
+// opaqueWrapError mirrors the rpcquorum provider wrapper: Error() carries only
+// a canonical message and the node's text is reachable solely via Unwrap().
+type opaqueWrapError struct {
+	cause error
+}
+
+func (e *opaqueWrapError) Error() string { return "provider[0] eth_sendRawTransaction failed" }
+
+func (e *opaqueWrapError) Unwrap() error { return e.cause }
+
+func TestClassifyBroadcastErrorMatchesWrappedCauses(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"wrapped nonce too low", &opaqueWrapError{cause: errors.New("nonce too low")}, db.SendErrorNonceTooLow},
+		{"wrapped nonce too high", &opaqueWrapError{cause: errors.New("nonce too high")}, db.SendErrorNonceTooHigh},
+		{"wrapped underpriced", &opaqueWrapError{cause: errors.New("replacement transaction underpriced")}, db.SendErrorUnderpriced},
+		{"wrapped insufficient funds", &opaqueWrapError{cause: errors.New("insufficient funds for gas * price + value")}, db.SendErrorRetryableEnv},
+		{"wrapped already known", &opaqueWrapError{cause: errors.New("already known")}, db.SendErrorAccepted},
+		{"wrapped definitive", &opaqueWrapError{cause: errors.New("intrinsic gas too low")}, db.SendErrorDefinitive},
+		{"wrapped unknown stays ambiguous", &opaqueWrapError{cause: errors.New("some brand new node error")}, db.SendErrorAmbiguous},
+		{"doubly wrapped", fmt.Errorf("broadcast: %w", &opaqueWrapError{cause: errors.New("nonce too low")}), db.SendErrorNonceTooLow},
+		{"joined errors", errors.Join(errors.New("first provider timed out"), &opaqueWrapError{cause: errors.New("transaction underpriced")}), db.SendErrorUnderpriced},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, detail := classifyBroadcastError(test.err)
+			if got != test.want {
+				t.Fatalf("classifyBroadcastError(%v) = %q, want %q", test.err, got, test.want)
+			}
+			if detail == "" {
+				t.Fatalf("classifyBroadcastError(%v) returned an empty detail", test.err)
+			}
+		})
+	}
+}
+
 func TestClassifyBroadcastErrorDetailIsCanonical(t *testing.T) {
 	// The detail must never echo the raw error, which can embed RPC URLs or keys.
 	raw := errors.New("Post \"https://rpc.example/v1/SECRET-KEY\": nonce too low")

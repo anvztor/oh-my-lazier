@@ -14,9 +14,10 @@ import (
 // classification is deliberately conservative: only tested, exact node phrases
 // are recognized, and anything unrecognized is treated as ambiguous (possibly
 // accepted) so an already-submitted transaction is never dropped from receipt
-// tracking. Only the canonical detail is persisted or logged — raw node errors
-// can embed RPC URLs or API keys. err == nil means the node accepted the
-// transaction.
+// tracking. Phrase matching walks the whole Unwrap chain because the RPC
+// quorum client wraps node errors behind a canonical provider message; only
+// the canonical detail is persisted or logged — raw node errors can embed RPC
+// URLs or API keys. err == nil means the node accepted the transaction.
 func classifyBroadcastError(err error) (class, detail string) {
 	if err == nil {
 		return db.SendErrorAccepted, ""
@@ -27,7 +28,7 @@ func classifyBroadcastError(err error) (class, detail string) {
 		return db.SendErrorAmbiguous, "transport failure before acknowledgement"
 	}
 
-	msg := strings.ToLower(err.Error())
+	msg := strings.ToLower(errorChainText(err))
 	match := func(phrases ...string) string {
 		for _, phrase := range phrases {
 			if strings.Contains(msg, phrase) {
@@ -83,4 +84,28 @@ func classifyBroadcastError(err error) (class, detail string) {
 	// Unknown transport/RPC failure: assume the transaction may have been
 	// accepted and let receipt polling decide.
 	return db.SendErrorAmbiguous, "unrecognized broadcast error"
+}
+
+// errorChainText joins the messages of every error in the Unwrap chain (both
+// single and joined wrapping) so phrase matching sees the node's original
+// message even when a wrapper's Error() hides its cause. The joined text is
+// used only for matching and never persisted.
+func errorChainText(err error) string {
+	var parts []string
+	var walk func(error, int)
+	walk = func(current error, depth int) {
+		if current == nil || depth > 8 {
+			return
+		}
+		parts = append(parts, current.Error())
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child, depth+1)
+			}
+			return
+		}
+		walk(errors.Unwrap(current), depth+1)
+	}
+	walk(err, 0)
+	return strings.Join(parts, "\n")
 }

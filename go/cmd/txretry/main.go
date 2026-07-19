@@ -84,6 +84,9 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "created fresh clone %d\n", cloneID)
+			// Report the clone that will actually run as After, mirroring
+			// retry-failed, so automation gets the live row's ID from the JSON.
+			*id = cloneID
 		case "abandon":
 			if err := store.ResolveExternalNonceAbandon(ctx, *id); err != nil {
 				fmt.Fprintf(os.Stderr, "resolve external nonce (abandon): %v\n", err)

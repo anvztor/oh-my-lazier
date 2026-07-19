@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -41,6 +43,15 @@ type ChainClient interface {
 	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
 	SendTransaction(ctx context.Context, tx *types.Transaction) error
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error)
+	// TransactionReceiptAt is TransactionReceipt with a caller-known minimum
+	// block: the nonce reconciler passes the confirmed block so lagging
+	// providers cannot form the authoritative-absence quorum that feeds its
+	// destructive decisions.
+	TransactionReceiptAt(ctx context.Context, txHash common.Hash, minBlock *big.Int) (*types.Receipt, error)
+	// CanonicalHashAt returns the majority-agreed block hash at a height; the
+	// receipt terminalizer uses it to prove a mined receipt's block is on the
+	// canonical chain before applying irreversible workflow state.
+	CanonicalHashAt(ctx context.Context, blockNumber *big.Int) (common.Hash, error)
 }
 
 // FeePolicy caps send-time gas fees for one outbox purpose.
@@ -313,7 +324,15 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 				continue
 			}
 			if err != nil {
-				return 0, err
+				// A failing receipt endpoint must only skip this task, never
+				// abort the pass: an aborted pass would also starve the
+				// broadcast and replacement stages that run after receipts in
+				// processOnce.
+				m.logger.Warn("skipped pinned receipt task after a lookup failure", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", winning.TxHash, "error", err.Error())
+				if err := m.store.TouchReceiptPoll(ctx, task.Outbox.ID); err != nil {
+					return 0, err
+				}
+				continue
 			}
 			receipt = pinned
 		} else {
@@ -323,10 +342,35 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 					continue
 				}
 				if err != nil {
-					return 0, err
+					// A lookup failure skips only THIS hash: a persistent
+					// hash-specific error on a superseded old attempt must
+					// not hide a later replacement whose receipt is already
+					// canonical — one nonce mines at most once, so a later
+					// canonical receipt is authoritative regardless of the
+					// older hash's answer. A pass-wide outage simply fails
+					// every hash and the task skips as a whole.
+					m.logger.Warn("skipped receipt candidate after a lookup failure", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", attempt.TxHash, "error", err.Error())
+					continue
 				}
 				if candidate.TxHash != attempt.TxHash {
 					return 0, fmt.Errorf("receipt tx hash %s does not match attempt tx hash %s", candidate.TxHash, attempt.TxHash)
+				}
+				if target.Confirmations > 0 {
+					onCanonical, canonErr := m.receiptOnCanonicalChain(ctx, target, candidate)
+					if canonErr != nil {
+						// Skip only this candidate (same reasoning as the
+						// lookup failure above); a chain-wide quorum outage
+						// fails every candidate and skips the task anyway.
+						m.logger.Warn("skipped receipt candidate; canonical hash quorum unavailable", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", attempt.TxHash, "error", canonErr.Error())
+						continue
+					}
+					if !onCanonical {
+						// A persistently served orphaned candidate must not
+						// shadow a later replacement or cancel attempt whose
+						// receipt IS canonical: keep scanning.
+						m.logger.Warn("skipped orphaned receipt candidate", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", attempt.TxHash)
+						continue
+					}
 				}
 				receipt = candidate
 				winning = attempt
@@ -360,6 +404,26 @@ func (m *Manager) ProcessReceipts(ctx context.Context, target Target, limit int)
 					return 0, err
 				}
 				m.logger.Debug("deferred tx receipt below confirmation depth", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "purpose", task.Outbox.Purpose, "tx_hash", winning.TxHash, "confirmations", target.Confirmations)
+				continue
+			}
+			// Depth alone can pair a receipt from one branch with a head from
+			// another: a reorg between the receipt read and the (cached) head
+			// read would then terminalize an orphaned transaction. The
+			// receipt's block hash must be the majority canonical hash at its
+			// height before anything irreversible happens; on a mismatch or a
+			// failed quorum read the row simply stays under receipt polling.
+			onCanonical, hashErr := m.receiptOnCanonicalChain(ctx, target, receipt)
+			if hashErr != nil {
+				m.logger.Warn("deferred tx receipt; canonical hash quorum unavailable", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", winning.TxHash, "error", hashErr.Error())
+				continue
+			}
+			if !onCanonical {
+				// Deliberately no stale-timer refresh here: refreshing on
+				// every poll would keep the row perpetually "fresh" and the
+				// orphan-aware replacement precheck would never get to run —
+				// the stale replacement path is exactly how this lane
+				// recovers from a provably orphaned receipt.
+				m.logger.Warn("deferred tx receipt; block is not on the majority canonical chain", "id", task.Outbox.ID, "chain_eid", target.ChainEID, "tx_hash", winning.TxHash, "receipt_block_hash", receipt.BlockHash)
 				continue
 			}
 		}
@@ -440,6 +504,21 @@ func (m *Manager) ProcessStaleBroadcastReplacement(ctx context.Context, target T
 			return 0, receiptErr
 		}
 		if receipt != nil {
+			onCanonical, canonErr := m.receiptOnCanonicalChain(ctx, target, receipt)
+			if canonErr != nil {
+				if err := m.store.DeferReplacement(ctx, outboxTx.ID); err != nil {
+					return 0, err
+				}
+				m.logger.Warn("deferred stale replacement; canonical hash quorum unavailable", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "tx_hash", hash, "error", canonErr.Error())
+				return outboxTx.ID, nil
+			}
+			if !onCanonical {
+				// A provably orphaned receipt must not count as mined: it
+				// would suppress same-nonce recovery forever while nothing can
+				// build on the nonce.
+				m.logger.Warn("ignoring orphaned receipt in stale replacement precheck", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "tx_hash", hash)
+				continue
+			}
 			if err := m.store.DeferReplacement(ctx, outboxTx.ID); err != nil {
 				return 0, err
 			}
@@ -529,7 +608,53 @@ func (m *Manager) ProcessNonceReconciliation(ctx context.Context, target Target)
 		}
 	}()
 
-	rpcCtx, cancel := context.WithTimeout(ctx, m.options.PreSignRPCTimeout)
+	// The heartbeat starts the moment the lease is held — before the head and
+	// nonce reads and the probe phase, all of which can add up past the lease
+	// on a large backlog while the final publish CASes on it. A failed renewal
+	// cancels probeCtx so every in-flight probe and slot wait aborts at once:
+	// once the publish can no longer land, finishing the probes only wastes
+	// the RPC budget and blocks this target's other work.
+	probeCtx, cancelProbes := context.WithCancel(ctx)
+	defer cancelProbes()
+	heartbeatLost := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(m.options.SigningLeaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-probeCtx.Done():
+				return
+			case <-ticker.C:
+				if err := m.store.ExtendNonceReconciliation(probeCtx, target.ChainEID, signerID, token, m.options.SigningLeaseTTL); err != nil {
+					if probeCtx.Err() != nil {
+						// Normal shutdown after the pass completed.
+						return
+					}
+					close(heartbeatLost)
+					cancelProbes()
+					return
+				}
+			}
+		}
+	}()
+
+	// The hashes load only now — after the heartbeat is running — so a
+	// backlog-proportional result set cannot burn the fresh lease unattended.
+	attemptHashes, err := m.store.LoadNonceReconcileAttemptHashes(probeCtx, func() []int64 {
+		ids := make([]int64, len(holds))
+		for i := range holds {
+			ids[i] = holds[i].ID
+		}
+		return ids
+	}())
+	if err != nil {
+		return 0, err
+	}
+	for i := range holds {
+		holds[i].AttemptHashes = attemptHashes[holds[i].ID]
+	}
+
+	rpcCtx, cancel := context.WithTimeout(probeCtx, m.options.PreSignRPCTimeout)
 	defer cancel()
 	head, err := target.Client.HeaderByNumber(rpcCtx, nil)
 	if err != nil {
@@ -539,13 +664,14 @@ func (m *Manager) ProcessNonceReconciliation(ctx context.Context, target Target)
 		return 0, errors.New("latest header block number is unavailable")
 	}
 	// The confirmed block matches the receipt gate arithmetic
-	// (head - receipt + 1 >= confirmations): with confirmations c > 0 the newest
-	// confirmed block is head - c + 1; zero disables the gate and reads latest.
+	// (head - receipt >= confirmations): with confirmations c > 0 the newest
+	// confirmed block is head - c, mirroring the indexer's confirmed window;
+	// zero disables the gate and reads latest.
 	confirmedBlockNumber := head.Number.Uint64()
 	var confirmedBlock *big.Int
 	if target.Confirmations > 0 {
-		if confirmedBlockNumber >= target.Confirmations-1 {
-			confirmedBlockNumber -= target.Confirmations - 1
+		if confirmedBlockNumber >= target.Confirmations {
+			confirmedBlockNumber -= target.Confirmations
 		} else {
 			confirmedBlockNumber = 0
 		}
@@ -556,25 +682,125 @@ func (m *Manager) ProcessNonceReconciliation(ctx context.Context, target Target)
 		return 0, err
 	}
 
-	// All RPC reads complete before anything is published: a receipt error here
-	// aborts the whole pass with every row untouched (the deferred finish only
-	// releases the lease with its backoff).
+	// Receipt lookups fan out across holds concurrently: the pass shares one
+	// RPC budget with the head and nonce reads above, and a signer with many
+	// held rows must not burn it serially — an expiring deadline used to
+	// discard the whole pass every minute and keep the lane held forever. A
+	// hold whose lookup fails is skipped this pass (it stays held and retries
+	// after the backoff) instead of aborting every other hold's progress; a
+	// hold's own decision is still made only from fully resolved reads.
+	type holdReceiptProbe struct {
+		anyReceipt bool
+		err        error
+	}
+	probes := make([]holdReceiptProbe, len(holds))
+	receiptSlots := make(chan struct{}, 8)
+	var receiptWG sync.WaitGroup
+	for i := range holds {
+		receiptWG.Add(1)
+		go func(i int) {
+			defer receiptWG.Done()
+			// Every hash of the hold probes concurrently: a NotFound answer
+			// deliberately waits out every provider, so probing replacements
+			// sequentially would stack full probe deadlines and overrun the
+			// pass budget whenever one provider hangs — skipping the hold's
+			// decision forever.
+			hashResults := make([]holdReceiptProbe, len(holds[i].AttemptHashes))
+			hashDecided := make([]bool, len(holds[i].AttemptHashes))
+			var hashWG sync.WaitGroup
+			for j, hash := range holds[i].AttemptHashes {
+				hashWG.Add(1)
+				go func(j int, hash common.Hash) {
+					defer hashWG.Done()
+					// The whole per-hash probe — including the canonical
+					// fan-out, which itself reaches every provider — stays
+					// inside one slot, so a backlog of holds is capped at
+					// slots × providers concurrent RPC, never holds × providers.
+					select {
+					case receiptSlots <- struct{}{}:
+					case <-probeCtx.Done():
+						hashResults[j] = holdReceiptProbe{err: probeCtx.Err()}
+						hashDecided[j] = true
+						return
+					}
+					defer func() { <-receiptSlots }()
+					// Probes run under probeCtx, NOT the 30-second head/nonce
+					// budget: every RPC below is internally bounded
+					// (per-provider probe deadlines) and the slot semaphore
+					// caps concurrency, so total probe time is proportional to
+					// the real work — while a lost lease cancels probeCtx and
+					// aborts everything at once. A shared fixed deadline would
+					// guarantee failure for a hold whose replacement hashes
+					// outnumber the slots whenever one provider hangs,
+					// skipping its decision forever.
+					// The confirmed block is the deny threshold: NotFound
+					// here feeds destructive decisions, and a provider still
+					// below the confirmed block cannot rule the tx out.
+					receipt, receiptErr := target.Client.TransactionReceiptAt(probeCtx, hash, new(big.Int).SetUint64(confirmedBlockNumber))
+					if errors.Is(receiptErr, ethereum.NotFound) {
+						return
+					}
+					if receiptErr != nil {
+						hashResults[j] = holdReceiptProbe{err: receiptErr}
+						hashDecided[j] = true
+						return
+					}
+					if receipt == nil {
+						return
+					}
+					// Only a receipt on the majority canonical chain defers
+					// the destructive decisions: a persistently served
+					// orphaned receipt must not keep the hold parked forever.
+					onCanonical, canonErr := m.receiptOnCanonicalChain(probeCtx, target, receipt)
+					if canonErr != nil {
+						hashResults[j] = holdReceiptProbe{err: canonErr}
+						hashDecided[j] = true
+						return
+					}
+					if onCanonical {
+						hashResults[j] = holdReceiptProbe{anyReceipt: true}
+						hashDecided[j] = true
+					}
+				}(j, hash)
+			}
+			hashWG.Wait()
+			// A canonical receipt on ANY hash defers the hold; otherwise any
+			// probe error skips it this pass (a hold's decision only ever
+			// comes from fully resolved reads).
+			for j := range hashResults {
+				if hashDecided[j] && hashResults[j].anyReceipt {
+					probes[i] = hashResults[j]
+					return
+				}
+			}
+			for j := range hashResults {
+				if hashDecided[j] && hashResults[j].err != nil {
+					probes[i] = hashResults[j]
+					return
+				}
+			}
+		}(i)
+	}
+	receiptWG.Wait()
+	select {
+	case <-heartbeatLost:
+		return 0, fmt.Errorf("nonce reconciliation lease lost during receipt probing for chain %d signer %s", target.ChainEID, signerID)
+	default:
+	}
+	// The heartbeat deliberately keeps running through the decision sweep and
+	// ApplyNonceReconciliation below: the publish CASes on the lease at the
+	// END of its transaction (after the signer advisory lock), so stopping
+	// here would reopen an unattended window. Apply consuming the token makes
+	// a post-publish renewal fail, which is harmless — the deferred
+	// cancelProbes reaps the goroutine on return.
+
 	decisions := make([]db.NonceReconcileDecision, 0, len(holds))
-	for _, hold := range holds {
-		anyReceipt := false
-		for _, hash := range hold.AttemptHashes {
-			receipt, receiptErr := target.Client.TransactionReceipt(rpcCtx, hash)
-			if errors.Is(receiptErr, ethereum.NotFound) {
-				continue
-			}
-			if receiptErr != nil {
-				return 0, receiptErr
-			}
-			if receipt != nil {
-				anyReceipt = true
-				break
-			}
+	for i, hold := range holds {
+		if probes[i].err != nil {
+			m.logger.Warn("skipping nonce reconcile hold after a receipt lookup failure", "id", hold.ID, "chain_eid", target.ChainEID, "signer", signerID, "nonce", hold.Nonce, "error", probes[i].err.Error())
+			continue
 		}
+		anyReceipt := probes[i].anyReceipt
 		switch {
 		case anyReceipt:
 			// One of our own transactions consumed the nonce; the receipts-first
@@ -640,6 +866,19 @@ func (m *Manager) ProcessCancelRequest(ctx context.Context, target Target) (int6
 			return 0, receiptErr
 		}
 		if receipt != nil {
+			onCanonical, canonErr := m.receiptOnCanonicalChain(ctx, target, receipt)
+			if canonErr != nil {
+				if err := m.store.DeferCancel(ctx, outboxTx.ID); err != nil {
+					return 0, err
+				}
+				m.logger.Warn("deferred cancel; canonical hash quorum unavailable", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "tx_hash", hash, "error", canonErr.Error())
+				return outboxTx.ID, nil
+			}
+			if !onCanonical {
+				// An orphaned receipt must not delay the operator's cancel.
+				m.logger.Warn("ignoring orphaned receipt in cancel precheck", "id", outboxTx.ID, "chain_eid", target.ChainEID, "signer", signerID, "tx_hash", hash)
+				continue
+			}
 			if err := m.store.DeferCancel(ctx, outboxTx.ID); err != nil {
 				return 0, err
 			}
@@ -706,8 +945,35 @@ func cancelQueuedView(outboxTx db.OutboxTx, self common.Address) db.QueuedOutbox
 	}
 }
 
+// receiptOnCanonicalChain reports whether a fetched receipt's block carries the
+// majority canonical hash at its height. The terminal gate uses it so an
+// orphaned receipt is never finalized, and every recovery precheck
+// (replacement, cancel, nonce reconciliation) uses it so a provider
+// persistently serving an orphaned receipt cannot count as "mined" and
+// suppress same-nonce recovery forever. Chains without a confirmation gate
+// skip the check. A failed quorum read propagates so each caller fails closed
+// by deferring its action for the round.
+func (m *Manager) receiptOnCanonicalChain(ctx context.Context, target Target, receipt *types.Receipt) (bool, error) {
+	if receipt == nil {
+		return false, nil
+	}
+	if target.Confirmations == 0 {
+		return true, nil
+	}
+	if receipt.BlockNumber == nil {
+		return false, errors.New("receipt block number is unavailable")
+	}
+	canonicalHash, err := target.Client.CanonicalHashAt(ctx, receipt.BlockNumber)
+	if err != nil {
+		return false, err
+	}
+	return canonicalHash == receipt.BlockHash, nil
+}
+
 // receiptConfirmed reports whether a receipt is buried under at least
-// confirmations blocks relative to the latest head.
+// confirmations blocks beyond its own: block B is trusted only once
+// head >= B + confirmations, matching the indexer's confirmed window
+// (head - confirmations).
 func receiptConfirmed(head *types.Header, receipt *types.Receipt, confirmations uint64) (bool, error) {
 	if head == nil || head.Number == nil || !head.Number.IsUint64() {
 		return false, errors.New("latest header block number is unavailable")
@@ -720,7 +986,7 @@ func receiptConfirmed(head *types.Header, receipt *types.Receipt, confirmations 
 	if headNumber < receiptNumber {
 		return false, nil
 	}
-	return headNumber-receiptNumber+1 >= confirmations, nil
+	return headNumber-receiptNumber >= confirmations, nil
 }
 
 // applyWorkflowReceipt applies the workflow effect of a mined receipt using the

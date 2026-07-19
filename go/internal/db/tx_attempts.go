@@ -57,6 +57,12 @@ const (
 	HeldNonceReconcileRequired = "nonce_reconcile_required"
 	HeldRepriceRequired        = "reprice_required"
 	HeldManual                 = "manual"
+	// HeldBroadcastExhausted parks a lane whose active attempt spent its whole
+	// broadcast budget without an accepted send. Unlike held(manual) it is
+	// explicitly replaceable: an operator replace signs a fresh attempt with a
+	// fresh budget for the same intent, while manual holds (definitive errors,
+	// signing budgets) usually need a config fix or a cancel instead.
+	HeldBroadcastExhausted = "broadcast_exhausted"
 )
 
 // ErrSignerLaneBlocked indicates a lower nonce for the same signer has not yet
@@ -439,7 +445,7 @@ func (s *Store) ClaimAttemptForBroadcast(ctx context.Context, chainEID uint32, s
 			AND o.status = 'signed' AND o.held_reason IS NULL
 			AND a.state = 'ambiguous' AND a.broadcast_count >= $5
 			AND (a.broadcast_lease_until IS NULL OR a.broadcast_lease_until <= now())
-	`, chainEID, signerID, TxStatusHeld, HeldManual, TxMaxBroadcasts)
+	`, chainEID, signerID, TxStatusHeld, HeldBroadcastExhausted, TxMaxBroadcasts)
 	if err != nil {
 		return BroadcastClaim{}, err
 	}
@@ -467,7 +473,15 @@ func (s *Store) ClaimAttemptForBroadcast(ctx context.Context, chainEID uint32, s
 					AND lower.status IN ('nonce_assigned', 'signed', 'held')
 			)
 		ORDER BY o.nonce ASC
-		FOR UPDATE OF a SKIP LOCKED
+		-- Locking the outbox row too serializes this claim against
+		-- RequestTxCancel: with only the attempt locked, a cancel intent could
+		-- commit between this read and the claim's commit and the stale claim
+		-- would still broadcast the original raw. Under the row lock the
+		-- predicate re-evaluates against the latest outbox version, so a claim
+		-- can never commit after the cancel intent is durable. (The window
+		-- between a committed claim and the actual send is inherent — cancel
+		-- always races already-claimed raw bytes.)
+		FOR UPDATE OF a, o SKIP LOCKED
 		LIMIT 1
 	`, chainEID, signerID, TxMaxBroadcasts).Scan(&attemptID, &outboxID, &state, &nonce, &broadcastCount, &rawTx, &hashBytes, &kind, &outboxStatus, &purpose)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -595,6 +609,11 @@ func (s *Store) ListReceiptPollTasks(ctx context.Context, chainEID uint32, signe
 		WHERE o.chain_eid = $1 AND o.signer_id = $2
 			AND o.status IN ('signed', 'broadcast', 'held')
 			AND o.active_attempt_id IS NOT NULL
+			-- A row whose every attempt is still unsent has nothing to poll.
+			AND EXISTS (
+				SELECT 1 FROM tx_attempts sent
+				WHERE sent.outbox_id = o.id AND sent.state IN ('submitted', 'ambiguous')
+			)
 		ORDER BY o.last_receipt_poll_at ASC NULLS FIRST, o.id ASC
 		LIMIT $3
 	`, chainEID, signerID, limit)
@@ -635,11 +654,16 @@ func (s *Store) ListReceiptPollTasks(ctx context.Context, chainEID uint32, signe
 		return tasks, nil
 	}
 
+	// Only sent attempts are poll-worthy: the broadcast claim flips signed to
+	// ambiguous BEFORE the raw ever reaches a node, so a signed-state attempt
+	// has definitively never been sent — polling its hash wastes RPC and, with
+	// receipts ordered before broadcasting in processOnce, a failing receipt
+	// endpoint could starve the first broadcast forever.
 	attemptRows, err := s.pool.Query(ctx, `
 		SELECT id, outbox_id, kind, nonce, tx_type, tx_hash, state
 		FROM tx_attempts
 		WHERE outbox_id = ANY($1)
-			AND state IN ('signed', 'submitted', 'ambiguous')
+			AND state IN ('submitted', 'ambiguous')
 		ORDER BY outbox_id ASC, id ASC
 	`, outboxIDs)
 	if err != nil {
@@ -1014,8 +1038,13 @@ func (s *Store) RequestTxReplacement(ctx context.Context, id int64) error {
 		SET replace_requested_at = now(), pre_sign_failure_count = 0, updated_at = now()
 		WHERE id = $1
 			AND active_attempt_id IS NOT NULL
-			AND (status = $2 OR (status = $3 AND held_reason = $4))
-	`, id, TxStatusBroadcast, TxStatusHeld, HeldRepriceRequired)
+			-- A cancel-pending row rejects replacement requests outright: the
+			-- request would sit dormant until the first cancel attempt becomes
+			-- active and then authorize a bump nobody asked for. Re-requesting
+			-- the cancel is the only way to authorize a cancel bump.
+			AND cancel_requested_at IS NULL
+			AND (status = $2 OR (status = $3 AND held_reason IN ($4, $5)))
+	`, id, TxStatusBroadcast, TxStatusHeld, HeldRepriceRequired, HeldBroadcastExhausted)
 	if err != nil {
 		return err
 	}
@@ -1109,6 +1138,7 @@ func (s *Store) NextReplacementCandidate(ctx context.Context, chainEID uint32, s
 					AND (
 						o.status = $4
 						OR (o.status = $6 AND o.held_reason = $7)
+						OR (o.status = $6 AND o.held_reason = 'broadcast_exhausted')
 						OR (o.status = $6 AND o.held_reason = 'manual' AND a.kind = 'cancel')
 					)
 				)
@@ -1179,7 +1209,7 @@ func replacementClaimable(status string, heldReason *string, kind string) bool {
 	if status != TxStatusHeld || heldReason == nil {
 		return false
 	}
-	if *heldReason == HeldRepriceRequired {
+	if *heldReason == HeldRepriceRequired || *heldReason == HeldBroadcastExhausted {
 		return true
 	}
 	return *heldReason == HeldManual && kind == TxAttemptCancel
