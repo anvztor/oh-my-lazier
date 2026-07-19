@@ -869,6 +869,9 @@ func TestProcessQuorumOnceMarksReorgWhenReceiptDisappears(t *testing.T) {
 	if len(store.quorumResult) == 0 {
 		t.Fatal("quorum result is empty")
 	}
+	if store.reorgCoords != nil {
+		t.Fatal("packet coordinates must not change when the receipt disappeared entirely")
+	}
 }
 
 func TestProcessQuorumOnceMarksReorgWhenReceiptBlockMoved(t *testing.T) {
@@ -912,6 +915,22 @@ func TestProcessQuorumOnceMarksReorgWhenReceiptBlockMoved(t *testing.T) {
 	}
 	if store.pausedPathwayGUID != (common.Hash{}) {
 		t.Fatalf("paused pathway guid = %s, want zero", store.pausedPathwayGUID)
+	}
+	// The stored coordinates must follow the re-included receipt — atomically
+	// with the status transition: the forward-only source cursor never rescans
+	// the replacement block, and a separate coordinate commit would leave a
+	// window for another instance to re-enter quorum on the old coordinates.
+	if store.reorgCoords == nil {
+		t.Fatal("packet coordinates were not refreshed after re-inclusion")
+	}
+	if store.reorgCoords.srcBlockNumber != packet.SrcBlockNumber+3 {
+		t.Fatalf("refreshed src block = %d, want %d", store.reorgCoords.srcBlockNumber, packet.SrcBlockNumber+3)
+	}
+	if store.reorgCoords.srcLogIndex != packet.SrcLogIndex+5 {
+		t.Fatalf("refreshed src log index = %d, want %d", store.reorgCoords.srcLogIndex, packet.SrcLogIndex+5)
+	}
+	if store.reorgCoords.expectedSrcBlockNumber != packet.SrcBlockNumber || store.reorgCoords.expectedSrcLogIndex != packet.SrcLogIndex {
+		t.Fatalf("coordinate CAS expects %d/%d, want the stale %d/%d", store.reorgCoords.expectedSrcBlockNumber, store.reorgCoords.expectedSrcLogIndex, packet.SrcBlockNumber, packet.SrcLogIndex)
 	}
 }
 
@@ -991,6 +1010,34 @@ type fakeStore struct {
 	deferredGUID          common.Hash
 	deferredStatus        string
 	enqueueErr            error
+	reorgCoords           *reorgCoordinates
+	reorgCoordsErr        error
+}
+
+type reorgCoordinates struct {
+	srcBlockNumber         uint64
+	srcLogIndex            uint
+	expectedSrcBlockNumber uint64
+	expectedSrcLogIndex    uint
+}
+
+func (s *fakeStore) MarkDVNReorgDetectedWithCoordinates(_ context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte, srcBlockNumber uint64, srcLogIndex uint, expectedSrcBlockNumber uint64, expectedSrcLogIndex uint) error {
+	if s.reorgCoordsErr != nil {
+		return s.reorgCoordsErr
+	}
+	if expectedStatus != string(packets.DVNQuorumChecking) {
+		return fmt.Errorf("unexpected expected status %q", expectedStatus)
+	}
+	s.reorgGUID = guid
+	s.reorgReason = reason
+	s.quorumResult = quorumResult
+	s.reorgCoords = &reorgCoordinates{
+		srcBlockNumber:         srcBlockNumber,
+		srcLogIndex:            srcLogIndex,
+		expectedSrcBlockNumber: expectedSrcBlockNumber,
+		expectedSrcLogIndex:    expectedSrcLogIndex,
+	}
+	return nil
 }
 
 func (s *fakeStore) ListDVNWork(_ context.Context, status string, _ int) ([]db.DVNWorkItem, error) {
@@ -1373,5 +1420,39 @@ func assertLogContains(t *testing.T, output string, wants ...string) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("logs missing %q in:\n%s", want, output)
 		}
+	}
+}
+
+func TestProcessQuorumOnceReorgCoordinateWriteFailureIsRetried(t *testing.T) {
+	packet := testDVNPacket()
+	receipt := testSourceReceipt(t, packet)
+	receipt.BlockNumber = new(big.Int).SetUint64(packet.SrcBlockNumber + 3)
+	receipt.Logs[0].BlockNumber = packet.SrcBlockNumber + 3
+	receipt.Logs[0].Index = packet.SrcLogIndex + 5
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNQuorumChecking),
+			},
+		}},
+		reorgCoordsErr: fmt.Errorf("coordinates write lost"),
+	}
+	worker := NewWithClients(
+		store,
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]ReceiptReader{packet.SrcEID: fakeReceiptReader{receipt: receipt}},
+		discardLogger(),
+	)
+
+	// The transition and the coordinate refresh commit atomically: a failed
+	// write changes nothing and the pass surfaces the error for a retry.
+	if _, err := worker.ProcessQuorumOnce(context.Background()); err == nil {
+		t.Fatal("ProcessQuorumOnce() error = nil, want the atomic write failure")
+	}
+	if store.reorgGUID != (common.Hash{}) || store.reorgCoords != nil {
+		t.Fatal("nothing may persist when the atomic reorg write failed")
 	}
 }

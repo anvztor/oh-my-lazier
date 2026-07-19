@@ -58,6 +58,7 @@ type Store interface {
 	DeferDVNJob(ctx context.Context, guid common.Hash, expectedStatus string, delay time.Duration) error
 	PauseChain(ctx context.Context, eid uint32) error
 	PausePathwayForPacket(ctx context.Context, guid common.Hash) error
+	MarkDVNReorgDetectedWithCoordinates(ctx context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte, srcBlockNumber uint64, srcLogIndex uint, expectedSrcBlockNumber uint64, expectedSrcLogIndex uint) error
 }
 
 // HeadReader reads a source chain head.
@@ -254,7 +255,18 @@ func (w *Worker) ProcessQuorumOnce(ctx context.Context) (bool, error) {
 	if receiptReader == nil {
 		return w.deferDVNWorkError(ctx, item, string(packets.DVNQuorumChecking), "missing_source_receipt_reader", fmt.Errorf("missing source receipt reader for eid %d", item.Packet.SrcEID))
 	}
-	receipt, err := receiptReader.TransactionReceipt(ctx, item.Packet.SrcTxHash)
+	// A NotFound answer routes this job into reorg handling, so the receipt
+	// read passes the indexed source block when the reader supports it:
+	// providers still below that block cannot authoritatively deny the tx and
+	// must not form the negative quorum.
+	var receipt *gethtypes.Receipt
+	if reader, ok := receiptReader.(interface {
+		TransactionReceiptAt(ctx context.Context, txHash common.Hash, minBlock *big.Int) (*gethtypes.Receipt, error)
+	}); ok {
+		receipt, err = reader.TransactionReceiptAt(ctx, item.Packet.SrcTxHash, new(big.Int).SetUint64(item.Packet.SrcBlockNumber))
+	} else {
+		receipt, err = receiptReader.TransactionReceipt(ctx, item.Packet.SrcTxHash)
+	}
 	if err != nil {
 		if rpcquorum.IsReceiptConflict(err) {
 			return true, w.markQuorumConflict(ctx, item.Packet, err)
@@ -275,6 +287,28 @@ func (w *Worker) ProcessQuorumOnce(ctx context.Context) (bool, error) {
 	report, err := verifySourceReceiptForEndpoint(item.Packet, receipt, endpoint)
 	if err != nil {
 		if errors.Is(err, errSourceReceiptReorg) {
+			// The forward-only source cursor normally never rescans the block
+			// the tx was re-included at, so the stored packet coordinates must
+			// be refreshed here or the confirmation gate re-checks the stale
+			// block forever. The transition and the coordinate refresh commit
+			// in ONE transaction: with two commits another instance can run
+			// the whole reorg round trip in between (the old block is deep,
+			// its gate passes instantly) and the late coordinates would land
+			// on a QUORUM_CHECKING job, skipping the new block's gate.
+			if updated, ok := reorgedPacketRecord(item.Packet, receipt, endpoint); ok {
+				payload, marshalErr := json.Marshal(map[string]any{
+					"tx_hash": item.Packet.SrcTxHash.Hex(),
+					"error":   err.Error(),
+				})
+				if marshalErr != nil {
+					return false, marshalErr
+				}
+				if reorgErr := w.store.MarkDVNReorgDetectedWithCoordinates(ctx, item.Packet.GUID, string(packets.DVNQuorumChecking), err.Error(), payload, updated.SrcBlockNumber, updated.SrcLogIndex, item.Packet.SrcBlockNumber, item.Packet.SrcLogIndex); reorgErr != nil {
+					return false, reorgErr
+				}
+				w.logger.Warn("dvn source reorg detected; refreshed source coordinates", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "tx_hash", item.Packet.SrcTxHash, "old_block_number", item.Packet.SrcBlockNumber, "new_block_number", updated.SrcBlockNumber, "old_log_index", item.Packet.SrcLogIndex, "new_log_index", updated.SrcLogIndex)
+				return true, nil
+			}
 			return true, w.markReorgDetected(ctx, item.Packet, err)
 		}
 		return true, w.markQuorumConflict(ctx, item.Packet, err)
@@ -837,6 +871,37 @@ func verifySourceReceiptForEndpoint(packet db.PacketRecord, receipt *gethtypes.R
 		}, nil
 	}
 	return QuorumReport{}, fmt.Errorf("source receipt missing PacketSent log index %d", packet.SrcLogIndex)
+}
+
+// reorgedPacketRecord locates the packet's PacketSent log inside a re-included
+// source receipt and returns the packet with the receipt's block number and
+// log index. The stored log index is useless after a re-inclusion (the
+// block-global index shifts), so the log is matched by decoding each PacketSent
+// event and comparing the full packet contents instead.
+func reorgedPacketRecord(packet db.PacketRecord, receipt *gethtypes.Receipt, endpoint common.Address) (db.PacketRecord, bool) {
+	if receipt == nil {
+		return db.PacketRecord{}, false
+	}
+	for _, log := range receipt.Logs {
+		if log == nil || log.BlockNumber == 0 {
+			continue
+		}
+		if endpoint != (common.Address{}) && log.Address != endpoint {
+			continue
+		}
+		record, err := indexer.PacketRecordFromSentLog(*log)
+		if err != nil || record.GUID != packet.GUID {
+			continue
+		}
+		if err := validateReceiptPacket(packet, record); err != nil {
+			continue
+		}
+		updated := packet
+		updated.SrcBlockNumber = log.BlockNumber
+		updated.SrcLogIndex = log.Index
+		return updated, true
+	}
+	return db.PacketRecord{}, false
 }
 
 // BuildVerifyCalldata ABI-encodes OpenDVN.submitVerification for active DVN mode.

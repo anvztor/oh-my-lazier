@@ -468,6 +468,57 @@ func (s *Store) updateDVNStatus(ctx context.Context, update dvnStatusUpdate) err
 	return nil
 }
 
+// MarkDVNReorgDetectedWithCoordinates records the reorg transition AND the
+// re-included source coordinates in one transaction. Two separate commits
+// would leave a window where another worker instance completes the
+// REORG_DETECTED -> WAITING_CONFIRMATIONS -> QUORUM_CHECKING round trip (the
+// OLD block is deep, so the confirmation gate passes instantly) before the
+// coordinates land — producing a QUORUM_CHECKING job with fresh coordinates
+// whose next receipt pass advances to verify without ever gating the NEW
+// block's depth. The status CAS still guards against a raced transition; the
+// coordinate write CASes on the old coordinates so a concurrent refresh (for
+// example the source indexer rescanning the block) is never clobbered.
+func (s *Store) MarkDVNReorgDetectedWithCoordinates(ctx context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte, srcBlockNumber uint64, srcLogIndex uint, expectedSrcBlockNumber uint64, expectedSrcLogIndex uint) error {
+	if guid == (common.Hash{}) {
+		return errors.New("dvn job guid is required")
+	}
+	if expectedStatus == "" {
+		return errors.New("dvn expected status is required")
+	}
+	lastErrorArg := any(nil)
+	if reason != "" {
+		lastErrorArg = reason
+	}
+	quorumResultArg := any(nil)
+	if len(quorumResult) != 0 {
+		quorumResultArg = string(quorumResult)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+		UPDATE dvn_jobs
+		SET status = $1, last_error = $4, quorum_result = COALESCE($5::jsonb, quorum_result), updated_at = now()
+		WHERE guid = $2 AND status = $3
+	`, string(packets.DVNReorgDetected), guid.Bytes(), expectedStatus, lastErrorArg, quorumResultArg)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("dvn job %s is not in status %s", guid, expectedStatus)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE packets
+		SET src_block_number = $1, src_log_index = $2, updated_at = now()
+		WHERE guid = $3 AND src_block_number = $4 AND src_log_index = $5
+	`, int64(srcBlockNumber), int64(srcLogIndex), guid.Bytes(), int64(expectedSrcBlockNumber), int64(expectedSrcLogIndex)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // DVNWorkItem is a packet plus its DVN job state selected for processing.
 type DVNWorkItem struct {
 	Packet PacketRecord
