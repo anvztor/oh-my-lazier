@@ -155,10 +155,16 @@ contract ReceiveUlnMock {
     }
 }
 
+/// @notice Minimal test-runner cheatcode surface (foundry-compatible EDR).
+interface TestVm {
+    function warp(uint256 newTimestamp) external;
+}
+
 contract OpenWorkersTest {
     uint32 internal constant DST_EID = 40449;
     uint32 internal constant ALT_DST_EID = 40161;
     address internal constant OAPP = address(0x2002);
+    TestVm internal constant vm = TestVm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
     OpenExecutor internal executor;
     OpenDVN internal dvn;
@@ -340,7 +346,10 @@ contract OpenWorkersTest {
         );
     }
 
-    function test_priceFeedRejectsNonMonotonicSnapshot() public {
+    function test_priceFeedSkipsSupersededSnapshotWithoutRevertingBatch() public {
+        // The default test timestamp is too small to express an older-but-valid
+        // snapshot (updatedAt = 0 is invalid), so pin a realistic clock first.
+        vm.warp(1_000_000);
         WorkerTypes.PriceSnapshot memory first = WorkerTypes.PriceSnapshot({
             dstGasPriceInSrcToken: 20 gwei,
             dstDataFeePerByteInSrcToken: 0,
@@ -349,17 +358,34 @@ contract OpenWorkersTest {
         });
         setPriceSnapshot(priceFeed, DST_EID, first);
 
-        WorkerTypes.PriceSnapshot memory older = WorkerTypes.PriceSnapshot({
-            dstGasPriceInSrcToken: 10 gwei,
-            dstDataFeePerByteInSrcToken: 0,
-            updatedAt: uint64(block.timestamp - 1),
-            staleAfter: 30 minutes
+        // A batch carrying one superseded entry must not revert: the stored
+        // newer snapshot is kept and the batch's fresh entries still apply.
+        WorkerTypes.PriceSnapshotUpdate[] memory updates = new WorkerTypes.PriceSnapshotUpdate[](2);
+        updates[0] = WorkerTypes.PriceSnapshotUpdate({
+            dstEid: DST_EID,
+            snapshot: WorkerTypes.PriceSnapshot({
+                dstGasPriceInSrcToken: 10 gwei,
+                dstDataFeePerByteInSrcToken: 0,
+                updatedAt: uint64(block.timestamp - 1),
+                staleAfter: 30 minutes
+            })
         });
-        expectRevert(
-            address(priceFeed),
-            abi.encodeCall(priceFeed.setPriceSnapshot, (singleUpdate(DST_EID, older))),
-            WorkerErrors.InvalidPriceSnapshot.selector
-        );
+        updates[1] = WorkerTypes.PriceSnapshotUpdate({
+            dstEid: ALT_DST_EID,
+            snapshot: WorkerTypes.PriceSnapshot({
+                dstGasPriceInSrcToken: 40 gwei,
+                dstDataFeePerByteInSrcToken: 4 gwei,
+                updatedAt: uint64(block.timestamp),
+                staleAfter: 30 minutes
+            })
+        });
+        priceFeed.setPriceSnapshot(updates);
+
+        (uint256 dstGasPriceInSrcToken,, uint64 updatedAt,) = priceFeed.priceSnapshot(DST_EID);
+        require(dstGasPriceInSrcToken == 20 gwei, "superseded entry overwrote the newer snapshot");
+        require(updatedAt == uint64(block.timestamp), "superseded entry changed the stored timestamp");
+        (dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(ALT_DST_EID);
+        require(dstGasPriceInSrcToken == 40 gwei, "fresh entry in a batch with a superseded entry was not stored");
 
         // A snapshot with an equal (non-decreasing) timestamp is still accepted.
         WorkerTypes.PriceSnapshot memory same = WorkerTypes.PriceSnapshot({
@@ -369,7 +395,7 @@ contract OpenWorkersTest {
             staleAfter: 30 minutes
         });
         setPriceSnapshot(priceFeed, DST_EID, same);
-        (uint256 dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(DST_EID);
+        (dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(DST_EID);
         require(dstGasPriceInSrcToken == 30 gwei, "equal-timestamp update was not stored");
     }
 

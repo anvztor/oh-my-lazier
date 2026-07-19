@@ -2793,7 +2793,10 @@ function optionalMarketDataBaseURL(
   // valid escapes, so only inspect the authority after the last "@".
   const authority = baseURL.slice("https://".length).split(/[/?#]/)[0];
   const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
-  if (hostPort.includes("%")) {
+  // WHATWG "repairs" an empty raw authority (https:///example.com parses with
+  // hostname example.com), but Go's net/url sees an empty host and rejects it
+  // at worker startup — the profile must fail here, not there.
+  if (!hostPort || hostPort.includes("%")) {
     throw new Error(
       `${label} must be an absolute HTTPS URL without query or fragment`,
     );

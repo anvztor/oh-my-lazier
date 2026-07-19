@@ -27,6 +27,12 @@ contract OpenPriceFeed is Ownable {
     /// @param allowed Whether the address may submit price snapshots.
     event SubmitterSet(address indexed submitter, bool allowed);
 
+    /// @notice Emitted when a batch entry is skipped because a newer snapshot is already stored.
+    /// @param dstEid Destination endpoint ID of the skipped entry.
+    /// @param updatedAt Timestamp of the skipped snapshot.
+    /// @param storedUpdatedAt Timestamp of the snapshot already stored.
+    event PriceSnapshotSkipped(uint32 indexed dstEid, uint64 updatedAt, uint64 storedUpdatedAt);
+
     /// @notice Initializes price feed ownership and initial submitters.
     /// @param initialOwner Initial owner address.
     /// @param initialSubmitters Addresses allowed to submit price snapshots.
@@ -49,8 +55,12 @@ contract OpenPriceFeed is Ownable {
     }
 
     /// @notice Stores shared market price inputs for destination endpoints.
-    /// @dev Each destination snapshot's `updatedAt` must be non-decreasing, so a
-    /// reordered or delayed submission cannot overwrite a newer price with an older one.
+    /// @dev Each destination snapshot's `updatedAt` must be non-decreasing.
+    /// A superseded entry (older than the stored snapshot) is skipped instead of
+    /// reverting: with multiple authorized submitters, one submitter can land a
+    /// newer snapshot for one destination while another submitter's batch is in
+    /// flight, and reverting would make that immutable batch calldata fail
+    /// forever, discarding its still-fresh entries for other destinations.
     /// @param updates Destination endpoint price snapshots to store.
     function setPriceSnapshot(WorkerTypes.PriceSnapshotUpdate[] calldata updates) external onlySubmitter {
         if (updates.length == 0) revert WorkerErrors.InvalidPriceSnapshotBatch();
@@ -60,9 +70,13 @@ contract OpenPriceFeed is Ownable {
             if (
                 snapshot.dstGasPriceInSrcToken == 0 || snapshot.updatedAt == 0 || snapshot.updatedAt > block.timestamp
                     || snapshot.staleAfter == 0 || snapshot.staleAfter > MAX_PRICE_SNAPSHOT_STALE_AFTER
-                    || snapshot.updatedAt < priceSnapshot[update.dstEid].updatedAt
             ) {
                 revert WorkerErrors.InvalidPriceSnapshot(update.dstEid);
+            }
+            uint64 storedUpdatedAt = priceSnapshot[update.dstEid].updatedAt;
+            if (snapshot.updatedAt < storedUpdatedAt) {
+                emit PriceSnapshotSkipped(update.dstEid, snapshot.updatedAt, storedUpdatedAt);
+                continue;
             }
             priceSnapshot[update.dstEid] = snapshot;
             emit PriceSnapshotSet(update.dstEid, snapshot);

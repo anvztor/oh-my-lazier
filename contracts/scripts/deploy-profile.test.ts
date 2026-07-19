@@ -353,6 +353,8 @@ test("normalizeProfile rejects base URLs that parse in JS but not in the Go work
     "https://example.com/%",
     "https://%65xample.com",
     "https://example%2ecom",
+    "https:///example.com",
+    "https://user@/path",
   ];
   for (const baseURL of rejected) {
     const input = baseProfile();
