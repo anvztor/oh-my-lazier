@@ -82,6 +82,10 @@ type ChainSpec = {
   name: string;
   hostRpcUrl: string;
   containerRpcUrl: string;
+  // When set, all txs on this chain are sent as LEGACY with this gasPrice (wei).
+  // goat-geth's own tooling deploys with --legacy; EIP-1559 txs can be dropped
+  // from its mempool. Set REGTEST_B_GAS_PRICE for chain B.
+  gasPrice?: bigint;
 };
 
 type ChainDeployment = ChainSpec & {
@@ -101,7 +105,11 @@ type ChainDeployment = ChainSpec & {
 type Clients = {
   publicClient: PublicClient;
   walletClient: WalletClient;
+  gasPrice?: bigint;
 };
+
+// goat-geth blocks are ~2s; give receipts generous headroom + polling.
+const receiptOpts = { timeout: 180_000, pollingInterval: 1_000 } as const;
 
 const tmpDir = optionalEnv("REGTEST_TMP_DIR", "tmp/regtest");
 const deployerPrivateKey = normalizePrivateKey(
@@ -166,6 +174,7 @@ const chainSpecs: readonly ChainSpec[] = [
     name: optionalEnv("REGTEST_A_NAME", "evm-regtest-a"),
     hostRpcUrl: optionalEnv("REGTEST_A_HOST_RPC_URL", "http://127.0.0.1:18545"),
     containerRpcUrl: optionalEnv("REGTEST_A_CONTAINER_RPC_URL", "http://anvil-a:8545"),
+    gasPrice: optionalGasPrice("REGTEST_A_GAS_PRICE"),
   },
   {
     key: "b",
@@ -174,8 +183,14 @@ const chainSpecs: readonly ChainSpec[] = [
     name: optionalEnv("REGTEST_B_NAME", "goat-regtest-b"),
     hostRpcUrl: optionalEnv("REGTEST_B_HOST_RPC_URL", "http://127.0.0.1:18546"),
     containerRpcUrl: optionalEnv("REGTEST_B_CONTAINER_RPC_URL", "http://goat-geth:8545"),
+    gasPrice: optionalGasPrice("REGTEST_B_GAS_PRICE"),
   },
 ];
+
+function optionalGasPrice(name: string): bigint | undefined {
+  const v = optionalEnv(name, "");
+  return v === "" ? undefined : BigInt(v);
+}
 
 await mkdir(tmpDir, { recursive: true });
 
@@ -332,10 +347,15 @@ async function deploy(clients: Clients, label: string, artifact: { abi: Abi; byt
     args: [...args],
     account: deployer,
     chain: clients.walletClient.chain,
+    ...(clients.gasPrice === undefined ? {} : { gasPrice: clients.gasPrice }),
   });
-  const address = await waitForContract(clients.publicClient, hash);
-  console.error(`[regtest-deploy] ${label}: ${address}`);
-  return getAddress(address);
+  const receipt = await clients.publicClient.waitForTransactionReceipt({ hash, ...receiptOpts });
+  if (receipt.status !== "success" || receipt.contractAddress == null) {
+    throw new Error(`${label} deploy ${hash} failed`);
+  }
+  await waitForContract(clients.publicClient, hash);
+  console.error(`[regtest-deploy] ${label}: ${receipt.contractAddress}`);
+  return getAddress(receipt.contractAddress);
 }
 
 async function tx(clients: Clients, label: string, address: Address, abi: Abi, functionName: string, args: readonly unknown[]): Promise<void> {
@@ -346,8 +366,9 @@ async function tx(clients: Clients, label: string, address: Address, abi: Abi, f
     args: [...args],
     account: deployer,
     chain: clients.walletClient.chain,
+    ...(clients.gasPrice === undefined ? {} : { gasPrice: clients.gasPrice }),
   });
-  const receipt = await clients.publicClient.waitForTransactionReceipt({ hash });
+  const receipt = await clients.publicClient.waitForTransactionReceipt({ hash, ...receiptOpts });
   if (receipt.status !== "success") {
     throw new Error(`${label} transaction ${hash} failed`);
   }
@@ -365,6 +386,7 @@ function clientsFor(spec: ChainSpec): Clients {
   return {
     publicClient: createPublicClient({ chain, transport }),
     walletClient: createWalletClient({ account: deployer, chain, transport }),
+    gasPrice: spec.gasPrice,
   };
 }
 
