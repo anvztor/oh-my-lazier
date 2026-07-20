@@ -1,0 +1,263 @@
+<title>GOATED regtest bridge — deploy handoff</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ink: #12161c;
+    --ink-soft: #3a434f;
+    --muted: #66717f;
+    --line: #e4e7ec;
+    --line-strong: #cdd3db;
+    --surface: #ffffff;
+    --surface-2: #f6f8fa;
+    --bg: #eef1f5;
+    --gold: #b6801f;        /* GOAT accent, used sparingly */
+    --gold-soft: #f5ecd6;
+    --cyan: #17708a;        /* LayerZero mesh */
+    --cyan-soft: #e0f0f4;
+    --ok: #1f7a4d;
+    --ok-soft: #e0f0e7;
+    --warn: #9a5a12;
+    --warn-soft: #f7ecd9;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --r: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e9edf2; --ink-soft: #c2cad4; --muted: #8a94a2;
+      --line: #262c34; --line-strong: #363d47;
+      --surface: #151a20; --surface-2: #1b2128; --bg: #0e1116;
+      --gold: #e0a94e; --gold-soft: #2c2412;
+      --cyan: #5cc0d8; --cyan-soft: #12242a;
+      --ok: #5cc08a; --ok-soft: #122419;
+      --warn: #e0a94e; --warn-soft: #2c2412;
+    }
+  }
+  :root[data-theme="light"] {
+    --ink: #12161c; --ink-soft: #3a434f; --muted: #66717f;
+    --line: #e4e7ec; --line-strong: #cdd3db;
+    --surface: #ffffff; --surface-2: #f6f8fa; --bg: #eef1f5;
+    --gold: #b6801f; --gold-soft: #f5ecd6; --cyan: #17708a; --cyan-soft: #e0f0f4;
+    --ok: #1f7a4d; --ok-soft: #e0f0e7; --warn: #9a5a12; --warn-soft: #f7ecd9;
+  }
+  :root[data-theme="dark"] {
+    --ink: #e9edf2; --ink-soft: #c2cad4; --muted: #8a94a2;
+    --line: #262c34; --line-strong: #363d47;
+    --surface: #151a20; --surface-2: #1b2128; --bg: #0e1116;
+    --gold: #e0a94e; --gold-soft: #2c2412; --cyan: #5cc0d8; --cyan-soft: #12242a;
+    --ok: #5cc08a; --ok-soft: #122419; --warn: #e0a94e; --warn-soft: #2c2412;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.6;
+    font-size: 16px; letter-spacing: -0.003em;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: clamp(20px, 4vw, 56px) clamp(16px, 4vw, 40px) 80px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 28px; margin-bottom: 36px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--cyan); margin: 0 0 12px; }
+  h1 { font-size: clamp(26px, 4vw, 38px); line-height: 1.12; margin: 0 0 14px; font-weight: 680; text-wrap: balance; letter-spacing: -0.02em; }
+  .lede { font-size: 17px; color: var(--ink-soft); margin: 0; max-width: 68ch; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft); }
+  .badge.ok { background: var(--ok-soft); border-color: transparent; color: var(--ok); }
+  .badge.dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  h2 { font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 52px 0 18px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
+  h2 .n { color: var(--gold); margin-right: 10px; }
+  p { margin: 0 0 14px; max-width: 72ch; }
+  a { color: var(--cyan); }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--surface-2); border: 1px solid var(--line); padding: 1px 5px; border-radius: 5px; }
+  strong { font-weight: 640; color: var(--ink); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 20px 22px; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .fig { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 10px; overflow-x: auto; }
+  .fig svg { display: block; min-width: 640px; margin: 0 auto; }
+  figcaption { color: var(--muted); font-size: 13px; text-align: center; margin-top: 6px; font-family: var(--mono); }
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r); }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  thead th { background: var(--surface-2); font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.addr { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .role { font-family: var(--mono); font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--cyan-soft); color: var(--cyan); }
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  ol.steps > li { counter-increment: s; position: relative; padding: 14px 16px 14px 52px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); }
+  ol.steps > li::before { content: counter(s); position: absolute; left: 14px; top: 14px; width: 26px; height: 26px; border-radius: 7px; background: var(--gold-soft); color: var(--gold); font-family: var(--mono); font-size: 13px; font-weight: 700; display: grid; place-items: center; }
+  .li-t { font-weight: 600; margin: 0 0 6px; font-size: 14.5px; }
+  pre { margin: 8px 0 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; color: var(--ink-soft); }
+  pre .c { color: var(--muted); }
+  .note { border-left: 3px solid var(--gold); background: var(--gold-soft); border-radius: 0 8px 8px 0; padding: 12px 16px; margin: 16px 0; font-size: 14px; color: var(--ink-soft); }
+  .note.cyan { border-color: var(--cyan); background: var(--cyan-soft); }
+  ul.tight { margin: 6px 0 0; padding-left: 20px; }
+  ul.tight li { margin-bottom: 5px; }
+  footer { margin-top: 60px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; font-family: var(--mono); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  .kv { display: flex; flex-direction: column; gap: 3px; }
+  .kv .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .kv .v { font-weight: 600; }
+  @media (max-width: 560px) { body { font-size: 15px; } th, td { padding: 8px 10px; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">dev-bugfix · handoff → regtest-ops</p>
+    <h1>GOATED OFT regtest bridge — deploy &amp; wiring handoff</h1>
+    <p class="lede">A LayerZero&nbsp;V2 OFT bridge for GOATED across two EVM regtest chains, relayed end-to-end by <strong>oh-my-lazier</strong> (OpenDVN&nbsp;+&nbsp;OpenExecutor). Deploy scripts, worker configs, and a compose fragment — validated bidirectionally on two local chains before goat-geth.</p>
+    <div class="badges">
+      <span class="badge ok dot">builds green ×3</span>
+      <span class="badge ok dot">A→B delivered</span>
+      <span class="badge ok dot">B→A delivered</span>
+      <span class="badge">autonomous 2-worker relay</span>
+      <span class="badge">2026-07-20</span>
+    </div>
+  </header>
+
+  <h2><span class="n">01</span>Topology</h2>
+  <p>Chain&nbsp;A (EVM-regtest) is the source and holds the GOATED supply; chain&nbsp;B is goat-geth. GOATED here is oh-my-lazier's mintable <strong>TestOFT</strong>, mirroring testnet3's live "GOATED TestOFT" — preminted 1,000,000 on A, 0 on B. Two OpenDVN instances secure each pathway; two worker processes drive them.</p>
+  <figure class="fig">
+    <svg viewBox="0 0 720 300" role="img" aria-label="Two EVM chains bridged by LayerZero with two oh-my-lazier workers">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="var(--cyan)"/>
+        </marker>
+        <style>
+          .chip{fill:var(--surface-2);stroke:var(--line-strong);}
+          .chl{fill:var(--ink);font:600 13px var(--sans);}
+          .csub{fill:var(--muted);font:11px var(--mono);}
+          .comp{fill:var(--surface);stroke:var(--line-strong);}
+          .compl{fill:var(--ink-soft);font:11px var(--mono);}
+          .flow{stroke:var(--cyan);stroke-width:2;fill:none;}
+          .flowl{fill:var(--cyan);font:600 11px var(--mono);}
+          .wbox{fill:var(--gold-soft);stroke:var(--gold);}
+          .wl{fill:var(--gold);font:600 11px var(--mono);}
+        </style>
+      </defs>
+      <!-- Chain A -->
+      <rect class="chip" x="24" y="40" width="210" height="150" rx="10"/>
+      <text class="chl" x="40" y="66">Chain A · EVM-regtest</text>
+      <text class="csub" x="40" y="84">eid 90101 · source</text>
+      <rect class="comp" x="40" y="98" width="178" height="26" rx="6"/><text class="compl" x="50" y="115">EndpointV2 · Send/RecvUln</text>
+      <rect class="comp" x="40" y="130" width="178" height="26" rx="6"/><text class="compl" x="50" y="147">GOATED TestOFT · 1,000,000</text>
+      <rect class="comp" x="40" y="162" width="178" height="20" rx="6"/><text class="compl" x="50" y="176">OpenExecutor · OpenDVN ×2</text>
+      <!-- Chain B -->
+      <rect class="chip" x="486" y="40" width="210" height="150" rx="10"/>
+      <text class="chl" x="502" y="66">Chain B · goat-geth</text>
+      <text class="csub" x="502" y="84">eid 90102 · dest</text>
+      <rect class="comp" x="502" y="98" width="178" height="26" rx="6"/><text class="compl" x="512" y="115">EndpointV2 · Send/RecvUln</text>
+      <rect class="comp" x="502" y="130" width="178" height="26" rx="6"/><text class="compl" x="512" y="147">GOATED TestOFT · mint on recv</text>
+      <rect class="comp" x="502" y="162" width="178" height="20" rx="6"/><text class="compl" x="512" y="176">OpenExecutor · OpenDVN ×2</text>
+      <!-- flows -->
+      <path class="flow" d="M234 118 L486 118" marker-end="url(#ar)"/>
+      <text class="flowl" x="360" y="110" text-anchor="middle">send A→B (burn)</text>
+      <path class="flow" d="M486 150 L234 150" marker-end="url(#ar)"/>
+      <text class="flowl" x="360" y="168" text-anchor="middle">send B→A</text>
+      <!-- workers -->
+      <rect class="wbox" x="250" y="222" width="220" height="30" rx="8"/>
+      <text class="wl" x="360" y="241" text-anchor="middle">worker-1 · Executor + OpenDVN #1</text>
+      <rect class="wbox" x="250" y="258" width="220" height="26" rx="8"/>
+      <text class="wl" x="360" y="275" text-anchor="middle">worker-2 · OpenDVN #2</text>
+      <path class="flow" style="stroke-dasharray:3 3;opacity:.7" d="M180 190 C180 220 250 232 250 237"/>
+      <path class="flow" style="stroke-dasharray:3 3;opacity:.7" d="M540 190 C540 220 470 232 470 237"/>
+      <text class="csub" x="360" y="212" text-anchor="middle">oh-my-lazier · indexes both chains, verifies + delivers</text>
+    </svg>
+    <figcaption>Two required DVNs per pathway; each worker verifies exactly one. They coordinate via on-chain state.</figcaption>
+  </figure>
+
+  <h2><span class="n">02</span>Why two workers</h2>
+  <div class="grid2">
+    <div class="card">
+      <p class="li-t">The runtime rule</p>
+      <p style="margin:0;font-size:14px;color:var(--ink-soft)">The oh-my-lazier worker <strong>hard-requires ≥2 required DVNs</strong> in the receive-ULN config (<code>go/internal/dvn/dvn.go</code>) and each process verifies exactly <strong>one</strong> DVN. A single-DVN pathway is paused to <code>MANUAL_REVIEW</code> at runtime — <code>--skip-onchain-check</code> does not bypass it.</p>
+    </div>
+    <div class="card">
+      <p class="li-t">The shape</p>
+      <p style="margin:0;font-size:14px;color:var(--ink-soft)"><strong>worker-1</strong> runs OpenExecutor + the primary OpenDVN; <strong>worker-2</strong> runs the secondary OpenDVN. Separate databases; they coordinate purely through on-chain <code>PayloadVerified</code> events. The executor delivers once both DVNs have verified.</p>
+    </div>
+  </div>
+  <div class="note cyan">Enforced options on the OApp already supply the lzReceive gas (250,000). Callers must send with <strong>empty extraOptions</strong> — adding a lzReceive option too triggers a duplicate-option revert (<code>0x56b04d0d</code>).</div>
+
+  <h2><span class="n">03</span>Run it</h2>
+  <p>From <code>~/workspace/goat-dev/oh-my-lazier</code>. Dependencies installed once via <code>npm ci</code>; Go 1.23+ (auto-fetches 1.26.4 per <code>go.mod</code>).</p>
+  <ol class="steps">
+    <li>
+      <p class="li-t">Bring up both chains — chain A must produce blocks continuously</p>
+      <pre><span class="c"># chain A: any source EVM. On anvil, use --block-time so packets confirm.</span>
+anvil --chain-id 31337 --block-time 2 --port 18545
+<span class="c"># chain B: goat-geth from the goat-regtest stack (RPC :8545)</span></pre>
+    </li>
+    <li>
+      <p class="li-t">Fund deployer + both workers on goat-geth</p>
+      <pre><span class="c"># funder = 0xbc00…dCA2 (goat-regtest README key)</span>
+cast send 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --value 100ether \
+  --private-key 0xdd11c216…107f --rpc-url http://127.0.0.1:8545 --legacy
+<span class="c"># repeat for 0x7099…79C8 (worker-1) and 0x3C44…93BC (worker-2)</span></pre>
+    </li>
+    <li>
+      <p class="li-t">Deploy + wire both chains, emit configs</p>
+      <pre>REGTEST_A_HOST_RPC_URL=http://127.0.0.1:18545 REGTEST_A_CHAIN_ID=31337 \
+REGTEST_B_HOST_RPC_URL=http://127.0.0.1:8545  REGTEST_B_CHAIN_ID=<span class="c">&lt;goat-geth chainId&gt;</span> \
+REGTEST_B_CONTAINER_RPC_URL=http://goat-regtest-geth-node:8545 \
+npm run regtest:deploy</pre>
+    </li>
+    <li>
+      <p class="li-t">Generate the two worker keystores</p>
+      <pre>E2E_WORKER_PRIVATE_KEY=0x59c6995e… REGTEST_KEYSTORE_PASSWORD=&lt;pw&gt; \
+  go run ./go/cmd/e2ekeystore -out tmp/regtest/worker-1-keystore.json -password-env REGTEST_KEYSTORE_PASSWORD
+E2E_WORKER_PRIVATE_KEY=0x5de4111a… REGTEST_KEYSTORE_PASSWORD=&lt;pw&gt; \
+  go run ./go/cmd/e2ekeystore -out tmp/regtest/worker-2-keystore.json -password-env REGTEST_KEYSTORE_PASSWORD</pre>
+    </li>
+    <li>
+      <p class="li-t">Start Postgres (2 DBs) + both workers</p>
+      <pre>REGTEST_KEYSTORE_PASSWORD=&lt;pw&gt; \
+  docker compose -f deploy/regtest/docker-compose.regtest.yml up -d --build</pre>
+    </li>
+    <li>
+      <p class="li-t">Smoke test a GOATED transfer</p>
+      <pre>REGTEST_A_HOST_RPC_URL=http://127.0.0.1:18545 \
+REGTEST_B_HOST_RPC_URL=http://127.0.0.1:8545 \
+npm run regtest:send            <span class="c"># A→B ; add REGTEST_SEND_DIRECTION=ba for reverse</span></pre>
+    </li>
+  </ol>
+
+  <h2><span class="n">04</span>Identities &amp; EIDs</h2>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Role</th><th>Address</th><th>Key (throwaway)</th><th>Funding</th></tr></thead>
+      <tbody>
+        <tr><td><span class="role">deployer</span></td><td class="addr">0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266</td><td class="addr">0xac0974…2ff80 (anvil[0])</td><td>both chains</td></tr>
+        <tr><td><span class="role">worker-1</span></td><td class="addr">0x70997970C51812dc3A010C7d01b50e0d17dc79C8</td><td class="addr">0x59c699…8690d (anvil[1])</td><td>both chains</td></tr>
+        <tr><td><span class="role">worker-2</span></td><td class="addr">0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC</td><td class="addr">0x5de411…b365a (anvil[2])</td><td>both chains</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p style="margin-top:14px"><strong>EIDs:</strong> chain&nbsp;A = <code>90101</code>, chain&nbsp;B = <code>90102</code>. Contract addresses are minted per run into <code>tmp/regtest/deployments.json</code> (Endpoint, Send/ReceiveUln302, GOATED OFT, OpenExecutor, OpenDVN ×2, OpenPriceFeed on each chain).</p>
+  <div class="note">goat-geth genesis funds only <code>0x29cF…468e</code>, <code>0x43E8…3FF7</code>, <code>0xbc00…dCA2</code>. The three addresses above must be funded on chain&nbsp;B before deploy — see step&nbsp;2.</div>
+
+  <h2><span class="n">05</span>Validation</h2>
+  <p>End-to-end on two local anvils (chainId 31337 / 31338), two real oh-my-lazier workers + Postgres, interval mining 2s. Fully autonomous — no manual DVN or delivery steps.</p>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Direction</th><th>Amount</th><th>Result</th><th class="num">Latency</th><th>Source tx</th></tr></thead>
+      <tbody>
+        <tr><td>A → B</td><td class="num">1.0 GOATED</td><td><span class="badge ok dot" style="font-size:11px">delivered</span></td><td class="num">28.8&nbsp;s</td><td class="addr">0xfd40b4…efcbc8</td></tr>
+        <tr><td>B → A</td><td class="num">0.5 GOATED</td><td><span class="badge ok dot" style="font-size:11px">delivered</span></td><td class="num">26.6&nbsp;s</td><td class="addr">0x4e5e0a…a5646f</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="n">06</span>What we need from regtest-ops</h2>
+  <ul class="tight">
+    <li>goat-geth live <code>eth_chainId</code> → fill <code>REGTEST_B_CHAIN_ID</code>.</li>
+    <li>Confirm goat-geth host RPC (<code>http://127.0.0.1:8545</code>) and container name (<code>goat-regtest-geth-node</code>) on <code>goat_network</code>.</li>
+    <li>A source EVM for chain&nbsp;A (anvil, chainId 31337, <code>--block-time 2</code>, on <code>goat_network</code>) — or say the word and dev-bugfix runs it.</li>
+    <li>Run the three chain-B funding sends (step&nbsp;2), or authorize dev-bugfix to.</li>
+  </ul>
+
+  <footer>
+    <span class="kv"><span class="k">deploy</span><span class="v">contracts/scripts/regtest-deploy.ts</span></span>
+    <span class="kv"><span class="k">send</span><span class="v">contracts/scripts/regtest-send.ts</span></span>
+    <span class="kv"><span class="k">compose</span><span class="v">deploy/regtest/docker-compose.regtest.yml</span></span>
+    <span class="kv"><span class="k">status</span><span class="v">_coord/dev-bugfix.status.json</span></span>
+  </footer>
+</div>

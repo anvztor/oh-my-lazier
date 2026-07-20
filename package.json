@@ -19,6 +19,8 @@
     "configure:open-workers-pathway": "hardhat ignition deploy ignition/modules/OpenWorkersPathwayConfig.ts",
     "configure:open-dvn-pathway": "hardhat ignition deploy ignition/modules/OpenDVNPathwayConfig.ts",
     "deploy:profile": "tsx contracts/scripts/deploy-profile.ts",
+    "regtest:deploy": "tsx contracts/scripts/regtest-deploy.ts",
+    "regtest:send": "tsx contracts/scripts/regtest-send.ts",
     "render:oft-pathway-params": "tsx contracts/scripts/render-oft-pathway-params.ts",
     "configure:workers": "tsx contracts/scripts/configure-workers.ts",
     "generate:lzabi": "npm run compile && tsx contracts/scripts/generate-lzabi.ts",

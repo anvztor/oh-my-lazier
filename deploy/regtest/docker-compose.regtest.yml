@@ -1,0 +1,88 @@
+# oh-my-lazier GOATED regtest relay: Postgres + two worker instances.
+#
+#   worker-1 = OpenExecutor + primary OpenDVN
+#   worker-2 = secondary OpenDVN  (the worker hard-requires >=2 required DVNs,
+#              and each worker process verifies exactly one DVN)
+#
+# Prereqs produced by `npm run regtest:deploy` (contracts/scripts/regtest-deploy.ts):
+#   ./tmp/regtest/worker-1.container.yaml
+#   ./tmp/regtest/worker-2.container.yaml
+#   ./tmp/regtest/worker-1-keystore.json
+#   ./tmp/regtest/worker-2-keystore.json
+#
+# The two workers must reach BOTH EVM chains. Set the container RPC URLs when you
+# run regtest-deploy so they resolve on `goat_network`:
+#   REGTEST_A_CONTAINER_RPC_URL=http://<chain-A-anvil-container>:8545
+#   REGTEST_B_CONTAINER_RPC_URL=http://goat-regtest-geth-node:8545   # goat-geth container_name
+#
+# Bring up:  docker compose -f deploy/regtest/docker-compose.regtest.yml up -d --build
+# The workers run with --skip-onchain-check (regtest ULN uses the 2 OpenDVN
+# instances; the startup check's independent-DVN heuristic is advisory here).
+
+name: goated-regtest-relay
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: goated-regtest-postgres
+    environment:
+      POSTGRES_DB: laz_worker_1
+      POSTGRES_USER: laz_worker
+      POSTGRES_PASSWORD: laz_worker
+    ports:
+      - "55433:5432"
+    volumes:
+      - ./initdb.sql:/docker-entrypoint-initdb.d/10-initdb.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U laz_worker -d laz_worker_1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 3s
+      retries: 12
+    networks:
+      - goat_network
+
+  worker-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: oh-my-lazier-worker:regtest
+    container_name: goated-regtest-worker-1
+    command: ["-config", "/app/tmp/regtest/worker-1.container.yaml", "-skip-onchain-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://laz_worker:laz_worker@postgres:5432/laz_worker_1?sslmode=disable
+      REGTEST_KEYSTORE_PASSWORD: ${REGTEST_KEYSTORE_PASSWORD:-regtest-local-pw}
+    ports:
+      - "19190:9090"
+    volumes:
+      - ../../tmp/regtest:/app/tmp/regtest:ro
+    networks:
+      - goat_network
+
+  worker-2:
+    image: oh-my-lazier-worker:regtest
+    container_name: goated-regtest-worker-2
+    command: ["-config", "/app/tmp/regtest/worker-2.container.yaml", "-skip-onchain-check"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker-1:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgres://laz_worker:laz_worker@postgres:5432/laz_worker_2?sslmode=disable
+      REGTEST_KEYSTORE_PASSWORD: ${REGTEST_KEYSTORE_PASSWORD:-regtest-local-pw}
+    ports:
+      - "19191:9090"
+    volumes:
+      - ../../tmp/regtest:/app/tmp/regtest:ro
+    networks:
+      - goat_network
+
+# goat_network is created by the goat-regtest stack (docker-compose-goat-geth.yml).
+# Keep it external so the workers can reach goat-geth by container name.
+networks:
+  goat_network:
+    external: true
