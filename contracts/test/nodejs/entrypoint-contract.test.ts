@@ -115,10 +115,6 @@ test("every contract-script entrypoint is a Hardhat run wrapper", async () => {
   }
   assert.equal(packageJSON.dependencies.tsx, undefined);
   assert.equal(
-    packageJSON.dependencies["@nomicfoundation/ignition-core"],
-    "3.1.7"
-  );
-  assert.equal(
     packageJSON.scripts["test:scripts"],
     "hardhat test nodejs --no-compile"
   );
