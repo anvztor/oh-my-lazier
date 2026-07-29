@@ -350,10 +350,12 @@ func (a *App) priceBotWithSources(store *db.Store, registry *chain.Registry, sou
 		Interval:             time.Duration(a.cfg.Pricing.IntervalSeconds) * time.Second,
 		StaleAfter:           time.Duration(a.cfg.Pricing.StaleAfterSeconds) * time.Second,
 		MaxDeviation:         a.cfg.Pricing.MaxDeviationBps,
+		MinUpdateDeviation:   a.cfg.Pricing.MinUpdateDeviationBps,
+		Heartbeat:            time.Duration(a.cfg.Pricing.HeartbeatSeconds) * time.Second,
 		SourceRequestTimeout: time.Duration(a.cfg.Pricing.SourceRequestTimeoutSeconds) * time.Second,
 		GasSpikeBps:          a.cfg.Pricing.GasSpikeBps,
 	}
-	return pricing.NewWithDependencies(store, registry, settings, sources, a.logger)
+	return pricing.NewWithDependencies(store, registry, settings, sources, pricing.NewOnChainPriceSnapshotReader(registry), a.logger)
 }
 
 func (a *App) priceSelectionPolicy() pricing.PriceSelectionPolicy {
