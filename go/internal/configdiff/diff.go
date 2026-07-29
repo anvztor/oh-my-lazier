@@ -227,6 +227,8 @@ type pricingConfigGlobal struct {
 	IntervalSeconds             uint64 `json:"interval_seconds"`
 	StaleAfterSeconds           uint64 `json:"stale_after_seconds"`
 	MaxDeviationBps             uint64 `json:"max_deviation_bps"`
+	MinUpdateDeviationBps       uint64 `json:"min_update_deviation_bps"`
+	HeartbeatSeconds            uint64 `json:"heartbeat_seconds"`
 	SourceRequestTimeoutSeconds uint64 `json:"source_request_timeout_seconds"`
 	GasSpikeBps                 uint64 `json:"gas_spike_bps"`
 	CoinMarketCapBaseURL        string `json:"coinmarketcap_base_url"`
@@ -254,6 +256,8 @@ func pricingGlobal(pricing config.PricingConfig) pricingConfigGlobal {
 		IntervalSeconds:             pricing.IntervalSeconds,
 		StaleAfterSeconds:           pricing.StaleAfterSeconds,
 		MaxDeviationBps:             pricing.MaxDeviationBps,
+		MinUpdateDeviationBps:       pricing.MinUpdateDeviationBps,
+		HeartbeatSeconds:            pricing.HeartbeatSeconds,
 		SourceRequestTimeoutSeconds: pricing.SourceRequestTimeoutSeconds,
 		GasSpikeBps:                 pricing.GasSpikeBps,
 		CoinMarketCapBaseURL:        pricing.CoinMarketCapBaseURL,

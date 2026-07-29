@@ -58,6 +58,13 @@ const config = defineConfig({
       url: configVariable("HOODI_RPC_URL"),
       accounts: [configVariable("HOODI_PRIVATE_KEY")],
     },
+    bscTestnet: {
+      type: "http",
+      chainType: "l1",
+      chainId: 97,
+      url: configVariable("BSCTESTNET_RPC_URL"),
+      accounts: [configVariable("BSCTESTNET_PRIVATE_KEY")],
+    },
   },
   ignition: {
     requiredConfirmations: 1,

@@ -836,6 +836,8 @@ test("renderWorkerConfig emits external OApps, active DVN signer, and worker con
   );
   assert.match(yaml, /native_asset_id: eth/);
   assert.doesNotMatch(yaml, /primary_source:/);
+  assert.match(yaml, /min_update_deviation_bps: 50/);
+  assert.match(yaml, /heartbeat_seconds: 900/);
   assert.match(yaml, /source_request_timeout_seconds: 10/);
   assert.match(yaml, /start_block_number: 123456/);
   assert.match(yaml, /start_block_number: 654321/);

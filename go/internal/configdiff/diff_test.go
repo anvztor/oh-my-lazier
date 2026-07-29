@@ -438,6 +438,8 @@ func validConfig() config.Config {
 			IntervalSeconds:             300,
 			StaleAfterSeconds:           1800,
 			MaxDeviationBps:             500,
+			MinUpdateDeviationBps:       50,
+			HeartbeatSeconds:            900,
 			SourceRequestTimeoutSeconds: 10,
 			GasSpikeBps:                 1000,
 			Chains: []config.PricingChainConfig{

@@ -628,6 +628,8 @@ function renderPricingConfig(profile: DeploymentProfile): string {
   interval_seconds: 300
   stale_after_seconds: 1800
   max_deviation_bps: ${profile.pricing.maxDeviationBps}
+  min_update_deviation_bps: 50
+  heartbeat_seconds: 900
   source_request_timeout_seconds: ${profile.pricing.sourceRequestTimeoutSeconds}
   gas_spike_bps: 1000
 ${renderOptionalPricingGlobal(profile.pricing)}  chains:

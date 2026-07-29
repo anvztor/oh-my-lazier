@@ -1,0 +1,68 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_35-cfad6ba1a7a446bc1a37858570fe97f22a7a6234",
+  "solcVersion": "0.8.35",
+  "solcLongVersion": "0.8.35+commit.47b9dedd",
+  "compilerType": "solc",
+  "toolVersions": {
+    "hardhat": "3.9.1"
+  },
+  "userSourceNameMap": {
+    "contracts/contracts/workers/OpenPriceFeed.sol": "project/contracts/contracts/workers/OpenPriceFeed.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "osaka",
+      "metadata": {
+        "bytecodeHash": "none",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1000
+      },
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode.linkReferences",
+            "evm.bytecode.object",
+            "evm.bytecode.opcodes",
+            "evm.bytecode.sourceMap",
+            "evm.deployedBytecode.immutableReferences",
+            "evm.deployedBytecode.linkReferences",
+            "evm.deployedBytecode.object",
+            "evm.deployedBytecode.opcodes",
+            "evm.deployedBytecode.sourceMap",
+            "evm.methodIdentifiers"
+          ]
+        }
+      },
+      "remappings": [
+        "project/:@openzeppelin/contracts/=npm/@openzeppelin/contracts@5.6.1/"
+      ],
+      "viaIR": true
+    },
+    "sources": {
+      "npm/@openzeppelin/contracts@5.6.1/access/Ownable.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\n\npragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which provides a basic access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * The initial owner is set to the address provided by the deployer. This can\n * later be changed with {transferOwnership}.\n *\n * This module is used through inheritance. It will make available the modifier\n * `onlyOwner`, which can be applied to your functions to restrict their use to\n * the owner.\n */\nabstract contract Ownable is Context {\n    address private _owner;\n\n    /**\n     * @dev The caller account is not authorized to perform an operation.\n     */\n    error OwnableUnauthorizedAccount(address account);\n\n    /**\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\n     */\n    error OwnableInvalidOwner(address owner);\n\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\n     */\n    constructor(address initialOwner) {\n        if (initialOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(initialOwner);\n    }\n\n    /**\n     * @dev Throws if called by any account other than the owner.\n     */\n    modifier onlyOwner() {\n        _checkOwner();\n        _;\n    }\n\n    /**\n     * @dev Returns the address of the current owner.\n     */\n    function owner() public view virtual returns (address) {\n        return _owner;\n    }\n\n    /**\n     * @dev Throws if the sender is not the owner.\n     */\n    function _checkOwner() internal view virtual {\n        if (owner() != _msgSender()) {\n            revert OwnableUnauthorizedAccount(_msgSender());\n        }\n    }\n\n    /**\n     * @dev Leaves the contract without owner. It will not be possible to call\n     * `onlyOwner` functions. Can only be called by the current owner.\n     *\n     * NOTE: Renouncing ownership will leave the contract without an owner,\n     * thereby disabling any functionality that is only available to the owner.\n     */\n    function renounceOwnership() public virtual onlyOwner {\n        _transferOwnership(address(0));\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Can only be called by the current owner.\n     */\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        if (newOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual {\n        address oldOwner = _owner;\n        _owner = newOwner;\n        emit OwnershipTransferred(oldOwner, newOwner);\n    }\n}\n"
+      },
+      "npm/@openzeppelin/contracts@5.6.1/utils/Context.sol": {
+        "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n\n    function _contextSuffixLength() internal view virtual returns (uint256) {\n        return 0;\n    }\n}\n"
+      },
+      "project/contracts/contracts/common/WorkerErrors.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.35;\n\n/// @title WorkerErrors\n/// @notice Custom errors shared by worker contracts.\nlibrary WorkerErrors {\n    error UnauthorizedSendLib(address sendLib);\n    error UnauthorizedVerifier(address verifier);\n    error PathwayDisabled(uint32 dstEid, address sender);\n    error MessageTooLarge(uint256 size, uint256 maxSize);\n    error InvalidPriceFeed(address priceFeed);\n    error InvalidPriceSnapshot(uint32 dstEid);\n    error InvalidPriceSnapshotBatch();\n    error InvalidPriceSubmitter(address submitter);\n    error UnauthorizedPriceSubmitter(address submitter);\n    error PriceSnapshotStale(uint32 dstEid, uint256 updatedAt, uint256 staleAfter);\n    error InvalidBps(uint16 bps);\n    error InvalidDstGasPrice(uint256 gasUnits);\n    error InvalidGas(uint256 gasLimit, uint256 minGas, uint256 maxGas);\n    error InvalidOptions();\n    error MissingLzReceiveOption();\n    error DuplicateLzReceiveOption();\n    error UnsupportedOption(uint8 workerId, uint8 optionType);\n    error NonZeroLzReceiveValue(uint128 value);\n    error EmptyDVNOptions();\n    error Paused();\n    error SendPaused(uint32 dstEid);\n    error ReceivePaused(uint32 srcEid);\n    error RateLimitExceeded(uint32 dstEid, uint256 requested, uint256 available);\n}\n"
+      },
+      "project/contracts/contracts/common/WorkerTypes.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.35;\n\n/// @title WorkerTypes\n/// @notice Shared structs used by the self-hosted Executor, DVN, and OFT controls.\nlibrary WorkerTypes {\n    /// @notice Per-OApp pathway limits and enablement.\n    struct PathwayConfig {\n        bool enabled;\n        uint256 maxMessageSize;\n        uint128 minLzReceiveGas;\n        uint128 maxLzReceiveGas;\n    }\n\n    /// @notice Shared market price inputs for one destination endpoint.\n    struct PriceSnapshot {\n        uint256 dstGasPriceInSrcToken;\n        uint256 dstDataFeePerByteInSrcToken;\n        uint64 updatedAt;\n        uint64 staleAfter;\n    }\n\n    /// @notice Price snapshot update for one destination endpoint.\n    struct PriceSnapshotUpdate {\n        uint32 dstEid;\n        PriceSnapshot snapshot;\n    }\n\n    /// @notice Native-token fee inputs for one destination endpoint and worker role.\n    struct FeeModel {\n        uint256 baseFee;\n        uint64 dstGasOverhead;\n        uint64 dataSizeOverheadBytes;\n        uint16 marginBps;\n    }\n\n    /// @notice Decoded executor lzReceive option accepted in phase 1.\n    struct ExecutorOption {\n        uint128 lzReceiveGas;\n        uint128 lzReceiveValue;\n    }\n\n    /// @notice Token bucket settings for outbound OFT sends.\n    struct RateLimitConfig {\n        uint256 capacity;\n        uint256 refillPerSecond;\n    }\n\n    /// @notice Current token bucket state for outbound OFT sends.\n    struct RateLimitState {\n        uint256 tokens;\n        uint64 updatedAt;\n    }\n}\n"
+      },
+      "project/contracts/contracts/workers/OpenPriceFeed.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.35;\n\nimport {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\nimport {WorkerErrors} from \"../common/WorkerErrors.sol\";\nimport {WorkerTypes} from \"../common/WorkerTypes.sol\";\n\n/// @title OpenPriceFeed\n/// @notice Submitter-managed shared market price snapshots for source-chain workers.\ncontract OpenPriceFeed is Ownable {\n    /// @notice Maximum accepted price freshness window.\n    uint64 public constant MAX_PRICE_SNAPSHOT_STALE_AFTER = 1 days;\n\n    /// @notice Price snapshot by destination endpoint ID.\n    mapping(uint32 dstEid => WorkerTypes.PriceSnapshot snapshot) public priceSnapshot;\n\n    /// @notice Whether an address may submit price snapshots.\n    mapping(address submitter => bool allowed) public submitters;\n\n    /// @notice Emitted when destination price inputs are updated.\n    /// @param dstEid Destination endpoint ID.\n    /// @param snapshot New price snapshot.\n    event PriceSnapshotSet(uint32 indexed dstEid, WorkerTypes.PriceSnapshot snapshot);\n\n    /// @notice Emitted when price submitter authorization changes.\n    /// @param submitter Address whose authorization changed.\n    /// @param allowed Whether the address may submit price snapshots.\n    event SubmitterSet(address indexed submitter, bool allowed);\n\n    /// @notice Initializes price feed ownership and initial submitters.\n    /// @param initialOwner Initial owner address.\n    /// @param initialSubmitters Addresses allowed to submit price snapshots.\n    constructor(address initialOwner, address[] memory initialSubmitters) Ownable(initialOwner) {\n        for (uint256 i = 0; i < initialSubmitters.length; i++) {\n            _setSubmitter(initialSubmitters[i], true);\n        }\n    }\n\n    modifier onlySubmitter() {\n        if (!submitters[msg.sender]) revert WorkerErrors.UnauthorizedPriceSubmitter(msg.sender);\n        _;\n    }\n\n    /// @notice Adds or removes an address from the price submitter allowlist.\n    /// @param submitter Address whose authorization should change.\n    /// @param allowed Whether the address may submit price snapshots.\n    function setSubmitter(address submitter, bool allowed) external onlyOwner {\n        _setSubmitter(submitter, allowed);\n    }\n\n    /// @notice Stores shared market price inputs for destination endpoints.\n    /// @param updates Destination endpoint price snapshots to store.\n    function setPriceSnapshot(WorkerTypes.PriceSnapshotUpdate[] calldata updates) external onlySubmitter {\n        if (updates.length == 0) revert WorkerErrors.InvalidPriceSnapshotBatch();\n        for (uint256 i = 0; i < updates.length; i++) {\n            WorkerTypes.PriceSnapshotUpdate calldata update = updates[i];\n            WorkerTypes.PriceSnapshot calldata snapshot = update.snapshot;\n            if (\n                snapshot.dstGasPriceInSrcToken == 0 || snapshot.updatedAt == 0 || snapshot.updatedAt > block.timestamp\n                    || snapshot.staleAfter == 0 || snapshot.staleAfter > MAX_PRICE_SNAPSHOT_STALE_AFTER\n            ) {\n                revert WorkerErrors.InvalidPriceSnapshot(update.dstEid);\n            }\n            priceSnapshot[update.dstEid] = snapshot;\n            emit PriceSnapshotSet(update.dstEid, snapshot);\n        }\n    }\n\n    function _setSubmitter(address submitter, bool allowed) internal {\n        if (submitter == address(0)) revert WorkerErrors.InvalidPriceSubmitter(submitter);\n        submitters[submitter] = allowed;\n        emit SubmitterSet(submitter, allowed);\n    }\n}\n"
+      }
+    }
+  }
+}
