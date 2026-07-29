@@ -136,14 +136,14 @@ func TestProcessConfirmationsOnceMarksQuorumChecking(t *testing.T) {
 	)
 }
 
-func TestProcessConfirmationsOnceActivePausesPathwayOnDestinationConfigDrift(t *testing.T) {
+func TestProcessConfirmationsOnceActivePausesPathwayOnInsufficientAssignedConfirmations(t *testing.T) {
 	packet := testDVNPacket()
 	store := &fakeStore{
 		work: []db.DVNWorkItem{{
 			Packet: packet,
 			Job: db.DVNJobRecord{
 				GUID:                  packet.GUID,
-				ConfirmationsRequired: 12,
+				ConfirmationsRequired: 10,
 				Status:                string(packets.DVNAssigned),
 			},
 		}},
@@ -172,8 +172,8 @@ func TestProcessConfirmationsOnceActivePausesPathwayOnDestinationConfigDrift(t *
 	if store.manualReviewGUID != packet.GUID {
 		t.Fatalf("manual review guid = %s, want %s", store.manualReviewGUID, packet.GUID)
 	}
-	if !strings.Contains(store.manualReviewReason, "receive uln confirmations") {
-		t.Fatalf("manual review reason = %q, want receive uln confirmations mismatch", store.manualReviewReason)
+	if !strings.Contains(store.manualReviewReason, "assigned confirmations 10 are below receive uln required confirmations 15") {
+		t.Fatalf("manual review reason = %q, want insufficient assigned confirmations", store.manualReviewReason)
 	}
 	if store.pausedPathwayGUID != packet.GUID {
 		t.Fatalf("paused pathway guid = %s, want %s", store.pausedPathwayGUID, packet.GUID)
@@ -322,7 +322,7 @@ func TestProcessReadyToVerifyOnceMarksWouldVerify(t *testing.T) {
 	}
 }
 
-func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
+func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTxWithAsymmetricConfirmations(t *testing.T) {
 	packet := testDVNPacket()
 	report := []byte(`{"status":"ready"}`)
 	logger, logs := captureLogger(slog.LevelInfo)
@@ -331,7 +331,7 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
 			Packet: packet,
 			Job: db.DVNJobRecord{
 				GUID:                  packet.GUID,
-				ConfirmationsRequired: 12,
+				ConfirmationsRequired: 20,
 				Status:                string(packets.DVNReadyToVerify),
 				QuorumResult:          report,
 			},
@@ -348,7 +348,18 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
 		},
 		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
 		nil,
-		map[uint32]ContractCaller{packet.DstEID: fakeDVNReconcileCaller{}},
+		map[uint32]ContractCaller{
+			packet.DstEID: fakeDVNReconcileCaller{ulnConfig: receiveUlnConfig{
+				Confirmations:        15,
+				RequiredDVNCount:     2,
+				OptionalDVNCount:     nilDVNCount,
+				OptionalDVNThreshold: 0,
+				RequiredDVNs: []common.Address{
+					common.HexToAddress("0x6666666666666666666666666666666666666666"),
+					common.HexToAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				},
+			}},
+		},
 		logger,
 	)
 
@@ -384,6 +395,12 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTx(t *testing.T) {
 	}
 	if args[0].(common.Address) != common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
 		t.Fatalf("submitVerification receiveLib = %s", args[0].(common.Address))
+	}
+	if args[3].(uint64) != 20 {
+		t.Fatalf("submitVerification confirmations = %d, want assigned confirmations 20", args[3].(uint64))
+	}
+	if store.manualReviewGUID != (common.Hash{}) {
+		t.Fatalf("manual review guid = %s, want zero", store.manualReviewGUID)
 	}
 	if !bytes.Equal(store.quorumResult, report) {
 		t.Fatalf("quorum result = %s, want %s", store.quorumResult, report)
@@ -448,7 +465,7 @@ func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveLibraryDrift(t *tes
 	}
 }
 
-func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveUlnConfigDrift(t *testing.T) {
+func TestProcessReadyToVerifyOnceActivePausesPathwayOnInsufficientAssignedConfirmations(t *testing.T) {
 	packet := testDVNPacket()
 	report := []byte(`{"status":"ready"}`)
 	store := &fakeStore{
@@ -456,7 +473,7 @@ func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveUlnConfigDrift(t *t
 			Packet: packet,
 			Job: db.DVNJobRecord{
 				GUID:                  packet.GUID,
-				ConfirmationsRequired: 12,
+				ConfirmationsRequired: 10,
 				Status:                string(packets.DVNReadyToVerify),
 				QuorumResult:          report,
 			},
@@ -490,8 +507,8 @@ func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveUlnConfigDrift(t *t
 	if store.manualReviewGUID != packet.GUID {
 		t.Fatalf("manual review guid = %s, want %s", store.manualReviewGUID, packet.GUID)
 	}
-	if !strings.Contains(store.manualReviewReason, "receive uln confirmations") {
-		t.Fatalf("manual review reason = %q, want receive uln confirmations mismatch", store.manualReviewReason)
+	if !strings.Contains(store.manualReviewReason, "assigned confirmations 10 are below receive uln required confirmations 15") {
+		t.Fatalf("manual review reason = %q, want insufficient assigned confirmations", store.manualReviewReason)
 	}
 	if store.pausedPathwayGUID != packet.GUID {
 		t.Fatalf("paused pathway guid = %s, want %s", store.pausedPathwayGUID, packet.GUID)
