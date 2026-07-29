@@ -159,6 +159,10 @@ type PricingConfig struct {
 	StaleAfterSeconds uint64 `yaml:"stale_after_seconds"`
 	// MaxDeviationBps is the allowed primary-vs-sanity feed deviation; it defaults to 500.
 	MaxDeviationBps uint64 `yaml:"max_deviation_bps"`
+	// MinUpdateDeviationBps is the minimum change from the last written price that triggers an update; it defaults to 50.
+	MinUpdateDeviationBps uint64 `yaml:"min_update_deviation_bps"`
+	// HeartbeatSeconds is the maximum time between price writes in a quiet market; it defaults to half stale_after_seconds.
+	HeartbeatSeconds uint64 `yaml:"heartbeat_seconds"`
 	// SourceRequestTimeoutSeconds bounds one concurrent market-source read; it defaults to 10.
 	SourceRequestTimeoutSeconds uint64 `yaml:"source_request_timeout_seconds"`
 	// GasSpikeBps triggers early updates when destination gas rises past the previous quoted price.
@@ -424,6 +428,12 @@ func load(path string, applyEnv bool) (Config, error) {
 		}
 		if cfg.Pricing.MaxDeviationBps == 0 {
 			cfg.Pricing.MaxDeviationBps = 500
+		}
+		if cfg.Pricing.MinUpdateDeviationBps == 0 {
+			cfg.Pricing.MinUpdateDeviationBps = 50
+		}
+		if cfg.Pricing.HeartbeatSeconds == 0 {
+			cfg.Pricing.HeartbeatSeconds = cfg.Pricing.StaleAfterSeconds / 2
 		}
 		if cfg.Pricing.SourceRequestTimeoutSeconds == 0 {
 			cfg.Pricing.SourceRequestTimeoutSeconds = 10
@@ -794,6 +804,24 @@ func (c Config) validatePricing(chains map[uint32]struct{}, signers map[string]s
 	}
 	if c.Pricing.MaxDeviationBps == 0 {
 		return errors.New("pricing max_deviation_bps is required")
+	}
+	if c.Pricing.MinUpdateDeviationBps == 0 {
+		return errors.New("pricing min_update_deviation_bps is required")
+	}
+	if c.Pricing.MinUpdateDeviationBps > 10_000 {
+		return errors.New("pricing min_update_deviation_bps exceeds 10000")
+	}
+	if c.Pricing.HeartbeatSeconds == 0 {
+		return errors.New("pricing heartbeat_seconds is required")
+	}
+	if err := validateDurationSeconds("pricing heartbeat_seconds", c.Pricing.HeartbeatSeconds); err != nil {
+		return err
+	}
+	if c.Pricing.HeartbeatSeconds >= c.Pricing.StaleAfterSeconds {
+		return errors.New("pricing heartbeat_seconds must be less than stale_after_seconds")
+	}
+	if c.Pricing.IntervalSeconds >= c.Pricing.StaleAfterSeconds-c.Pricing.HeartbeatSeconds {
+		return errors.New("pricing heartbeat_seconds plus interval_seconds must be less than stale_after_seconds")
 	}
 	if c.Pricing.SourceRequestTimeoutSeconds == 0 {
 		return errors.New("pricing source_request_timeout_seconds is required")

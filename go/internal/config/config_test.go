@@ -166,6 +166,14 @@ func TestValidateRejectsDurationOverflow(t *testing.T) {
 			},
 		},
 		{
+			name:  "pricing heartbeat",
+			field: "heartbeat_seconds",
+			mutate: func(cfg *Config) {
+				cfg.Pricing = validPricingConfig()
+				cfg.Pricing.HeartbeatSeconds = overflow
+			},
+		},
+		{
 			name:  "pricing source request timeout",
 			field: "source_request_timeout_seconds",
 			mutate: func(cfg *Config) {
@@ -688,6 +696,28 @@ func TestValidateRejectsPricingStaleAfterAboveContractMaximum(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsPricingHeartbeatWithoutStalenessMargin(t *testing.T) {
+	tests := []struct {
+		name      string
+		heartbeat uint64
+		want      string
+	}{
+		{name: "equals stale after", heartbeat: 1800, want: "heartbeat_seconds must be less than stale_after_seconds"},
+		{name: "leaves no polling margin", heartbeat: 1500, want: "heartbeat_seconds plus interval_seconds must be less than stale_after_seconds"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Pricing = validPricingConfig()
+			cfg.Pricing.HeartbeatSeconds = test.heartbeat
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsEnabledPricingWithoutPathwayFees(t *testing.T) {
 	cfg := validConfig()
 	cfg.Pricing = validPricingConfig()
@@ -1091,6 +1121,32 @@ func TestLoadStaticDefaultsAndAcceptsIndexerPollIntervalSeconds(t *testing.T) {
 	}
 }
 
+func TestLoadStaticDefaultsPriceUpdateGate(t *testing.T) {
+	cfg := validConfig()
+	cfg.Pricing = validPricingConfig()
+	cfg.Pricing.MinUpdateDeviationBps = 0
+	cfg.Pricing.HeartbeatSeconds = 0
+	body, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loaded, err := LoadStatic(path)
+	if err != nil {
+		t.Fatalf("LoadStatic() error = %v", err)
+	}
+	if loaded.Pricing.MinUpdateDeviationBps != 50 {
+		t.Fatalf("default minimum update deviation = %d, want 50", loaded.Pricing.MinUpdateDeviationBps)
+	}
+	if loaded.Pricing.HeartbeatSeconds != 900 {
+		t.Fatalf("default heartbeat = %d, want 900", loaded.Pricing.HeartbeatSeconds)
+	}
+}
+
 func TestLoadStaticRejectsInvalidUnsignedIntegers(t *testing.T) {
 	cfg := validConfig()
 	cfg.Pricing = validPricingConfig()
@@ -1321,6 +1377,8 @@ func validPricingConfig() PricingConfig {
 		IntervalSeconds:             300,
 		StaleAfterSeconds:           1800,
 		MaxDeviationBps:             500,
+		MinUpdateDeviationBps:       50,
+		HeartbeatSeconds:            900,
 		SourceRequestTimeoutSeconds: 10,
 		GasSpikeBps:                 1000,
 		Chains: []PricingChainConfig{

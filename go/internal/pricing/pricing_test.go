@@ -367,6 +367,8 @@ func TestSettingsRejectStaleAfterAboveContractMaximum(t *testing.T) {
 		Interval:             time.Minute,
 		StaleAfter:           time.Duration(config.MaxPriceSnapshotStaleAfterSeconds+1) * time.Second,
 		MaxDeviation:         500,
+		MinUpdateDeviation:   50,
+		Heartbeat:            15 * time.Minute,
 		SourceRequestTimeout: time.Second,
 		GasSpikeBps:          1000,
 	}
@@ -412,6 +414,29 @@ func TestBuildSetPriceSnapshotCalldata(t *testing.T) {
 	method := priceSnapshotABI.Methods["setPriceSnapshot"]
 	if string(calldata[:4]) != string(method.ID) {
 		t.Fatalf("method id = 0x%x, want 0x%x", calldata[:4], method.ID)
+	}
+}
+
+func TestReadPriceSnapshot(t *testing.T) {
+	want := testPriceSnapshot()
+	response, err := priceSnapshotABI.Methods["priceSnapshot"].Outputs.Pack(
+		want.DstGasPriceInSrcToken,
+		want.DstDataFeePerByteInSrcToken,
+		want.UpdatedAt,
+		want.StaleAfter,
+	)
+	if err != nil {
+		t.Fatalf("priceSnapshot output Pack() error = %v", err)
+	}
+
+	got, err := readPriceSnapshot(context.Background(), staticEVMResponseReader{response: response}, common.HexToAddress("0x4444444444444444444444444444444444444444"), 40449)
+	if err != nil {
+		t.Fatalf("readPriceSnapshot() error = %v", err)
+	}
+	if got.DstGasPriceInSrcToken.Cmp(want.DstGasPriceInSrcToken) != 0 ||
+		got.DstDataFeePerByteInSrcToken.Cmp(want.DstDataFeePerByteInSrcToken) != 0 ||
+		got.UpdatedAt != want.UpdatedAt || got.StaleAfter != want.StaleAfter {
+		t.Fatalf("readPriceSnapshot() = %+v, want %+v", got, want)
 	}
 }
 
