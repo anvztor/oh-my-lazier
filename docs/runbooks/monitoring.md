@@ -76,7 +76,7 @@ Operational assumptions:
 - Indexer logs emit at most one throttled `Info` `indexer progress` entry per chain per interval, aggregating advanced streams, block range, lag, processed item counts, and duration. Per-stream `indexer stream advanced` entries and per-poll `indexer poll completed` summaries are `Debug`. Per-event entries identify source assignments and destination reconciliation events by `guid`, `src_eid`, `dst_eid`, and `tx_hash`.
 - Tx manager logs identify nonce bootstrap/claim, signing, broadcast, receipt confirmation/failure, mined gas usage, actual destination-chain gas cost, and retry enqueue by `tx_outbox_id` or `id`, `chain_eid`, `signer`, and `purpose`; they must not include calldata, signatures, keystore contents, or raw secret-bearing config.
 - RPC failures and quorum conflicts identify configured endpoints only as `provider[n]`, where `n` is the zero-based configuration order. Logs and persisted job errors must not include complete RPC URLs or their credentials, paths, or query values.
-- Pricing logs identify `eid`, source name, primary/sanity role, and failure category. Deviation rejections also include `deviation_bps`. They must not include market-data base URLs, RPC URLs, API keys, or secret-bearing configuration. An unhealthy primary, no healthy declared sanity source, or any healthy sanity deviation stops the whole price-update cycle before enqueue; there is no sanity fallback.
+- Pricing logs identify `eid`, source name, primary/sanity role, and failure category. Source-sanity rejections include `deviation_bps` and remain governed by `max_deviation_bps`; they stop the whole price-update cycle before enqueue, with no sanity fallback. Normal write suppression logs `skipped price snapshot update` at `Debug` with the source EID, destination EID, feed, computed `deviation_bps`, seconds since the last write, `min_update_deviation_bps`, and `heartbeat_seconds`. On startup, the bot bootstraps those per-pathway values from the source-chain OpenPriceFeed instead of forcing a cold write. Verify `heartbeat_seconds + interval_seconds < stale_after_seconds`; at the default 900/300/1800 settings, a quiet feed writes about every 15 minutes and retains at least 10 minutes between the latest scheduled heartbeat evaluation and contract expiry during healthy operation. Pricing logs must not include market-data base URLs, RPC URLs, API keys, or secret-bearing configuration.
 - The `fee_accounting` loop converts mined worker receipt gas costs to source-chain native wei. Pricing-source errors leave affected receipts pending and visible through `laz_worker_fee_unpriced_receipts`; they do not revert tx receipt confirmation or job state transitions.
 - `services.executor.enabled` and `services.dvn.enabled` are process-level switches. A deployment that runs only one role should page on that role's streams and job states, while the other role's durable cursors may be absent in that process.
 - Txmgr automatically retries failed outbox rows with classified failure kinds for up to five attempts. It also automatically replaces broadcast rows that have no receipt after `tx_manager.stale_broadcast_replacement_after_seconds` seconds, keeping the nonce and using the existing replacement fee bump while still respecting configured fee caps. `txretry` remains the manual override for exhausted rows or operator-reviewed replacement, but it is no longer the default path for ordinary failed rows or ordinary pending replacements.
@@ -85,3 +85,49 @@ Operational assumptions:
 - Do not unpause a chain or pathway until the conflict source is identified and the latest `inspect:lz-config` output still matches the intended migration config.
 - A deterministic active-DVN destination config mismatch moves the affected job to `MANUAL_REVIEW` and pauses that pathway atomically. Other pathways continue processing; clear the drift and review the recorded `last_error` before unpausing.
 - A deterministic executor delivery build failure, including unsupported persisted executor options observed after a permissionless commit, moves the job and packet to `MANUAL_REVIEW` with `last_error` instead of retrying indefinitely.
+
+After resolving and reviewing an active-DVN destination config mismatch, reset the selected job and its pathway together. Supply the complete 64-character GUID without the `0x` prefix. Resetting to `ASSIGNED` makes the worker re-run destination validation, source-confirmation waiting, and source receipt quorum validation rather than trusting the earlier review state. A remaining mismatch returns the job and pathway to manual review atomically.
+
+```bash
+psql "$DATABASE_URL" -v guid='<64-character-guid>' <<'SQL'
+BEGIN;
+WITH target AS (
+  SELECT packet.guid, packet.src_eid, packet.dst_eid, packet.sender, packet.receiver
+  FROM packets AS packet
+  JOIN dvn_jobs AS job ON job.guid = packet.guid
+  WHERE packet.guid = decode(:'guid', 'hex') AND job.status = 'MANUAL_REVIEW'
+  FOR UPDATE OF packet, job
+), resumed AS (
+  UPDATE dvn_jobs AS job
+  SET status = 'ASSIGNED', quorum_result = NULL, last_error = NULL,
+      retry_count = 0, next_retry_at = NULL, updated_at = now()
+  FROM target
+  WHERE job.guid = target.guid
+  RETURNING job.guid
+), unpaused AS (
+  UPDATE pathways AS pathway
+  SET paused = false
+  FROM target, resumed
+  WHERE pathway.src_eid = target.src_eid
+    AND pathway.dst_eid = target.dst_eid
+    AND pathway.src_oapp = target.sender
+    AND pathway.dst_oapp = target.receiver
+  RETURNING pathway.id
+)
+SELECT (SELECT count(*) FROM resumed) AS resumed_jobs,
+       (SELECT count(*) FROM unpaused) AS unpaused_pathways,
+       (SELECT count(*) FROM resumed) = 1
+         AND (SELECT count(*) FROM unpaused) = 1 AS recovery_ok
+\gset
+\echo resumed_jobs=:resumed_jobs unpaused_pathways=:unpaused_pathways
+\if :recovery_ok
+  COMMIT;
+\else
+  ROLLBACK;
+  \warn 'DVN recovery changed an unexpected number of rows; transaction rolled back'
+  \quit 1
+\endif
+SQL
+```
+
+The transaction commits only when `resumed_jobs = 1` and `unpaused_pathways = 1`; otherwise it rolls back and exits nonzero. After a successful reset, run the readiness check and watch the selected GUID through the DVN states.

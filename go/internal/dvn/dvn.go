@@ -537,8 +537,9 @@ func receiveUlnConfigFromABI(value any) (receiveUlnConfig, error) {
 }
 
 func validateReceiveUlnConfig(config receiveUlnConfig, confirmations uint64, openDVN common.Address) error {
-	if config.Confirmations != confirmations {
-		return fmt.Errorf("receive uln confirmations %d does not match assigned confirmations %d", config.Confirmations, confirmations)
+	// ReceiveUln302 accepts a DVN verification whose submitted confirmations meet or exceed this threshold.
+	if confirmations < config.Confirmations {
+		return fmt.Errorf("assigned confirmations %d are below receive uln required confirmations %d", confirmations, config.Confirmations)
 	}
 	if config.RequiredDVNCount != uint8(len(config.RequiredDVNs)) {
 		return fmt.Errorf("receive uln requiredDVNCount %d does not match requiredDVNs length %d", config.RequiredDVNCount, len(config.RequiredDVNs))
