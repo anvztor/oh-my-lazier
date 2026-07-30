@@ -2,9 +2,6 @@ package kms
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"encoding/asn1"
-	"errors"
 	"math/big"
 	"os"
 	"testing"
@@ -84,24 +81,4 @@ func TestRustackKMSIntegrationSignsEthereumTransaction(t *testing.T) {
 	if from != address {
 		t.Fatalf("sender = %s, want %s", from, address)
 	}
-}
-
-type subjectPublicKeyInfo struct {
-	Algorithm        asn1.RawValue
-	SubjectPublicKey asn1.BitString
-}
-
-func parseKMSPublicKey(der []byte) (*ecdsa.PublicKey, error) {
-	var spki subjectPublicKeyInfo
-	rest, err := asn1.Unmarshal(der, &spki)
-	if err != nil {
-		return nil, err
-	}
-	if len(rest) != 0 {
-		return nil, errors.New("public key has trailing DER bytes")
-	}
-	if len(spki.SubjectPublicKey.Bytes) == 0 {
-		return nil, errors.New("public key is empty")
-	}
-	return crypto.UnmarshalPubkey(spki.SubjectPublicKey.Bytes)
 }

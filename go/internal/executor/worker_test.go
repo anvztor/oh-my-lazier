@@ -68,6 +68,42 @@ func TestProcessCommitterOnceEnqueuesCommitTx(t *testing.T) {
 	)
 }
 
+func TestProcessCommitterOnceSkipsInactiveSendScope(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorVerifiable)
+	logger, logs := captureLogger(slog.LevelDebug)
+	store := &fakeStore{
+		work: []db.ExecutorWorkItem{{
+			Packet: packet,
+			Job:    db.ExecutorJobRecord{GUID: packet.GUID, Status: string(packets.ExecutorVerifiable)},
+		}},
+		enqueueErr: db.ErrTxSendScopeInactive,
+	}
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeCommitReadyCaller{}},
+		logger,
+	)
+
+	// A pause committed between work selection and the enqueue is a normal
+	// skip: no error, no job transition, resumed after unpause.
+	processed, err := worker.ProcessCommitterOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessCommitterOnce() error = %v, want skipped without error", err)
+	}
+	if processed {
+		t.Fatal("processed = true, want false for an inactive send scope")
+	}
+	if store.nextStatus != "" {
+		t.Fatalf("job transitioned to %q, want untouched", store.nextStatus)
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped executor commit tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestProcessCommitterOnceMarksAssignedWaitingWhenNotVerifiable(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorAssigned)
@@ -357,6 +393,41 @@ func TestProcessDelivererOnceRetriesFailedLzReceive(t *testing.T) {
 	}
 }
 
+func TestProcessDelivererOnceParksLzReceiveAfterRetryBudget(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorLzReceiveFailed)
+	store := &fakeStore{
+		workByStatus: map[string][]db.ExecutorWorkItem{string(packets.ExecutorLzReceiveFailed): {{
+			Packet: packet,
+			Job: db.ExecutorJobRecord{
+				GUID:       packet.GUID,
+				Status:     string(packets.ExecutorLzReceiveFailed),
+				RetryCount: db.MaxLzReceiveDeliveryAttempts,
+			},
+		}}},
+	}
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeExecutableCaller{payloadHash: packet.PayloadHash, inboundNonce: 7}},
+		slog.Default(),
+	)
+
+	processed, err := worker.ProcessDelivererOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessDelivererOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.nextStatus != string(packets.ExecutorManualReview) {
+		t.Fatalf("next status = %q, want %q (retry budget exhausted must park, not re-enqueue)", store.nextStatus, packets.ExecutorManualReview)
+	}
+	if store.request.Purpose == TxPurposeLzReceive {
+		t.Fatal("a new lzReceive tx was enqueued after the retry budget was exhausted")
+	}
+}
+
 func TestProcessDelivererOnceMarksInvalidLzReceiveOptionsForManualReview(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorExecutable)
@@ -471,6 +542,39 @@ func TestProcessDelivererOnceMarksDeliveredWhenEndpointPayloadCleared(t *testing
 	}
 }
 
+func TestProcessDelivererOnceDefersDeliveryBelowConfirmationDepth(t *testing.T) {
+	packet := testPacketRecord()
+	packet.Status = string(packets.ExecutorExecutable)
+	store := &fakeStore{
+		workByStatus: map[string][]db.ExecutorWorkItem{string(packets.ExecutorExecutable): {{
+			Packet: packet,
+			Job:    db.ExecutorJobRecord{GUID: packet.GUID, Status: string(packets.ExecutorExecutable)},
+		}}},
+	}
+	// The endpoint reports delivered at latest, but the head is below the chain's
+	// confirmation depth (12), so the terminal DELIVERED state must not be written.
+	worker := NewWithCallers(
+		store,
+		testRegistry(t),
+		map[uint32]ContractCaller{packet.DstEID: fakeExecutableCaller{payloadHash: common.Hash{}, inboundNonce: 7, lazyInboundNonce: 7, headBlock: 5}},
+		slog.Default(),
+	)
+
+	processed, err := worker.ProcessDelivererOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessDelivererOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.nextStatus == string(packets.ExecutorDelivered) {
+		t.Fatal("marked DELIVERED from a shallow (below-confirmation-depth) observation")
+	}
+	if store.deferredGUID != packet.GUID {
+		t.Fatalf("deferred guid = %s, want %s", store.deferredGUID, packet.GUID)
+	}
+}
+
 func TestProcessDelivererOnceDefersReadinessError(t *testing.T) {
 	packet := testPacketRecord()
 	packet.Status = string(packets.ExecutorExecutable)
@@ -512,6 +616,7 @@ func TestCheckDeliveryStateKeepsPayloadExecutableWhenLazyNonceAdvanced(t *testin
 		fakeExecutableCaller{payloadHash: packet.PayloadHash, inboundNonce: packet.Nonce.Uint64(), lazyInboundNonce: packet.Nonce.Uint64()},
 		common.HexToAddress("0x4444444444444444444444444444444444444444"),
 		packet,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("CheckDeliveryState() error = %v", err)
@@ -531,6 +636,7 @@ type fakeStore struct {
 	lastError      string
 	deferredGUID   common.Hash
 	deferredStatus string
+	enqueueErr     error
 }
 
 func (s *fakeStore) ListExecutorWork(_ context.Context, status string, _ int) ([]db.ExecutorWorkItem, error) {
@@ -590,6 +696,9 @@ func (s *fakeStore) MarkExecutorDeliveredFromChain(_ context.Context, guid commo
 }
 
 func (s *fakeStore) EnqueueExecutorTx(_ context.Context, guid common.Hash, expectedStatus, nextStatus string, request db.TxRequest) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.guid = guid
 	s.expectedStatus = expectedStatus
 	s.nextStatus = nextStatus
@@ -609,7 +718,13 @@ func (failingCaller) CallContract(context.Context, ethereum.CallMsg, *big.Int) (
 	return nil, fmt.Errorf("unexpected eth_call")
 }
 
+func (failingCaller) BlockNumber(context.Context) (uint64, error) {
+	return 0, fmt.Errorf("unexpected block number")
+}
+
 type fakeCommitReadyCaller struct{}
+
+func (fakeCommitReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
 
 func (fakeCommitReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -638,6 +753,10 @@ type fakeCommitAlreadyCommittedCaller struct {
 	payloadHash common.Hash
 }
 
+func (fakeCommitAlreadyCommittedCaller) BlockNumber(context.Context) (uint64, error) {
+	return 1_000_000, nil
+}
+
 func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
 	if err != nil {
@@ -652,6 +771,8 @@ func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call e
 }
 
 type fakeCommitNotReadyCaller struct{}
+
+func (fakeCommitNotReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
 
 func (fakeCommitNotReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -674,6 +795,14 @@ type fakeExecutableCaller struct {
 	payloadHash      common.Hash
 	inboundNonce     uint64
 	lazyInboundNonce uint64
+	headBlock        uint64
+}
+
+func (c fakeExecutableCaller) BlockNumber(context.Context) (uint64, error) {
+	if c.headBlock != 0 {
+		return c.headBlock, nil
+	}
+	return 1_000_000, nil
 }
 
 func (c fakeExecutableCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {

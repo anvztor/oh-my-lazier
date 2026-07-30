@@ -52,6 +52,8 @@ const requiredDocs: RequiredDoc[] = [
       "LazSignerLowNativeBalance",
       "LazIndexerPollFailing",
       "LazIndexerPollStalled",
+      "LazRPCProviderConflict",
+      "LazRPCQuorumUnavailable",
       "laz_chain_paused == 1",
       "laz_pathway_paused == 1",
       "laz_indexer_poll_success",
@@ -61,6 +63,8 @@ const requiredDocs: RequiredDoc[] = [
       "laz_indexer_last_success_timestamp_seconds",
       "laz_indexer_failure_since_timestamp_seconds",
       "laz_indexer_cursor_last_block",
+      "laz_rpc_provider_status",
+      "laz_rpc_provider_log_conflict",
       "laz_signer_native_balance_wei",
       "laz_worker_fee_negative_margin_jobs",
       "laz_worker_fee_unpriced_receipts",
@@ -216,6 +220,20 @@ const requiredAlertRules: RequiredAlertRule[] = [
       "laz_indexer_last_poll_timestamp_seconds > 0",
       "or laz_indexer_start_timestamp_seconds",
       "> 2 * laz_indexer_poll_interval_seconds",
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazRPCProviderConflict",
+    anchors: [
+      'laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1',
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazRPCQuorumUnavailable",
+    anchors: [
+      '2 * count by (chain_eid, job, instance) (laz_rpc_provider_status{status="unavailable"}) >= count by (chain_eid, job, instance) (laz_rpc_provider_status)',
       "severity: page",
     ],
   },

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/lzabi"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -1047,6 +1049,100 @@ func TestIndexerPollOnceLogsSyncProgress(t *testing.T) {
 	}
 }
 
+func TestIndexerPartialWindowFailureReplaysIdempotently(t *testing.T) {
+	executor := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	sendLib := common.HexToAddress("0x9999999999999999999999999999999999999999")
+	store := newFakeIndexerStore()
+	store.cursors[cursorKey(40161, ExecutorSourceStream)] = 40
+	client := &fakeLogClient{head: 65, sourceLogs: testExecutorSourceLogs(t, executor, sendLib, big.NewInt(42))}
+	calls := 0
+	client.onFilter = func(ethereum.FilterQuery) error {
+		calls++
+		if calls == 2 {
+			return errors.New("second chunk conflicted")
+		}
+		return nil
+	}
+	indexer := NewWithClient(
+		testIndexerChain(40161, "ethereum-sepolia", common.HexToAddress("0x2222222222222222222222222222222222222222")),
+		[]chain.Pathway{testIndexerPathway()},
+		store,
+		client,
+		discardLogger(),
+	).WithStreams(StreamSet{ExecutorSource: true})
+	indexer.backfillRange = 10
+	indexer.queryBlockRange = 5
+
+	// The 41..50 window splits into chunks 41-45 and 46-50; the second chunk
+	// fails after the first already wrote durable rows.
+	if _, err := indexer.ProcessOnce(context.Background()); err == nil {
+		t.Fatal("ProcessOnce() error = nil, want second-chunk failure")
+	}
+	if cursor := store.cursors[cursorKey(40161, ExecutorSourceStream)]; cursor != 40 {
+		t.Fatalf("cursor after partial window = %d, want unmoved 40", cursor)
+	}
+	if len(store.packets) != 1 || len(store.jobs) != 1 {
+		t.Fatalf("partial window wrote %d packets / %d jobs, want the first chunk's 1/1", len(store.packets), len(store.jobs))
+	}
+
+	// The replay re-reads the whole window; upserts stay idempotent and the
+	// cursor advances only now.
+	client.onFilter = nil
+	if _, err := indexer.ProcessOnce(context.Background()); err != nil {
+		t.Fatalf("ProcessOnce(replay) error = %v", err)
+	}
+	if cursor := store.cursors[cursorKey(40161, ExecutorSourceStream)]; cursor != 50 {
+		t.Fatalf("cursor after replay = %d, want 50", cursor)
+	}
+	if len(store.packets) != 1 || len(store.jobs) != 1 {
+		t.Fatalf("replay duplicated rows: %d packets / %d jobs, want 1/1", len(store.packets), len(store.jobs))
+	}
+}
+
+func TestIndexerPollOnceReportsProviderStatuses(t *testing.T) {
+	providers := []rpcquorum.Provider{
+		{ID: "provider-0", Status: rpcquorum.ProviderHealthy},
+		{ID: "provider-1", Status: rpcquorum.ProviderConflict, LogConflict: true},
+	}
+	store := newFakeIndexerStore()
+	store.cursors[cursorKey(40161, ExecutorSourceStream)] = 40
+	client := &quorumStatusLogClient{
+		fakeLogClient: &fakeLogClient{head: 65},
+		providers:     providers,
+	}
+	recorder := &providerStatusRecorder{}
+	indexer := NewWithClient(
+		testIndexerChain(40161, "ethereum-sepolia", common.HexToAddress("0x2222222222222222222222222222222222222222")),
+		[]chain.Pathway{testIndexerPathway()},
+		store,
+		client,
+		discardLogger(),
+	).WithStreams(StreamSet{ExecutorSource: true}).WithMetrics(recorder)
+	indexer.backfillRange = 10
+
+	if err := indexer.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce() error = %v", err)
+	}
+	if len(recorder.reports) != 1 {
+		t.Fatalf("provider reports = %d, want 1", len(recorder.reports))
+	}
+	report := recorder.reports[0]
+	if report.chainEID != 40161 || report.chainName != "ethereum-sepolia" {
+		t.Fatalf("report identity = %d/%s, want 40161/ethereum-sepolia", report.chainEID, report.chainName)
+	}
+	if !reflect.DeepEqual(report.providers, providers) {
+		t.Fatalf("report providers = %+v, want %+v", report.providers, providers)
+	}
+
+	client.filterErr = errors.New("log quorum conflict")
+	if err := indexer.pollOnce(context.Background()); err != nil {
+		t.Fatalf("pollOnce() error = %v, want swallowed poll failure", err)
+	}
+	if len(recorder.reports) != 2 {
+		t.Fatalf("provider reports after failed poll = %d, want 2 (statuses must surface even when the poll fails)", len(recorder.reports))
+	}
+}
+
 func TestIndexerPollOnceAggregatesStreamProgressInfo(t *testing.T) {
 	logger, logs := captureLogger(slog.LevelInfo)
 	store := newFakeIndexerStore()
@@ -1403,6 +1499,7 @@ type fakeLogClient struct {
 	destinationLogs []gethtypes.Log
 	queries         []ethereum.FilterQuery
 	onBlock         func()
+	onFilter        func(query ethereum.FilterQuery) error
 }
 
 type fakeIndexerMetrics struct {
@@ -1443,6 +1540,11 @@ func (c *fakeLogClient) FilterLogs(_ context.Context, query ethereum.FilterQuery
 	if c.filterErr != nil {
 		return nil, c.filterErr
 	}
+	if c.onFilter != nil {
+		if err := c.onFilter(query); err != nil {
+			return nil, err
+		}
+	}
 	c.queries = append(c.queries, query)
 	if queryHasTopic(query, lzabi.PacketSentTopic()) {
 		return append([]gethtypes.Log(nil), c.sourceLogs...), nil
@@ -1454,6 +1556,34 @@ func (c *fakeLogClient) FilterLogs(_ context.Context, query ethereum.FilterQuery
 		return append([]gethtypes.Log(nil), c.destinationLogs...), nil
 	}
 	return nil, nil
+}
+
+type quorumStatusLogClient struct {
+	*fakeLogClient
+	providers []rpcquorum.Provider
+}
+
+func (c *quorumStatusLogClient) Providers() []rpcquorum.Provider {
+	return c.providers
+}
+
+type providerReport struct {
+	chainEID  uint32
+	chainName string
+	providers []rpcquorum.Provider
+}
+
+type providerStatusRecorder struct {
+	reports []providerReport
+}
+
+func (r *providerStatusRecorder) RegisterIndexer(uint32, string, time.Duration) {}
+
+func (r *providerStatusRecorder) RecordIndexerPoll(uint32, string, time.Duration, uint64, uint64, int, int, int, time.Duration, error) {
+}
+
+func (r *providerStatusRecorder) RecordRPCProviders(chainEID uint32, chainName string, providers []rpcquorum.Provider) {
+	r.reports = append(r.reports, providerReport{chainEID: chainEID, chainName: chainName, providers: providers})
 }
 
 type fakeIndexerStore struct {

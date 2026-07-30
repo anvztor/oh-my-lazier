@@ -18,6 +18,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/lzabi"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 	"github.com/islishude/oh-my-lazier/go/internal/workerloop"
 	"github.com/jackc/pgx/v5"
 )
@@ -850,6 +851,16 @@ func (i *Indexer) pollOnce(ctx context.Context) error {
 			duration,
 			err,
 		)
+		// Surface each provider's quorum classification (including the sticky
+		// log-conflict dimension) after every poll, so a flagged provider is
+		// visible before its conflicts ever escalate to a stalled cursor.
+		if statusSource, ok := i.client.(interface{ Providers() []rpcquorum.Provider }); ok {
+			if recorder, ok := i.metrics.(interface {
+				RecordRPCProviders(chainEID uint32, chainName string, providers []rpcquorum.Provider)
+			}); ok {
+				recorder.RecordRPCProviders(i.chain.EID, i.chain.Name, statusSource.Providers())
+			}
+		}
 	}
 	if err == nil {
 		i.logPollSuccess(result, duration)

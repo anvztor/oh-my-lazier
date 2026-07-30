@@ -423,6 +423,36 @@ func TestApplyExecutorDestinationLogsDoesNotLetAlertOverrideDelivered(t *testing
 	}
 }
 
+func TestApplyExecutorDestinationLogsSkipsAlertForManualReviewJob(t *testing.T) {
+	packet := testDestinationPacketRecord()
+	store := &fakeDestinationStore{
+		byGUID: map[common.Hash]db.PacketRecord{
+			packet.GUID: packet,
+		},
+		executorJobs: map[common.Hash]db.ExecutorJobRecord{
+			packet.GUID: {
+				GUID:   packet.GUID,
+				Status: string(packets.ExecutorManualReview),
+			},
+		},
+	}
+
+	// A historical alert for a parked job must skip, not error: an error here
+	// would wedge the destination cursor behind the un-appliable log forever.
+	applied, err := ApplyExecutorDestinationLogs(context.Background(), store, packet.DstEID, []gethtypes.Log{
+		testLzReceiveAlertLog(t, packet, []byte{0xde, 0xad}),
+	})
+	if err != nil {
+		t.Fatalf("ApplyExecutorDestinationLogs() error = %v", err)
+	}
+	if applied != 0 {
+		t.Fatalf("applied = %d, want 0", applied)
+	}
+	if store.failedGUID != (common.Hash{}) {
+		t.Fatalf("failed guid = %s, want zero", store.failedGUID)
+	}
+}
+
 func TestApplyExecutorDestinationLogsSkipsUnexpectedAlertExecutor(t *testing.T) {
 	packet := testDestinationPacketRecord()
 	store := &fakeDestinationStore{

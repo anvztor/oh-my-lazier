@@ -21,8 +21,9 @@ type retryOutput struct {
 
 func main() {
 	configPath := flag.String("config", "config/example.yaml", "worker config path")
-	action := flag.String("action", "", "retry action: retry-failed or replace")
+	action := flag.String("action", "", "retry action: retry-failed, replace, cancel-nonce, or resolve-external-nonce")
 	id := flag.Int64("id", 0, "tx_outbox id")
+	resolution := flag.String("resolution", "", "resolve-external-nonce resolution: retry or abandon")
 	flag.Parse()
 
 	if *id <= 0 {
@@ -65,12 +66,38 @@ func main() {
 		}
 		*id = afterID
 	case "replace":
-		if err := store.PrepareReplacementTx(ctx, *id); err != nil {
-			fmt.Fprintf(os.Stderr, "prepare replacement tx: %v\n", err)
+		if err := store.RequestTxReplacement(ctx, *id); err != nil {
+			fmt.Fprintf(os.Stderr, "request replacement tx: %v\n", err)
+			os.Exit(1)
+		}
+	case "cancel-nonce":
+		if err := store.RequestTxCancel(ctx, *id); err != nil {
+			fmt.Fprintf(os.Stderr, "request cancel: %v\n", err)
+			os.Exit(1)
+		}
+	case "resolve-external-nonce":
+		switch *resolution {
+		case "retry":
+			cloneID, err := store.ResolveExternalNonceRetry(ctx, *id)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "resolve external nonce (retry): %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "created fresh clone %d\n", cloneID)
+			// Report the clone that will actually run as After, mirroring
+			// retry-failed, so automation gets the live row's ID from the JSON.
+			*id = cloneID
+		case "abandon":
+			if err := store.ResolveExternalNonceAbandon(ctx, *id); err != nil {
+				fmt.Fprintf(os.Stderr, "resolve external nonce (abandon): %v\n", err)
+				os.Exit(1)
+			}
+		default:
+			fmt.Fprintln(os.Stderr, "-resolution must be retry or abandon")
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "-action must be retry-failed or replace")
+		fmt.Fprintln(os.Stderr, "-action must be retry-failed, replace, cancel-nonce, or resolve-external-nonce")
 		os.Exit(1)
 	}
 
