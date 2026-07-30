@@ -16,6 +16,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/bigutil"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/readiness"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 	"github.com/islishude/oh-my-lazier/go/internal/workerloop"
 )
 
@@ -34,6 +35,16 @@ type RuntimeSnapshot struct {
 	Indexers       []IndexerRuntimeStat
 	LoopRetries    []LoopRetryRuntimeStat
 	SignerBalances []SignerBalanceRuntimeStat
+	RPCProviders   []RPCProviderRuntimeStat
+}
+
+// RPCProviderRuntimeStat is one RPC provider's latest quorum classification.
+type RPCProviderRuntimeStat struct {
+	ChainEID    uint32
+	ChainName   string
+	ProviderID  string
+	Status      string
+	LogConflict bool
 }
 
 // IndexerRuntimeStat summarizes one in-process indexer loop.
@@ -82,6 +93,7 @@ type Registry struct {
 	indexers       map[indexerKey]*IndexerRuntimeStat
 	loopRetries    map[string]*LoopRetryRuntimeStat
 	signerBalances map[signerBalanceKey]*SignerBalanceRuntimeStat
+	rpcProviders   map[uint32][]RPCProviderRuntimeStat
 	now            func() time.Time
 }
 
@@ -101,6 +113,7 @@ func NewRegistry() *Registry {
 		indexers:       make(map[indexerKey]*IndexerRuntimeStat),
 		loopRetries:    make(map[string]*LoopRetryRuntimeStat),
 		signerBalances: make(map[signerBalanceKey]*SignerBalanceRuntimeStat),
+		rpcProviders:   make(map[uint32][]RPCProviderRuntimeStat),
 		now:            time.Now,
 	}
 }
@@ -161,6 +174,30 @@ func (r *Registry) indexerStatLocked(chainEID uint32, chainName string, pollInte
 	}
 	stat.PollIntervalSeconds = pollInterval.Seconds()
 	return stat
+}
+
+// RecordRPCProviders records one chain's latest per-provider quorum
+// classification (head status plus the sticky log-conflict dimension). The
+// state is keyed by chain EID alone so multiple reporting components (indexer
+// polls, the signer balance monitor) overwrite one series per chain instead of
+// emitting duplicate gauge lines.
+func (r *Registry) RecordRPCProviders(chainEID uint32, chainName string, providers []rpcquorum.Provider) {
+	if r == nil {
+		return
+	}
+	stats := make([]RPCProviderRuntimeStat, 0, len(providers))
+	for _, provider := range providers {
+		stats = append(stats, RPCProviderRuntimeStat{
+			ChainEID:    chainEID,
+			ChainName:   chainName,
+			ProviderID:  provider.ID,
+			Status:      string(provider.Status),
+			LogConflict: provider.LogConflict,
+		})
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rpcProviders[chainEID] = stats
 }
 
 // RecordLoopRetry records one supervisor retry after a worker loop returned an error.
@@ -232,6 +269,9 @@ func (r *Registry) RuntimeSnapshot() RuntimeSnapshot {
 		copied.MinNativeBalanceWei = bigutil.Clone(stat.MinNativeBalanceWei)
 		snapshot.SignerBalances = append(snapshot.SignerBalances, copied)
 	}
+	for _, stats := range r.rpcProviders {
+		snapshot.RPCProviders = append(snapshot.RPCProviders, stats...)
+	}
 	sort.Slice(snapshot.Indexers, func(a, b int) bool {
 		if snapshot.Indexers[a].ChainEID != snapshot.Indexers[b].ChainEID {
 			return snapshot.Indexers[a].ChainEID < snapshot.Indexers[b].ChainEID
@@ -246,6 +286,12 @@ func (r *Registry) RuntimeSnapshot() RuntimeSnapshot {
 			return snapshot.SignerBalances[a].ChainEID < snapshot.SignerBalances[b].ChainEID
 		}
 		return snapshot.SignerBalances[a].SignerID < snapshot.SignerBalances[b].SignerID
+	})
+	sort.Slice(snapshot.RPCProviders, func(a, b int) bool {
+		if snapshot.RPCProviders[a].ChainEID != snapshot.RPCProviders[b].ChainEID {
+			return snapshot.RPCProviders[a].ChainEID < snapshot.RPCProviders[b].ChainEID
+		}
+		return snapshot.RPCProviders[a].ProviderID < snapshot.RPCProviders[b].ProviderID
 	})
 	return snapshot
 }
@@ -333,15 +379,19 @@ func renderDBMetrics(output *strings.Builder, snapshot db.StatsSnapshot) {
 	for _, stat := range snapshot.Chains {
 		fmt.Fprintf(output, "laz_chain_enabled{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Enabled))
 	}
-	output.WriteString("# HELP laz_chain_paused Whether a chain is paused by safety logic.\n")
+	// A record removed from configuration keeps paused = true as a safety
+	// state for a possible re-enable, but readiness and the durable loops
+	// ignore disabled records entirely — exporting their pause would page
+	// operators forever about a scope nothing acts on.
+	output.WriteString("# HELP laz_chain_paused Whether an enabled chain is paused by safety logic.\n")
 	output.WriteString("# TYPE laz_chain_paused gauge\n")
 	for _, stat := range snapshot.Chains {
-		fmt.Fprintf(output, "laz_chain_paused{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Paused))
+		fmt.Fprintf(output, "laz_chain_paused{eid=%q,name=%s} %d\n", strconv.FormatUint(uint64(stat.EID), 10), label(stat.Name), boolGauge(stat.Enabled && stat.Paused))
 	}
-	output.WriteString("# HELP laz_pathway_paused Whether a configured pathway is paused by safety logic.\n")
+	output.WriteString("# HELP laz_pathway_paused Whether an enabled pathway is paused by safety logic.\n")
 	output.WriteString("# TYPE laz_pathway_paused gauge\n")
 	for _, stat := range snapshot.Pathways {
-		fmt.Fprintf(output, "laz_pathway_paused{src_eid=%q,dst_eid=%q} %d\n", uint32Label(stat.SrcEID), uint32Label(stat.DstEID), boolGauge(stat.Paused))
+		fmt.Fprintf(output, "laz_pathway_paused{src_eid=%q,dst_eid=%q} %d\n", uint32Label(stat.SrcEID), uint32Label(stat.DstEID), boolGauge(stat.Enabled && stat.Paused))
 	}
 	output.WriteString("# HELP laz_packets_total Packets by source, destination, and status.\n")
 	output.WriteString("# TYPE laz_packets_total gauge\n")
@@ -362,6 +412,16 @@ func renderDBMetrics(output *strings.Builder, snapshot db.StatsSnapshot) {
 	output.WriteString("# TYPE laz_tx_outbox_total gauge\n")
 	for _, stat := range snapshot.TxOutbox {
 		fmt.Fprintf(output, "laz_tx_outbox_total{chain_eid=%q,status=%s,retry_state=%s} %d\n", uint32Label(stat.ChainEID), label(stat.Status), label(stat.RetryState), stat.Count)
+	}
+	output.WriteString("# HELP laz_tx_outbox_held_total Blocked or cancel-pending signer lanes by chain, signer, and hold reason.\n")
+	output.WriteString("# TYPE laz_tx_outbox_held_total gauge\n")
+	for _, stat := range snapshot.TxOutboxHeld {
+		fmt.Fprintf(output, "laz_tx_outbox_held_total{chain_eid=%q,signer=%s,reason=%s} %d\n", uint32Label(stat.ChainEID), label(stat.SignerID), label(stat.HeldReason), stat.Count)
+	}
+	output.WriteString("# HELP laz_tx_outbox_held_oldest_age_seconds Age of the oldest blocked or cancel-pending row by chain, signer, and hold reason.\n")
+	output.WriteString("# TYPE laz_tx_outbox_held_oldest_age_seconds gauge\n")
+	for _, stat := range snapshot.TxOutboxHeld {
+		fmt.Fprintf(output, "laz_tx_outbox_held_oldest_age_seconds{chain_eid=%q,signer=%s,reason=%s} %d\n", uint32Label(stat.ChainEID), label(stat.SignerID), label(stat.HeldReason), stat.OldestAgeSeconds)
 	}
 	output.WriteString("# HELP laz_tx_receipt_gas_cost_dst_wei Mined transaction receipt gas cost in destination-chain native wei by chain and outbox purpose.\n")
 	output.WriteString("# TYPE laz_tx_receipt_gas_cost_dst_wei gauge\n")
@@ -401,6 +461,16 @@ func renderDBMetrics(output *strings.Builder, snapshot db.StatsSnapshot) {
 }
 
 func renderRuntimeMetrics(output *strings.Builder, snapshot RuntimeSnapshot) {
+	output.WriteString("# HELP laz_rpc_provider_status RPC provider quorum head classification (1 for the current status).\n")
+	output.WriteString("# TYPE laz_rpc_provider_status gauge\n")
+	for _, stat := range snapshot.RPCProviders {
+		fmt.Fprintf(output, "laz_rpc_provider_status{chain_eid=%q,provider=%s,status=%s} 1\n", uint32Label(stat.ChainEID), label(stat.ProviderID), label(stat.Status))
+	}
+	output.WriteString("# HELP laz_rpc_provider_log_conflict Whether the provider's last log window disagreed with the log quorum (sticky until it agrees again).\n")
+	output.WriteString("# TYPE laz_rpc_provider_log_conflict gauge\n")
+	for _, stat := range snapshot.RPCProviders {
+		fmt.Fprintf(output, "laz_rpc_provider_log_conflict{chain_eid=%q,provider=%s} %d\n", uint32Label(stat.ChainEID), label(stat.ProviderID), boolGauge(stat.LogConflict))
+	}
 	output.WriteString("# HELP laz_worker_loop_retries_total Worker loop restart attempts after returned errors.\n")
 	output.WriteString("# TYPE laz_worker_loop_retries_total counter\n")
 	for _, stat := range snapshot.LoopRetries {

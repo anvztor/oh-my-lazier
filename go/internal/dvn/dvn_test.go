@@ -322,6 +322,54 @@ func TestProcessReadyToVerifyOnceMarksWouldVerify(t *testing.T) {
 	}
 }
 
+func TestProcessReadyToVerifyOnceActiveSkipsInactiveSendScope(t *testing.T) {
+	packet := testDVNPacket()
+	logger, logs := captureLogger(slog.LevelDebug)
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNReadyToVerify),
+				QuorumResult:          []byte(`{"status":"ready"}`),
+			},
+		}},
+		enqueueErr: db.ErrTxSendScopeInactive,
+	}
+	registry := testRegistry(t, packet, config.DVNModeActive)
+	worker := NewWithClientsSettingsAndCallers(
+		store,
+		registry,
+		map[uint32]Settings{
+			packet.DstEID: {
+				SignerID: "0x8888888888888888888888888888888888888888",
+			},
+		},
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		nil,
+		map[uint32]ContractCaller{packet.DstEID: fakeDVNReconcileCaller{}},
+		logger,
+	)
+
+	// A pause committed between work selection and the enqueue is a normal
+	// skip: no error, no job transition, resumed after unpause.
+	processed, err := worker.ProcessReadyToVerifyOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessReadyToVerifyOnce() error = %v, want skipped without error", err)
+	}
+	if processed {
+		t.Fatal("processed = true, want false for an inactive send scope")
+	}
+	if store.verifyGUID != (common.Hash{}) {
+		t.Fatalf("verify enqueued for %s, want none", store.verifyGUID)
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped dvn verify tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTxWithAsymmetricConfirmations(t *testing.T) {
 	packet := testDVNPacket()
 	report := []byte(`{"status":"ready"}`)
@@ -412,6 +460,76 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTxWithAsymmetricConfirmatio
 		`to_status=VERIFY_TX_ENQUEUED`,
 		`tx_outbox_id=42`,
 	)
+}
+
+// fakeDVNDriftAtConfirmedCaller reports the configured receive library at latest
+// but a different (older) library at any historical block, simulating a recent
+// config change that has not yet reached confirmation depth.
+type fakeDVNDriftAtConfirmedCaller struct{}
+
+func (fakeDVNDriftAtConfirmedCaller) CallContract(_ context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	method, err := dvnMethodBySelector(call.Data)
+	if err != nil {
+		return nil, err
+	}
+	switch method.Name {
+	case "inboundPayloadHash":
+		return method.Outputs.Pack(common.Hash{})
+	case "getReceiveLibrary":
+		lib := common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		if blockNumber != nil {
+			lib = common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+		}
+		return method.Outputs.Pack(lib, false)
+	case "getUlnConfig":
+		return method.Outputs.Pack(defaultReceiveUlnConfig())
+	case "hashLookup":
+		return method.Outputs.Pack(true, uint64(12))
+	default:
+		return nil, fmt.Errorf("unexpected method %s", method.Name)
+	}
+}
+
+func TestProcessReadyToVerifyOnceActiveDefersConfigMismatchAtConfirmedBlock(t *testing.T) {
+	packet := testDVNPacket()
+	report := []byte(`{"status":"ready"}`)
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNReadyToVerify),
+				QuorumResult:          report,
+			},
+		}},
+	}
+	worker := NewWithClientsSettingsAndCallers(
+		store,
+		testRegistry(t, packet, config.DVNModeActive),
+		map[uint32]Settings{packet.DstEID: {SignerID: "0x8888888888888888888888888888888888888888"}},
+		map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
+		nil,
+		map[uint32]ContractCaller{packet.DstEID: fakeDVNDriftAtConfirmedCaller{}},
+		discardLogger(),
+	)
+
+	processed, err := worker.ProcessReadyToVerifyOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessReadyToVerifyOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.verifiedFromChainGUID != (common.Hash{}) {
+		t.Fatal("marked verified from a below-confirmation-depth observation")
+	}
+	if store.manualReviewGUID != (common.Hash{}) || store.pausedPathwayGUID != (common.Hash{}) {
+		t.Fatal("a historical (unconfirmed) config difference must not pause the pathway")
+	}
+	if store.deferredGUID != packet.GUID {
+		t.Fatalf("deferred guid = %s, want %s", store.deferredGUID, packet.GUID)
+	}
 }
 
 func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveLibraryDrift(t *testing.T) {
@@ -601,7 +719,7 @@ func TestProcessReadyToVerifyOnceActiveMarksVerifiedWhenAlreadyCompleteOnChain(t
 						SignerID: "0x8888888888888888888888888888888888888888",
 					},
 				},
-				nil,
+				map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
 				nil,
 				map[uint32]ContractCaller{packet.DstEID: test.caller},
 				discardLogger(),
@@ -768,6 +886,69 @@ func TestProcessQuorumOnceMarksReorgWhenReceiptDisappears(t *testing.T) {
 	if len(store.quorumResult) == 0 {
 		t.Fatal("quorum result is empty")
 	}
+	if store.reorgCoords != nil {
+		t.Fatal("packet coordinates must not change when the receipt disappeared entirely")
+	}
+}
+
+func TestProcessQuorumOnceMarksReorgWhenReceiptBlockMoved(t *testing.T) {
+	packet := testDVNPacket()
+	receipt := testSourceReceipt(t, packet)
+	// The source tx was re-included by a reorg at a later block. Re-inclusion at
+	// a different position also shifts the block-global log index, so the receipt
+	// block must be checked before the log-index lookup or the reorg is missed.
+	receipt.BlockNumber = new(big.Int).SetUint64(packet.SrcBlockNumber + 3)
+	receipt.Logs[0].BlockNumber = packet.SrcBlockNumber + 3
+	receipt.Logs[0].Index = packet.SrcLogIndex + 5
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNQuorumChecking),
+			},
+		}},
+	}
+	worker := NewWithClients(
+		store,
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]ReceiptReader{packet.SrcEID: fakeReceiptReader{receipt: receipt}},
+		discardLogger(),
+	)
+
+	processed, err := worker.ProcessQuorumOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessQuorumOnce() error = %v", err)
+	}
+	if !processed {
+		t.Fatal("processed = false, want true")
+	}
+	if store.reorgGUID != packet.GUID {
+		t.Fatalf("reorg guid = %s, want %s", store.reorgGUID, packet.GUID)
+	}
+	if store.readyGUID != (common.Hash{}) {
+		t.Fatalf("ready guid = %s, want zero (must not verify a moved receipt)", store.readyGUID)
+	}
+	if store.pausedPathwayGUID != (common.Hash{}) {
+		t.Fatalf("paused pathway guid = %s, want zero", store.pausedPathwayGUID)
+	}
+	// The stored coordinates must follow the re-included receipt — atomically
+	// with the status transition: the forward-only source cursor never rescans
+	// the replacement block, and a separate coordinate commit would leave a
+	// window for another instance to re-enter quorum on the old coordinates.
+	if store.reorgCoords == nil {
+		t.Fatal("packet coordinates were not refreshed after re-inclusion")
+	}
+	if store.reorgCoords.srcBlockNumber != packet.SrcBlockNumber+3 {
+		t.Fatalf("refreshed src block = %d, want %d", store.reorgCoords.srcBlockNumber, packet.SrcBlockNumber+3)
+	}
+	if store.reorgCoords.srcLogIndex != packet.SrcLogIndex+5 {
+		t.Fatalf("refreshed src log index = %d, want %d", store.reorgCoords.srcLogIndex, packet.SrcLogIndex+5)
+	}
+	if store.reorgCoords.expectedSrcBlockNumber != packet.SrcBlockNumber || store.reorgCoords.expectedSrcLogIndex != packet.SrcLogIndex {
+		t.Fatalf("coordinate CAS expects %d/%d, want the stale %d/%d", store.reorgCoords.expectedSrcBlockNumber, store.reorgCoords.expectedSrcLogIndex, packet.SrcBlockNumber, packet.SrcLogIndex)
+	}
 }
 
 func TestProcessQuorumOnceDefersReceiptReaderError(t *testing.T) {
@@ -845,6 +1026,35 @@ type fakeStore struct {
 	quorumResult          []byte
 	deferredGUID          common.Hash
 	deferredStatus        string
+	enqueueErr            error
+	reorgCoords           *reorgCoordinates
+	reorgCoordsErr        error
+}
+
+type reorgCoordinates struct {
+	srcBlockNumber         uint64
+	srcLogIndex            uint
+	expectedSrcBlockNumber uint64
+	expectedSrcLogIndex    uint
+}
+
+func (s *fakeStore) MarkDVNReorgDetectedWithCoordinates(_ context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte, srcBlockNumber uint64, srcLogIndex uint, expectedSrcBlockNumber uint64, expectedSrcLogIndex uint) error {
+	if s.reorgCoordsErr != nil {
+		return s.reorgCoordsErr
+	}
+	if expectedStatus != string(packets.DVNQuorumChecking) {
+		return fmt.Errorf("unexpected expected status %q", expectedStatus)
+	}
+	s.reorgGUID = guid
+	s.reorgReason = reason
+	s.quorumResult = quorumResult
+	s.reorgCoords = &reorgCoordinates{
+		srcBlockNumber:         srcBlockNumber,
+		srcLogIndex:            srcLogIndex,
+		expectedSrcBlockNumber: expectedSrcBlockNumber,
+		expectedSrcLogIndex:    expectedSrcLogIndex,
+	}
+	return nil
 }
 
 func (s *fakeStore) ListDVNWork(_ context.Context, status string, _ int) ([]db.DVNWorkItem, error) {
@@ -880,6 +1090,9 @@ func (s *fakeStore) MarkDVNWouldVerify(_ context.Context, guid common.Hash, _ st
 }
 
 func (s *fakeStore) EnqueueDVNVerifyTx(_ context.Context, guid common.Hash, _, _ string, request db.TxRequest, quorumResult []byte) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.verifyGUID = guid
 	s.verifyRequest = request
 	s.quorumResult = bytes.Clone(quorumResult)
@@ -1183,9 +1396,10 @@ func testSourceReceipt(t *testing.T, packet db.PacketRecord) *gethtypes.Receipt 
 		Index:       packet.SrcLogIndex,
 	}
 	return &gethtypes.Receipt{
-		TxHash: packet.SrcTxHash,
-		Status: gethtypes.ReceiptStatusSuccessful,
-		Logs:   []*gethtypes.Log{log},
+		TxHash:      packet.SrcTxHash,
+		Status:      gethtypes.ReceiptStatusSuccessful,
+		BlockNumber: new(big.Int).SetUint64(packet.SrcBlockNumber),
+		Logs:        []*gethtypes.Log{log},
 	}
 }
 
@@ -1223,5 +1437,39 @@ func assertLogContains(t *testing.T, output string, wants ...string) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("logs missing %q in:\n%s", want, output)
 		}
+	}
+}
+
+func TestProcessQuorumOnceReorgCoordinateWriteFailureIsRetried(t *testing.T) {
+	packet := testDVNPacket()
+	receipt := testSourceReceipt(t, packet)
+	receipt.BlockNumber = new(big.Int).SetUint64(packet.SrcBlockNumber + 3)
+	receipt.Logs[0].BlockNumber = packet.SrcBlockNumber + 3
+	receipt.Logs[0].Index = packet.SrcLogIndex + 5
+	store := &fakeStore{
+		work: []db.DVNWorkItem{{
+			Packet: packet,
+			Job: db.DVNJobRecord{
+				GUID:                  packet.GUID,
+				ConfirmationsRequired: 12,
+				Status:                string(packets.DVNQuorumChecking),
+			},
+		}},
+		reorgCoordsErr: fmt.Errorf("coordinates write lost"),
+	}
+	worker := NewWithClients(
+		store,
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]ReceiptReader{packet.SrcEID: fakeReceiptReader{receipt: receipt}},
+		discardLogger(),
+	)
+
+	// The transition and the coordinate refresh commit atomically: a failed
+	// write changes nothing and the pass surfaces the error for a retry.
+	if _, err := worker.ProcessQuorumOnce(context.Background()); err == nil {
+		t.Fatal("ProcessQuorumOnce() error = nil, want the atomic write failure")
+	}
+	if store.reorgGUID != (common.Hash{}) || store.reorgCoords != nil {
+		t.Fatal("nothing may persist when the atomic reorg write failed")
 	}
 }

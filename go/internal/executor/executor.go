@@ -2,8 +2,11 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
+	"math/big"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -13,6 +16,70 @@ import (
 )
 
 const loopInterval = 5 * time.Second
+
+var errAwaitingConfirmations = errors.New("awaiting confirmation depth")
+
+// confirmedReadBlock returns the block that is chain.Confirmations deep, for
+// reading terminal on-chain state that must not be written to durable storage
+// until it can no longer be reorged out. A nil block with no error means the
+// chain has no confirmation gate (read latest); errAwaitingConfirmations means
+// the chain has not produced enough blocks yet for anything to be confirmed.
+func (w *Worker) confirmedReadBlock(ctx context.Context, eid uint32) (*big.Int, error) {
+	configuredChain, err := w.registry.Get(eid)
+	if err != nil {
+		return nil, err
+	}
+	if configuredChain.Confirmations == 0 {
+		return nil, nil
+	}
+	caller := w.caller(eid)
+	if caller == nil {
+		return nil, fmt.Errorf("missing destination caller for eid %d", eid)
+	}
+	head, err := caller.BlockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if head < configuredChain.Confirmations {
+		return nil, errAwaitingConfirmations
+	}
+	return new(big.Int).SetUint64(head - configuredChain.Confirmations), nil
+}
+
+// commitConfirmedOnChain reports whether the packet's commit is still present at
+// the confirmation-deep block, so a shallow (reorg-vulnerable) commit is not
+// written as terminal state. A not-yet-deep chain reports false (defer).
+func (w *Worker) commitConfirmedOnChain(ctx context.Context, eid uint32, endpoint, receiveLib common.Address, packet db.PacketRecord) (bool, error) {
+	confBlock, err := w.confirmedReadBlock(ctx, eid)
+	if errors.Is(err, errAwaitingConfirmations) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	state, err := CheckCommitState(ctx, w.caller(eid), endpoint, receiveLib, packet, confBlock)
+	if err != nil {
+		return false, err
+	}
+	return state == CommitCommitted, nil
+}
+
+// deliveryConfirmedOnChain reports whether the packet's delivery is still
+// present at the confirmation-deep block.
+func (w *Worker) deliveryConfirmedOnChain(ctx context.Context, eid uint32, endpoint common.Address, packet db.PacketRecord) (bool, error) {
+	confBlock, err := w.confirmedReadBlock(ctx, eid)
+	if errors.Is(err, errAwaitingConfirmations) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	state, err := CheckDeliveryState(ctx, w.caller(eid), endpoint, packet, confBlock)
+	if err != nil {
+		return false, err
+	}
+	return state == DeliveryDelivered, nil
+}
 
 // Store is the durable executor state required by the worker.
 type Store interface {
@@ -98,12 +165,23 @@ func (w *Worker) ProcessCommitterOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "destination_chain_lookup_error", err)
 	}
-	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet)
+	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, nil)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "commit_readiness_error", err)
 	}
 	switch state {
 	case CommitCommitted:
+		confirmed, err := w.commitConfirmedOnChain(ctx, item.Packet.DstEID, dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet)
+		if err != nil {
+			return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "commit_confirmation_error", err)
+		}
+		if !confirmed {
+			if err := w.store.DeferExecutorJob(ctx, item.Packet.GUID, string(packets.ExecutorVerifiable), loopInterval); err != nil {
+				return false, err
+			}
+			w.logger.Debug("deferred executor commit below confirmation depth", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", string(packets.ExecutorVerifiable))
+			return true, nil
+		}
 		if err := w.store.MarkExecutorCommittedFromChain(ctx, item.Packet.GUID, string(packets.ExecutorVerifiable)); err != nil {
 			return false, err
 		}
@@ -122,6 +200,12 @@ func (w *Worker) ProcessCommitterOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	id, err := w.store.EnqueueExecutorTx(ctx, item.Packet.GUID, string(packets.ExecutorVerifiable), string(packets.ExecutorCommitTxEnqueued), request)
+	if errors.Is(err, db.ErrTxSendScopeInactive) {
+		// The pathway or chain was paused/disabled between work selection and
+		// this enqueue; the job keeps its status and resumes after unpause.
+		w.logger.Debug("skipped executor commit tx enqueue", "reason", "send_scope_inactive", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -150,12 +234,23 @@ func (w *Worker) processCommitReadinessStatus(ctx context.Context, status string
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "destination_chain_lookup_error", err)
 	}
-	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet)
+	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, nil)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "commit_readiness_error", err)
 	}
 	switch state {
 	case CommitCommitted:
+		confirmed, err := w.commitConfirmedOnChain(ctx, item.Packet.DstEID, dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet)
+		if err != nil {
+			return w.deferExecutorWorkError(ctx, item, status, "commit_confirmation_error", err)
+		}
+		if !confirmed {
+			if err := w.store.DeferExecutorJob(ctx, item.Packet.GUID, status, loopInterval); err != nil {
+				return false, err
+			}
+			w.logger.Debug("deferred executor commit below confirmation depth", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", status)
+			return true, nil
+		}
 		if err := w.store.MarkExecutorCommittedFromChain(ctx, item.Packet.GUID, status); err != nil {
 			return false, err
 		}
@@ -204,12 +299,23 @@ func (w *Worker) processExecutableReadiness(ctx context.Context) (bool, error) {
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "destination_chain_lookup_error", err)
 	}
-	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet)
+	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, nil)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "delivery_readiness_error", err)
 	}
 	switch state {
 	case DeliveryDelivered:
+		confirmed, err := w.deliveryConfirmedOnChain(ctx, item.Packet.DstEID, dstChain.EndpointAddress, item.Packet)
+		if err != nil {
+			return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "delivery_confirmation_error", err)
+		}
+		if !confirmed {
+			if err := w.store.DeferExecutorJob(ctx, item.Packet.GUID, string(packets.ExecutorCommitted), loopInterval); err != nil {
+				return false, err
+			}
+			w.logger.Debug("deferred executor delivery below confirmation depth", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", string(packets.ExecutorCommitted))
+			return true, nil
+		}
 		if err := w.store.MarkExecutorDeliveredFromChain(ctx, item.Packet.GUID, string(packets.ExecutorCommitted)); err != nil {
 			return false, err
 		}
@@ -240,12 +346,23 @@ func (w *Worker) processDelivererStatus(ctx context.Context, status string) (boo
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "destination_chain_lookup_error", err)
 	}
-	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet)
+	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, nil)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "delivery_readiness_error", err)
 	}
 	switch state {
 	case DeliveryDelivered:
+		confirmed, err := w.deliveryConfirmedOnChain(ctx, item.Packet.DstEID, dstChain.EndpointAddress, item.Packet)
+		if err != nil {
+			return w.deferExecutorWorkError(ctx, item, status, "delivery_confirmation_error", err)
+		}
+		if !confirmed {
+			if err := w.store.DeferExecutorJob(ctx, item.Packet.GUID, status, loopInterval); err != nil {
+				return false, err
+			}
+			w.logger.Debug("deferred executor delivery below confirmation depth", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", status)
+			return true, nil
+		}
 		if err := w.store.MarkExecutorDeliveredFromChain(ctx, item.Packet.GUID, status); err != nil {
 			return false, err
 		}
@@ -259,11 +376,20 @@ func (w *Worker) processDelivererStatus(ctx context.Context, status string) (boo
 		w.logger.Debug("skipped executor delivery workflow", "reason", "delivery_not_executable", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "status", status, "delivery_state", deliveryStateLabel(state))
 		return true, nil
 	}
+	if status == string(packets.ExecutorLzReceiveFailed) && item.Job.RetryCount >= db.MaxLzReceiveDeliveryAttempts {
+		return w.markExecutorManualReview(ctx, item, status, fmt.Errorf("lzReceive reverted %d times, exceeding the %d-attempt retry budget", item.Job.RetryCount, db.MaxLzReceiveDeliveryAttempts))
+	}
 	request, err := BuildLzReceiveTx(item.Packet, dstChain.EndpointAddress, dstChain.TxRoles.Executor.SignerID)
 	if err != nil {
 		return w.markExecutorManualReview(ctx, item, status, err)
 	}
 	id, err := w.store.EnqueueExecutorTx(ctx, item.Packet.GUID, status, string(packets.ExecutorLzReceiveTxEnqueued), request)
+	if errors.Is(err, db.ErrTxSendScopeInactive) {
+		// The pathway or chain was paused/disabled between work selection and
+		// this enqueue; the job keeps its status and resumes after unpause.
+		w.logger.Debug("skipped executor lzReceive tx enqueue", "reason", "send_scope_inactive", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

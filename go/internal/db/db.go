@@ -73,13 +73,43 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// SyncConfig upserts chain and pathway metadata from validated startup config.
+// SyncConfig reconciles chain and pathway metadata from validated startup
+// config: records present in the config are upserted and enabled, and any
+// record no longer in the config is disabled so it is not treated as active.
 func (s *Store) SyncConfig(ctx context.Context, registry *chain.Registry) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Config syncs serialize globally: on a fresh database there are no rows to
+	// pre-lock, and two instances inserting the same new chains/pathways in
+	// registry map order could otherwise deadlock on the unique constraints.
+	// The (0, ...) namespace cannot collide with signer nonce locks, which
+	// always use a non-zero chain eid.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(0, hashtext('config_sync'))`); err != nil {
+		return err
+	}
+	// Pre-lock every existing chain and pathway row in the same deterministic
+	// order the send-scope gates use (chains by ascending eid, then pathways),
+	// so a config sync racing a concurrent worker instance's signing/enqueue
+	// share locks cannot deadlock on the bulk updates below.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM chains ORDER BY eid FOR UPDATE`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM pathways ORDER BY src_eid, dst_eid, src_oapp, dst_oapp FOR UPDATE`); err != nil {
+		return err
+	}
+	// Disable everything first, then re-enable only what the current validated
+	// config declares. The repository keeps no compatibility burden, so a chain
+	// or pathway removed from config must not linger as an active record that
+	// readiness and the durable loops still treat as live.
+	if _, err := tx.Exec(ctx, `UPDATE chains SET enabled = false`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE pathways SET enabled = false`); err != nil {
+		return err
+	}
 	for _, configuredChain := range registry.All() {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO chains (eid, name, chain_id, endpoint_address, enabled)
@@ -87,7 +117,8 @@ func (s *Store) SyncConfig(ctx context.Context, registry *chain.Registry) error 
 			ON CONFLICT (eid) DO UPDATE SET
 				name = EXCLUDED.name,
 				chain_id = EXCLUDED.chain_id,
-				endpoint_address = EXCLUDED.endpoint_address
+				endpoint_address = EXCLUDED.endpoint_address,
+				enabled = true
 		`, configuredChain.EID, configuredChain.Name, configuredChain.ChainID.Int64(), addressBytes(configuredChain.EndpointAddress)); err != nil {
 			return err
 		}

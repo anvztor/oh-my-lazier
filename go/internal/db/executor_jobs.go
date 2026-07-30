@@ -14,12 +14,23 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// MaxLzReceiveDeliveryAttempts bounds how many times a reverting lzReceive is
+// re-broadcast before the job is parked for manual review. Each attempt is a
+// paid on-chain transaction, so an unbounded loop would drain the executor
+// signer against a receiver that reverts at execution. The cap is enforced on
+// both retry drivers: the executor deliverer and the txmgr receipt-retry path.
+const MaxLzReceiveDeliveryAttempts = 5
+
 // ExecutorJobRecord records an OpenExecutor assignment for a known packet.
 type ExecutorJobRecord struct {
 	GUID        common.Hash
 	AssignedFee *big.Int
 	Status      string
 	LastError   string
+	RetryCount  int64
+	// ReceiveTxHash is the last lzReceive tx hash applied to this job (success
+	// or counted failure); zero until a receive outcome has been recorded.
+	ReceiveTxHash common.Hash
 }
 
 // ExecutorWorkItem is a packet plus its executor job state selected for processing.
@@ -65,12 +76,16 @@ func (s *Store) GetExecutorJob(ctx context.Context, guid common.Hash) (ExecutorJ
 	}
 	var job ExecutorJobRecord
 	var feeText *string
+	var receiveTxHash []byte
 	if err := s.pool.QueryRow(ctx, `
-		SELECT guid, assigned_fee::text, status, COALESCE(last_error, '')
+		SELECT guid, assigned_fee::text, status, COALESCE(last_error, ''), retry_count, receive_tx_hash
 		FROM executor_jobs
 		WHERE guid = $1
-	`, guid.Bytes()).Scan(&job.GUID, &feeText, &job.Status, &job.LastError); err != nil {
+	`, guid.Bytes()).Scan(&job.GUID, &feeText, &job.Status, &job.LastError, &job.RetryCount, &receiveTxHash); err != nil {
 		return ExecutorJobRecord{}, err
+	}
+	if len(receiveTxHash) == common.HashLength {
+		job.ReceiveTxHash = common.BytesToHash(receiveTxHash)
 	}
 	if feeText != nil {
 		fee, err := bigutil.ParseDecimal("executor assigned fee", *feeText)
@@ -95,10 +110,17 @@ func (s *Store) ListExecutorWork(ctx context.Context, status string, limit int) 
 			p.guid, p.src_eid, p.dst_eid, p.nonce::text, p.sender, p.receiver,
 			p.send_lib, p.src_tx_hash, p.src_block_number, p.src_log_index,
 			p.encoded_packet, p.packet_header, p.message, p.payload_hash,
-			p.options, p.status, ej.assigned_fee::text, ej.status
+			p.options, p.status, ej.assigned_fee::text, ej.status, ej.retry_count
 		FROM executor_jobs ej
 		JOIN packets p ON p.guid = ej.guid
 		WHERE ej.status = $1 AND (ej.next_retry_at IS NULL OR ej.next_retry_at <= now())
+			AND EXISTS (
+				SELECT 1 FROM pathways pw
+				WHERE pw.src_eid = p.src_eid AND pw.dst_eid = p.dst_eid
+					AND pw.src_oapp = p.sender AND pw.dst_oapp = p.receiver
+					AND pw.enabled AND NOT pw.paused
+			)
+			AND NOT EXISTS (SELECT 1 FROM chains c WHERE c.eid IN (p.src_eid, p.dst_eid) AND (NOT c.enabled OR c.paused))
 		ORDER BY ej.updated_at, ej.guid
 		LIMIT $2
 	`, status, limit)
@@ -129,6 +151,7 @@ func (s *Store) ListExecutorWork(ctx context.Context, status string, limit int) 
 			&row.PacketStatus,
 			&row.AssignedFee,
 			&row.JobStatus,
+			&row.RetryCount,
 		); err != nil {
 			return nil, err
 		}
@@ -221,6 +244,12 @@ func (s *Store) EnqueueExecutorTx(ctx context.Context, guid common.Hash, expecte
 	}
 	if currentStatus != expectedStatus {
 		return 0, fmt.Errorf("executor job %s status is %s, want %s", guid, currentStatus, expectedStatus)
+	}
+	// Refuse to enqueue new spend for a paused/disabled pathway or chain; the
+	// job keeps its current status and work selection re-offers it once the
+	// scope is active again.
+	if err := lockTxSendScope(ctx, tx, request.ChainEID, request.Purpose, request.GUID); err != nil {
+		return 0, err
 	}
 
 	var id int64
@@ -365,16 +394,22 @@ func (s *Store) MarkExecutorDeliveredObserved(ctx context.Context, guid, txHash 
 }
 
 // MarkExecutorReceiveFailed records an LzReceiveAlert or failed lzReceive receipt.
+// Each failing tx hash is counted at most once per job: the receipt applier and
+// the destination-event observer both report the same on-chain failure, and a
+// crash-replayed receipt may arrive after the deliverer already re-enqueued the
+// job, so a repeat of an already-counted hash is a no-op instead of charging
+// the retry budget twice and failing the in-flight attempt.
 func (s *Store) MarkExecutorReceiveFailed(ctx context.Context, guid, txHash common.Hash, reason string) error {
 	if txHash == (common.Hash{}) {
 		return errors.New("executor receive tx hash is required")
 	}
 	return s.updateExecutorStatus(ctx, executorStatusUpdate{
-		GUID:               guid,
-		ExpectedStatus:     string(packets.ExecutorLzReceiveTxEnqueued),
-		NextStatus:         string(packets.ExecutorLzReceiveFailed),
-		ReceiveTxHashBytes: txHash.Bytes(),
-		LastError:          reason,
+		GUID:                guid,
+		ExpectedStatus:      string(packets.ExecutorLzReceiveTxEnqueued),
+		NextStatus:          string(packets.ExecutorLzReceiveFailed),
+		ReceiveTxHashBytes:  txHash.Bytes(),
+		LastError:           reason,
+		IncrementRetryCount: true,
 	})
 }
 
@@ -384,21 +419,23 @@ func (s *Store) MarkExecutorReceiveFailedObserved(ctx context.Context, guid, txH
 		return errors.New("executor receive tx hash is required")
 	}
 	return s.updateExecutorStatus(ctx, executorStatusUpdate{
-		GUID:               guid,
-		ExpectedStatus:     expectedStatus,
-		NextStatus:         string(packets.ExecutorLzReceiveFailed),
-		ReceiveTxHashBytes: txHash.Bytes(),
-		LastError:          reason,
+		GUID:                guid,
+		ExpectedStatus:      expectedStatus,
+		NextStatus:          string(packets.ExecutorLzReceiveFailed),
+		ReceiveTxHashBytes:  txHash.Bytes(),
+		LastError:           reason,
+		IncrementRetryCount: true,
 	})
 }
 
 type executorStatusUpdate struct {
-	GUID               common.Hash
-	ExpectedStatus     string
-	NextStatus         string
-	CommitTxHashBytes  []byte
-	ReceiveTxHashBytes []byte
-	LastError          string
+	GUID                common.Hash
+	ExpectedStatus      string
+	NextStatus          string
+	CommitTxHashBytes   []byte
+	ReceiveTxHashBytes  []byte
+	LastError           string
+	IncrementRetryCount bool
 }
 
 func (s *Store) updateExecutorStatus(ctx context.Context, update executorStatusUpdate) error {
@@ -414,6 +451,9 @@ func (s *Store) updateExecutorStatus(ctx context.Context, update executorStatusU
 	if len(update.ReceiveTxHashBytes) != 0 && len(update.ReceiveTxHashBytes) != common.HashLength {
 		return errors.New("executor receive tx hash must be 32 bytes")
 	}
+	if update.IncrementRetryCount && len(update.ReceiveTxHashBytes) == 0 {
+		return errors.New("executor retry accounting requires the failing receive tx hash")
+	}
 	lastErrorArg := any(nil)
 	if update.LastError != "" {
 		lastErrorArg = update.LastError
@@ -424,6 +464,25 @@ func (s *Store) updateExecutorStatus(ctx context.Context, update executorStatusU
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Inserting into executor_receive_failures is the counting condition: each
+	// failing tx hash charges the retry budget at most once per job, so a
+	// crash-replayed receipt or a lagging LzReceiveAlert for an already-counted
+	// hash — even one from several attempts back — is a benign no-op instead of
+	// double-charging the budget and failing the in-flight attempt. The insert
+	// and the status transition commit atomically.
+	if update.IncrementRetryCount {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO executor_receive_failures (guid, tx_hash)
+			VALUES ($1, $2)
+			ON CONFLICT (guid, tx_hash) DO NOTHING
+		`, update.GUID.Bytes(), update.ReceiveTxHashBytes)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE executor_jobs
 		SET
@@ -431,9 +490,10 @@ func (s *Store) updateExecutorStatus(ctx context.Context, update executorStatusU
 			commit_tx_hash = COALESCE($4, commit_tx_hash),
 			receive_tx_hash = COALESCE($5, receive_tx_hash),
 			last_error = $6,
+			retry_count = CASE WHEN $7::boolean THEN retry_count + 1 ELSE retry_count END,
 			updated_at = now()
 		WHERE guid = $2 AND status = $3
-	`, update.NextStatus, update.GUID.Bytes(), update.ExpectedStatus, optionalBytes(update.CommitTxHashBytes), optionalBytes(update.ReceiveTxHashBytes), lastErrorArg)
+	`, update.NextStatus, update.GUID.Bytes(), update.ExpectedStatus, optionalBytes(update.CommitTxHashBytes), optionalBytes(update.ReceiveTxHashBytes), lastErrorArg, update.IncrementRetryCount)
 	if err != nil {
 		return err
 	}
@@ -469,6 +529,7 @@ type executorWorkRow struct {
 	PacketStatus   string
 	AssignedFee    *string
 	JobStatus      string
+	RetryCount     int64
 }
 
 func (r executorWorkRow) toExecutorWorkItem() (ExecutorWorkItem, error) {
@@ -523,6 +584,7 @@ func (r executorWorkRow) toExecutorWorkItem() (ExecutorWorkItem, error) {
 			GUID:        guid,
 			AssignedFee: assignedFee,
 			Status:      r.JobStatus,
+			RetryCount:  r.RetryCount,
 		},
 	}, nil
 }
