@@ -60,6 +60,9 @@ generate-pricing-abi:
 check-pricing-abi:
 	npm run check:pricing-abi
 
+# Integration tests share one Postgres instance; chain/pathway pause and enable
+# flags are load-bearing global state for the send-scope gates, so packages must
+# not run in parallel against the same database (-p 1).
 test-integration:
 	@set -e; \
 	cleanup() { \
@@ -67,7 +70,7 @@ test-integration:
 	}; \
 	trap cleanup EXIT INT TERM; \
 	$(INTEGRATION_COMPOSE) up -d --wait; \
-	TEST_POSTGRES_URL="$(INTEGRATION_POSTGRES_URL)" RUSTACK_KMS_ENDPOINT="$(INTEGRATION_RUSTACK_ENDPOINT)" go test -count=1 ./...; \
+	TEST_POSTGRES_URL="$(INTEGRATION_POSTGRES_URL)" RUSTACK_KMS_ENDPOINT="$(INTEGRATION_RUSTACK_ENDPOINT)" go test -count=1 -p 1 ./...; \
 
 test-kms-rustack:
 	@if [ -z "$$RUSTACK_KMS_ENDPOINT" ]; then \

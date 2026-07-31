@@ -2,6 +2,7 @@ package kms
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/asn1"
 	"errors"
 	"fmt"
@@ -26,7 +27,7 @@ var (
 
 // Client is the KMS API boundary used by Signer.
 type Client interface {
-	GetPublicKey(ctx context.Context, keyID string) (kmstypes.KeySpec, error)
+	GetPublicKey(ctx context.Context, keyID string) ([]byte, kmstypes.KeySpec, error)
 	SignDigest(ctx context.Context, keyID string, digest common.Hash) ([]byte, error)
 }
 
@@ -47,13 +48,13 @@ func NewSDKClientWithEndpoint(cfg aws.Config, endpoint string) *SDKClient {
 	})}
 }
 
-// GetPublicKey returns the KMS asymmetric key spec.
-func (c *SDKClient) GetPublicKey(ctx context.Context, keyID string) (kmstypes.KeySpec, error) {
+// GetPublicKey returns the KMS DER-encoded public key and asymmetric key spec.
+func (c *SDKClient) GetPublicKey(ctx context.Context, keyID string) ([]byte, kmstypes.KeySpec, error) {
 	out, err := c.client.GetPublicKey(ctx, &awskms.GetPublicKeyInput{KeyId: aws.String(keyID)})
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	return out.KeySpec, nil
+	return out.PublicKey, out.KeySpec, nil
 }
 
 // SignDigest signs a 32-byte digest with AWS KMS ECDSA_SHA_256.
@@ -82,19 +83,50 @@ func New(client Client, keyID string, address common.Address) *Signer {
 	return &Signer{client: client, keyID: keyID, address: address}
 }
 
-// ValidateKey confirms that the configured KMS key is ECC_SECG_P256K1.
+// ValidateKey confirms the configured KMS key is ECC_SECG_P256K1 and that its
+// public key resolves to the configured Ethereum address, so a key/address
+// mismatch fails fast at startup instead of at the first signature recovery.
 func (s *Signer) ValidateKey(ctx context.Context) error {
 	if s.client == nil {
 		return errors.New("kms client is required")
 	}
-	spec, err := s.client.GetPublicKey(ctx, s.keyID)
+	der, spec, err := s.client.GetPublicKey(ctx, s.keyID)
 	if err != nil {
 		return err
 	}
 	if spec != kmstypes.KeySpecEccSecgP256k1 {
 		return fmt.Errorf("kms key %s has key spec %s, want %s", s.keyID, spec, kmstypes.KeySpecEccSecgP256k1)
 	}
+	publicKey, err := parseKMSPublicKey(der)
+	if err != nil {
+		return fmt.Errorf("kms key %s has an invalid public key: %w", s.keyID, err)
+	}
+	if derived := crypto.PubkeyToAddress(*publicKey); derived != s.address {
+		return fmt.Errorf("kms key %s resolves to address %s, want %s", s.keyID, derived, s.address)
+	}
 	return nil
+}
+
+type subjectPublicKeyInfo struct {
+	Algorithm        asn1.RawValue
+	SubjectPublicKey asn1.BitString
+}
+
+// parseKMSPublicKey extracts the secp256k1 public key from a DER-encoded
+// SubjectPublicKeyInfo as returned by AWS KMS GetPublicKey.
+func parseKMSPublicKey(der []byte) (*ecdsa.PublicKey, error) {
+	var spki subjectPublicKeyInfo
+	rest, err := asn1.Unmarshal(der, &spki)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("public key has trailing DER bytes")
+	}
+	if len(spki.SubjectPublicKey.Bytes) == 0 {
+		return nil, errors.New("public key is empty")
+	}
+	return crypto.UnmarshalPubkey(spki.SubjectPublicKey.Bytes)
 }
 
 // Address returns the Ethereum address expected to recover from KMS signatures.

@@ -39,6 +39,12 @@ const outputs: AbiOutput[] = [
         artifact:
           "contracts/artifacts/contracts/contracts/workers/OpenPriceFeed.sol/OpenPriceFeed.json",
         type: "function",
+        name: "priceSnapshot",
+      },
+      {
+        artifact:
+          "contracts/artifacts/contracts/contracts/workers/OpenPriceFeed.sol/OpenPriceFeed.json",
+        type: "function",
         name: "setPriceSnapshot",
       },
     ],

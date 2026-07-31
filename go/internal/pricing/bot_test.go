@@ -21,7 +21,7 @@ func TestBotEnqueueOnceQueuesSharedPriceFeedUpdates(t *testing.T) {
 	registry := testRegistry(t)
 	store := &fakeStore{}
 	logger, logs := captureLogger(slog.LevelInfo)
-	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), logger)
+	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), emptySnapshotReader{}, logger)
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -66,6 +66,30 @@ func TestBotEnqueueOnceQueuesSharedPriceFeedUpdates(t *testing.T) {
 	})
 }
 
+func TestBotEnqueueOnceSkipsInactiveSendScope(t *testing.T) {
+	registry := testRegistry(t)
+	store := &fakeStore{enqueueErr: db.ErrTxSendScopeInactive}
+	logger, logs := captureLogger(slog.LevelDebug)
+	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), emptySnapshotReader{}, logger)
+	if err != nil {
+		t.Fatalf("NewWithDependencies() error = %v", err)
+	}
+	bot.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+
+	// A paused/disabled send chain skips this cycle's update without failing
+	// the pricing loop; the next cycle after unpause enqueues fresh prices.
+	if err := bot.EnqueueOnce(context.Background()); err != nil {
+		t.Fatalf("EnqueueOnce() error = %v, want skipped without error", err)
+	}
+	if len(store.requests) != 0 {
+		t.Fatalf("enqueued requests = %d, want none", len(store.requests))
+	}
+	assertLogContains(t, logs.String(),
+		`msg="skipped price update tx enqueue"`,
+		`reason=send_scope_inactive`,
+	)
+}
+
 func TestBotEnqueueOnceRejectsDeviationWithoutEnqueue(t *testing.T) {
 	registry := testRegistry(t)
 	store := &fakeStore{}
@@ -76,7 +100,7 @@ func TestBotEnqueueOnceRejectsDeviationWithoutEnqueue(t *testing.T) {
 		Gas:               fixedGas{price: big.NewInt(1_000_000_000)},
 		DataFeePerByteWei: big.NewInt(0),
 	}
-	bot, err := NewWithDependencies(store, registry, testSettings(), sources, discardLogger())
+	bot, err := NewWithDependencies(store, registry, testSettings(), sources, emptySnapshotReader{}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -86,6 +110,90 @@ func TestBotEnqueueOnceRejectsDeviationWithoutEnqueue(t *testing.T) {
 	}
 	if len(store.requests) != 0 {
 		t.Fatalf("enqueued requests = %d, want 0", len(store.requests))
+	}
+}
+
+func TestBotEnqueueOnceGatesWritesByDeviationAndHeartbeat(t *testing.T) {
+	const nowUnix = uint64(1_700_000_000)
+	pathways := testPathways()
+	tests := []struct {
+		name             string
+		destinationGas   int64
+		lastUpdatedAt    uint64
+		wantRequests     int
+		wantDeviationBps uint64
+	}{
+		{
+			name:             "unchanged before heartbeat skips",
+			destinationGas:   2_000_000_000,
+			lastUpdatedAt:    nowUnix - 300,
+			wantRequests:     0,
+			wantDeviationBps: 0,
+		},
+		{
+			name:             "deviation threshold writes",
+			destinationGas:   2_020_000_000,
+			lastUpdatedAt:    nowUnix - 300,
+			wantRequests:     1,
+			wantDeviationBps: 100,
+		},
+		{
+			name:             "heartbeat writes unchanged price",
+			destinationGas:   2_000_000_000,
+			lastUpdatedAt:    nowUnix - 900,
+			wantRequests:     1,
+			wantDeviationBps: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := testRegistryWithPathways(t, []config.PathwayConfig{pathways[0]})
+			store := &fakeStore{}
+			sources := testSources()
+			sources[40449] = ChainSources{
+				Primary:           testConfiguredPrice("primary", big.NewRat(1000, 1)),
+				Gas:               fixedGas{price: big.NewInt(test.destinationGas)},
+				DataFeePerByteWei: big.NewInt(0),
+			}
+			logger, logs := captureLogger(slog.LevelDebug)
+			reader := fixedSnapshotReader{snapshot: PriceSnapshot{
+				DstGasPriceInSrcToken:       big.NewInt(1_000_000_000),
+				DstDataFeePerByteInSrcToken: big.NewInt(0),
+				UpdatedAt:                   test.lastUpdatedAt,
+				StaleAfter:                  1800,
+			}}
+			bot, err := NewWithDependencies(store, registry, testSettings(), sources, reader, logger)
+			if err != nil {
+				t.Fatalf("NewWithDependencies() error = %v", err)
+			}
+			bot.now = func() time.Time { return time.Unix(int64(nowUnix), 0) }
+
+			if err := bot.EnqueueOnce(context.Background()); err != nil {
+				t.Fatalf("EnqueueOnce() error = %v", err)
+			}
+			if len(store.requests) != test.wantRequests {
+				t.Fatalf("enqueued requests = %d, want %d", len(store.requests), test.wantRequests)
+			}
+			if test.wantRequests == 0 {
+				assertLogContains(t, logs.String(),
+					`msg="skipped price snapshot update"`,
+					`reason=below_deviation_and_heartbeat`,
+					`deviation_bps=0`,
+					`heartbeat_seconds=900`,
+				)
+				return
+			}
+			wantPrice := new(big.Int).Quo(big.NewInt(test.destinationGas), big.NewInt(2))
+			assertRequestMatchesSnapshot(t, store.requests, pathways[0].SourceWorkers.PriceFeed.Common(), pathways[0].DstEID, PriceSnapshot{
+				DstGasPriceInSrcToken:       wantPrice,
+				DstDataFeePerByteInSrcToken: big.NewInt(0),
+				UpdatedAt:                   nowUnix,
+				StaleAfter:                  1800,
+			})
+			if got := PriceChangeBps(big.NewInt(1_000_000_000), wantPrice); got != test.wantDeviationBps {
+				t.Fatalf("PriceChangeBps() = %d, want %d", got, test.wantDeviationBps)
+			}
+		})
 	}
 }
 
@@ -104,7 +212,7 @@ func TestBotEnqueueOnceUsesSameNativeAssetConversionWithoutPriceReaders(t *testi
 			DataFeePerByteWei: big.NewInt(123),
 			NativeAssetID:     "eth",
 		},
-	}, discardLogger())
+	}, emptySnapshotReader{}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -133,7 +241,7 @@ func TestBotEnqueueOnGasSpikeQueuesOnlyAboveThreshold(t *testing.T) {
 	bot, err := NewWithDependencies(store, registry, testSettings(), map[uint32]ChainSources{
 		40161: {Primary: testConfiguredPrice("primary", big.NewRat(2000, 1)), Gas: sourceGas, DataFeePerByteWei: big.NewInt(0)},
 		40449: {Primary: testConfiguredPrice("primary", big.NewRat(1000, 1)), Gas: destinationGas, DataFeePerByteWei: big.NewInt(0)},
-	}, logger)
+	}, emptySnapshotReader{}, logger)
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -181,7 +289,7 @@ func TestBotEnqueueOnceDeduplicatesSharedPriceFeed(t *testing.T) {
 	pathways = []config.PathwayConfig{pathways[0], duplicate}
 	registry := testRegistryWithPathways(t, pathways)
 	store := &fakeStore{}
-	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), discardLogger())
+	bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), emptySnapshotReader{}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -218,7 +326,7 @@ func TestBotEnqueueOnceBatchesSameSourcePriceFeedTargets(t *testing.T) {
 		Gas:               fixedGas{price: big.NewInt(3_000_000_000)},
 		DataFeePerByteWei: big.NewInt(0),
 	}
-	bot, err := NewWithDependencies(store, registry, testSettings(), sources, discardLogger())
+	bot, err := NewWithDependencies(store, registry, testSettings(), sources, emptySnapshotReader{}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -271,7 +379,7 @@ func TestBotEnqueueOnGasSpikeBatchesSameSourcePriceFeedTargets(t *testing.T) {
 	sources := testSources()
 	sources[40449] = ChainSources{Primary: testConfiguredPrice("primary", big.NewRat(1000, 1)), Gas: destinationGas, DataFeePerByteWei: big.NewInt(0)}
 	sources[40500] = ChainSources{Primary: testConfiguredPrice("primary", big.NewRat(500, 1)), Gas: alternateGas, DataFeePerByteWei: big.NewInt(0)}
-	bot, err := NewWithDependencies(store, registry, testSettings(), sources, discardLogger())
+	bot, err := NewWithDependencies(store, registry, testSettings(), sources, emptySnapshotReader{}, discardLogger())
 	if err != nil {
 		t.Fatalf("NewWithDependencies() error = %v", err)
 	}
@@ -350,7 +458,7 @@ func TestBotEnqueueOnceRejectsConflictingSharedRoleFeeModel(t *testing.T) {
 			test.mutate(&duplicate)
 			registry := testRegistryWithPathways(t, []config.PathwayConfig{pathways[0], duplicate})
 			store := &fakeStore{}
-			bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), discardLogger())
+			bot, err := NewWithDependencies(store, registry, testSettings(), testSources(), emptySnapshotReader{}, discardLogger())
 			if err != nil {
 				t.Fatalf("NewWithDependencies() error = %v", err)
 			}
@@ -370,10 +478,36 @@ func TestBotEnqueueOnceRejectsConflictingSharedRoleFeeModel(t *testing.T) {
 }
 
 type fakeStore struct {
-	requests []db.TxRequest
+	requests   []db.TxRequest
+	enqueueErr error
+}
+
+type emptySnapshotReader struct{}
+
+func (emptySnapshotReader) PriceSnapshot(context.Context, uint32, common.Address, uint32) (PriceSnapshot, error) {
+	return PriceSnapshot{
+		DstGasPriceInSrcToken:       big.NewInt(0),
+		DstDataFeePerByteInSrcToken: big.NewInt(0),
+	}, nil
+}
+
+type fixedSnapshotReader struct {
+	snapshot PriceSnapshot
+}
+
+func (r fixedSnapshotReader) PriceSnapshot(context.Context, uint32, common.Address, uint32) (PriceSnapshot, error) {
+	return PriceSnapshot{
+		DstGasPriceInSrcToken:       new(big.Int).Set(r.snapshot.DstGasPriceInSrcToken),
+		DstDataFeePerByteInSrcToken: new(big.Int).Set(r.snapshot.DstDataFeePerByteInSrcToken),
+		UpdatedAt:                   r.snapshot.UpdatedAt,
+		StaleAfter:                  r.snapshot.StaleAfter,
+	}, nil
 }
 
 func (s *fakeStore) EnqueueTx(_ context.Context, request db.TxRequest) (int64, error) {
+	if s.enqueueErr != nil {
+		return 0, s.enqueueErr
+	}
 	s.requests = append(s.requests, request)
 	return int64(len(s.requests)), nil
 }
@@ -429,6 +563,8 @@ func testSettings() Settings {
 		Interval:             time.Minute,
 		StaleAfter:           30 * time.Minute,
 		MaxDeviation:         500,
+		MinUpdateDeviation:   50,
+		Heartbeat:            15 * time.Minute,
 		SourceRequestTimeout: time.Second,
 		GasSpikeBps:          1000,
 	}

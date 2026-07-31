@@ -194,8 +194,12 @@ func executorDestinationLogAlreadyApplied(status string, topic common.Hash) bool
 	case lzabi.PacketDeliveredTopic():
 		return status == string(packets.ExecutorDelivered)
 	case lzabi.LzReceiveAlertTopic():
+		// MANUAL_REVIEW mirrors the receipt applier's already-applied set: a
+		// parked job keeps its parked state, and the historical alert must not
+		// error out and wedge the destination cursor.
 		return status == string(packets.ExecutorLzReceiveFailed) ||
-			status == string(packets.ExecutorDelivered)
+			status == string(packets.ExecutorDelivered) ||
+			status == string(packets.ExecutorManualReview)
 	}
 	return false
 }

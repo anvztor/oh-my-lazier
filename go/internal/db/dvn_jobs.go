@@ -104,6 +104,13 @@ func (s *Store) ListDVNWork(ctx context.Context, status string, limit int) ([]DV
 		FROM dvn_jobs dj
 		JOIN packets p ON p.guid = dj.guid
 		WHERE dj.status = $1 AND (dj.next_retry_at IS NULL OR dj.next_retry_at <= now())
+			AND EXISTS (
+				SELECT 1 FROM pathways pw
+				WHERE pw.src_eid = p.src_eid AND pw.dst_eid = p.dst_eid
+					AND pw.src_oapp = p.sender AND pw.dst_oapp = p.receiver
+					AND pw.enabled AND NOT pw.paused
+			)
+			AND NOT EXISTS (SELECT 1 FROM chains c WHERE c.eid IN (p.src_eid, p.dst_eid) AND (NOT c.enabled OR c.paused))
 		ORDER BY dj.updated_at, dj.guid
 		LIMIT $2
 	`, status, limit)
@@ -258,6 +265,12 @@ func (s *Store) EnqueueDVNVerifyTx(ctx context.Context, guid common.Hash, expect
 	if currentStatus != expectedStatus {
 		return 0, fmt.Errorf("dvn job %s status is %s, want %s", guid, currentStatus, expectedStatus)
 	}
+	// Refuse to enqueue new spend for a paused/disabled pathway or chain; the
+	// job keeps its current status and work selection re-offers it once the
+	// scope is active again.
+	if err := lockTxSendScope(ctx, tx, request.ChainEID, request.Purpose, request.GUID); err != nil {
+		return 0, err
+	}
 
 	var id int64
 	if err := tx.QueryRow(ctx, `
@@ -336,6 +349,21 @@ func (s *Store) MarkDVNReorgDetected(ctx context.Context, guid common.Hash, expe
 		return errors.New("dvn reorg reason is required")
 	}
 	return s.updateDVNStatus(ctx, dvnStatusUpdate{GUID: guid, ExpectedStatus: expectedStatus, NextStatus: string(packets.DVNReorgDetected), LastError: reason, QuorumResult: quorumResult})
+}
+
+// MarkDVNManualReview parks a DVN job for operator review without pausing the
+// pathway: an operator-canceled verify transaction is not configuration drift,
+// so other packets on the pathway keep flowing.
+func (s *Store) MarkDVNManualReview(ctx context.Context, guid common.Hash, expectedStatus, reason string) error {
+	if reason == "" {
+		return errors.New("dvn manual review reason is required")
+	}
+	return s.updateDVNStatus(ctx, dvnStatusUpdate{
+		GUID:           guid,
+		ExpectedStatus: expectedStatus,
+		NextStatus:     string(packets.DVNManualReview),
+		LastError:      reason,
+	})
 }
 
 // MarkDVNManualReviewAndPausePathway atomically stops a job and its pathway after deterministic destination config drift.
@@ -438,6 +466,57 @@ func (s *Store) updateDVNStatus(ctx context.Context, update dvnStatusUpdate) err
 		return fmt.Errorf("dvn job %s is not in status %s", update.GUID, update.ExpectedStatus)
 	}
 	return nil
+}
+
+// MarkDVNReorgDetectedWithCoordinates records the reorg transition AND the
+// re-included source coordinates in one transaction. Two separate commits
+// would leave a window where another worker instance completes the
+// REORG_DETECTED -> WAITING_CONFIRMATIONS -> QUORUM_CHECKING round trip (the
+// OLD block is deep, so the confirmation gate passes instantly) before the
+// coordinates land — producing a QUORUM_CHECKING job with fresh coordinates
+// whose next receipt pass advances to verify without ever gating the NEW
+// block's depth. The status CAS still guards against a raced transition; the
+// coordinate write CASes on the old coordinates so a concurrent refresh (for
+// example the source indexer rescanning the block) is never clobbered.
+func (s *Store) MarkDVNReorgDetectedWithCoordinates(ctx context.Context, guid common.Hash, expectedStatus, reason string, quorumResult []byte, srcBlockNumber uint64, srcLogIndex uint, expectedSrcBlockNumber uint64, expectedSrcLogIndex uint) error {
+	if guid == (common.Hash{}) {
+		return errors.New("dvn job guid is required")
+	}
+	if expectedStatus == "" {
+		return errors.New("dvn expected status is required")
+	}
+	lastErrorArg := any(nil)
+	if reason != "" {
+		lastErrorArg = reason
+	}
+	quorumResultArg := any(nil)
+	if len(quorumResult) != 0 {
+		quorumResultArg = string(quorumResult)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+		UPDATE dvn_jobs
+		SET status = $1, last_error = $4, quorum_result = COALESCE($5::jsonb, quorum_result), updated_at = now()
+		WHERE guid = $2 AND status = $3
+	`, string(packets.DVNReorgDetected), guid.Bytes(), expectedStatus, lastErrorArg, quorumResultArg)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("dvn job %s is not in status %s", guid, expectedStatus)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE packets
+		SET src_block_number = $1, src_log_index = $2, updated_at = now()
+		WHERE guid = $3 AND src_block_number = $4 AND src_log_index = $5
+	`, int64(srcBlockNumber), int64(srcLogIndex), guid.Bytes(), int64(expectedSrcBlockNumber), int64(expectedSrcLogIndex)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // DVNWorkItem is a packet plus its DVN job state selected for processing.

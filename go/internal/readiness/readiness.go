@@ -12,6 +12,13 @@ const (
 	executorDestStream   = "executor_destination"
 	dvnSourceStream      = "dvn_source"
 	dvnDestStream        = "dvn_destination"
+
+	// repriceHeldStallSeconds is how long a held(reprice_required) lane may age
+	// before readiness treats it as stalled. Healthy automatic repricing cycles
+	// on a one-minute cooldown and escalates to reprice_exhausted within five
+	// attempts, so fifteen minutes of the same hold means the bump cannot land
+	// (typically the configured fee cap) and the operator must intervene.
+	repriceHeldStallSeconds = 15 * 60
 )
 
 // Services selects which worker role state should be evaluated for this process.
@@ -94,6 +101,43 @@ func EvaluateWithServices(snapshot db.StatsSnapshot, services Services) Report {
 			Code:    "failed_outbox",
 			Message: fmt.Sprintf("chain %d has %d exhausted failed tx_outbox rows", outbox.ChainEID, outbox.Count),
 		})
+	}
+	for _, held := range snapshot.TxOutboxHeld {
+		if held.Count == 0 {
+			continue
+		}
+		if _, ok := activeChains[held.ChainEID]; !ok {
+			continue
+		}
+		// Only operator-action holds block readiness: a held row parks the
+		// signer lane so no higher nonce is signed until it is resolved.
+		// reprice_required (below the automatic replacement cap) and
+		// nonce_reconcile_required self-heal through the automatic replacement
+		// and nonce reconciliation loops, and cancel_requested is an
+		// operator-initiated cancel already converging; a reprice hold past
+		// the cap surfaces as the synthetic reprice_exhausted reason and needs
+		// the operator.
+		switch held.HeldReason {
+		case db.HeldManual, db.HeldNonceConsumedExternally, db.HeldRepriceExhausted, db.HeldBroadcastExhausted:
+			issues = append(issues, Issue{
+				Code:    "held_signer_lane",
+				Message: fmt.Sprintf("chain %d signer %s has %d held(%s) tx_outbox rows blocking the nonce lane", held.ChainEID, held.SignerID, held.Count, held.HeldReason),
+			})
+		case db.HeldRepriceRequired:
+			// Self-healing only while the automatic reprice can actually land
+			// a bump. When the configured fee cap blocks the mandatory bump,
+			// every attempt defers before inserting anything, the replacement
+			// count never reaches reprice_exhausted, and the lane stays
+			// blocked with no synthetic escalation — so a reprice hold that
+			// has aged far past its one-minute cooldown cycle is stalled and
+			// needs the operator (a cap fix plus replace, or a cancel).
+			if held.OldestAgeSeconds > repriceHeldStallSeconds {
+				issues = append(issues, Issue{
+					Code:    "held_signer_lane",
+					Message: fmt.Sprintf("chain %d signer %s has %d held(reprice_required) tx_outbox rows stalled for %ds, likely blocked by the fee cap", held.ChainEID, held.SignerID, held.Count, held.OldestAgeSeconds),
+				})
+			}
+		}
 	}
 	for _, packet := range snapshot.Packets {
 		if packet.Status != string(packets.ExecutorManualReview) || packet.Count == 0 {

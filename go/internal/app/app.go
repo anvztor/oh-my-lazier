@@ -127,6 +127,32 @@ func (a *App) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if a.options.SkipOnchainCheck {
+			// -skip-onchain-check bypasses the config check that normally
+			// establishes each chain's head quorum before its first on-chain
+			// read. On-chain source validation below (Chainlink, Uniswap)
+			// reads contract identity over RPC, and a fresh quorum client
+			// would serve that from whichever provider is listed first —
+			// establish the majority trust state for those chains so a
+			// minority fork cannot bias startup validation. Chains with only
+			// HTTP market-data sources make no startup RPC reads and are
+			// skipped.
+			for _, pricingChain := range a.cfg.Pricing.Chains {
+				if !pricingChainUsesSource(pricingChain, "chainlink") && !pricingChainUsesSource(pricingChain, "uniswap") {
+					continue
+				}
+				configuredChain, err := registry.Get(pricingChain.EID)
+				if err != nil {
+					return err
+				}
+				if configuredChain.RPC == nil {
+					continue
+				}
+				if _, err := configuredChain.RPC.CheckHead(ctx); err != nil {
+					return fmt.Errorf("check chain %d rpc head quorum: %w", pricingChain.EID, err)
+				}
+			}
+		}
 		if err := pricing.ValidateSourceConfigurations(ctx, priceSources, a.priceSelectionPolicy()); err != nil {
 			return err
 		}
@@ -143,6 +169,28 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	if err := store.Migrate(ctx); err != nil {
 		return err
+	}
+
+	if a.options.SkipOnchainCheck {
+		// The bypassed config check is what normally establishes every chain's
+		// head quorum before its first on-chain read. The pricing chains with
+		// on-chain sources were probed before source validation above; probe
+		// every remaining configured chain here, before the durable loops
+		// start, so DVN destination-config validation, executor readiness
+		// reads, and gas polls never run against a fresh all-healthy
+		// classification that a forked first provider could exploit.
+		for _, configuredChainConfig := range a.cfg.Chains {
+			configuredChain, err := registry.Get(configuredChainConfig.EID)
+			if err != nil {
+				return err
+			}
+			if configuredChain.RPC == nil {
+				continue
+			}
+			if _, err := configuredChain.RPC.CheckHead(ctx); err != nil {
+				return fmt.Errorf("check chain %d rpc head quorum: %w", configuredChainConfig.EID, err)
+			}
+		}
 	}
 
 	a.logger.Info("synchronizing registry configuration...")
@@ -350,10 +398,12 @@ func (a *App) priceBotWithSources(store *db.Store, registry *chain.Registry, sou
 		Interval:             time.Duration(a.cfg.Pricing.IntervalSeconds) * time.Second,
 		StaleAfter:           time.Duration(a.cfg.Pricing.StaleAfterSeconds) * time.Second,
 		MaxDeviation:         a.cfg.Pricing.MaxDeviationBps,
+		MinUpdateDeviation:   a.cfg.Pricing.MinUpdateDeviationBps,
+		Heartbeat:            time.Duration(a.cfg.Pricing.HeartbeatSeconds) * time.Second,
 		SourceRequestTimeout: time.Duration(a.cfg.Pricing.SourceRequestTimeoutSeconds) * time.Second,
 		GasSpikeBps:          a.cfg.Pricing.GasSpikeBps,
 	}
-	return pricing.NewWithDependencies(store, registry, settings, sources, a.logger)
+	return pricing.NewWithDependencies(store, registry, settings, sources, pricing.NewOnChainPriceSnapshotReader(registry), a.logger)
 }
 
 func (a *App) priceSelectionPolicy() pricing.PriceSelectionPolicy {
@@ -606,9 +656,11 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 		}
 		targets = append(targets, txmgr.Target{
 			ChainEID:            configuredChain.EID,
+			ChainName:           configuredChain.Name,
 			ChainID:             new(big.Int).Set(configuredChain.ChainID),
 			Signer:              configuredSigner,
 			Client:              configuredChain.RPC,
+			Confirmations:       configuredChain.Confirmations,
 			FeePolicies:         cloneFeePolicies(requirement.policies),
 			MinNativeBalanceWei: bigutil.Clone(requirement.minNativeBalanceWei),
 		})
