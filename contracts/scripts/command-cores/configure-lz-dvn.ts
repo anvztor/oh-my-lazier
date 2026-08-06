@@ -40,7 +40,8 @@ export function parseConfigureLzDVNCommandInput(
     "sendUln",
     "receiveUln",
     "requiredDVNs",
-    "confirmations",
+    "sendConfirmations",
+    "receiveConfirmations",
     "expectedSigner",
   ]);
   return {
@@ -50,7 +51,8 @@ export function parseConfigureLzDVNCommandInput(
     sendUln: addressField(input, "sendUln", label),
     receiveUln: addressField(input, "receiveUln", label),
     requiredDVNs: addressArrayField(input, "requiredDVNs", label),
-    confirmations: bigintField(input, "confirmations", label),
+    sendConfirmations: bigintField(input, "sendConfirmations", label),
+    receiveConfirmations: bigintField(input, "receiveConfirmations", label),
     expectedSigner: addressField(input, "expectedSigner", label),
   };
 }
@@ -72,7 +74,9 @@ export async function runConfigureLzDVNCommand(
     await gate.authorize({
       command: "configure:lz-dvn",
       targets: [{ network: context.networkName, chainId: context.chainId }],
-      actions: ["set LayerZero send and receive ULN configurations"],
+      actions: [
+        "set LayerZero send and receive ULN configurations (per-library confirmations)",
+      ],
     });
     await configureLzDVN(runFile.input, chainClients(context));
   });

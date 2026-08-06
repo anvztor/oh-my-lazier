@@ -211,6 +211,9 @@ func (s *Store) peekSendableTx(ctx context.Context, chainEID uint32, signerID st
 			AND (o.next_sign_at IS NULL OR o.next_sign_at <= now())
 			AND (o.lease_until IS NULL OR o.lease_until <= now())
 			AND o.cancel_requested_at IS NULL
+			-- A pinned receipt resolution means the nonce is consumed; such a
+			-- row must never be selected for signing again.
+			AND o.receipt_outcome IS NULL
 			-- Rows without a nonce whose send scope is paused/disabled are held
 			-- back here so they cannot starve active work behind them; the
 			-- signing gate re-checks the scope under share locks.
@@ -393,21 +396,24 @@ func (s *Store) MarkQueuedTxEstimateRevertFailed(ctx context.Context, id int64, 
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var attempts uint32
+	var purpose string
 	if err := tx.QueryRow(ctx, `
-		SELECT attempts
+		SELECT attempts, purpose
 		FROM tx_outbox
 		WHERE id = $1 AND status = $2
 			AND nonce IS NULL AND active_attempt_id IS NULL
 			AND (lease_until IS NULL OR lease_until <= now())
 		FOR UPDATE
-	`, id, TxStatusQueued).Scan(&attempts); errors.Is(err, pgx.ErrNoRows) {
+	`, id, TxStatusQueued).Scan(&attempts, &purpose); errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
 
 	var retryAt any
-	if attempts < TxAutoRetryMaxAttempts {
+	// A failed pricing row is terminal (its calldata carries a time-bound
+	// observation the retry paths refuse), so it never gets a retry window.
+	if attempts < TxAutoRetryMaxAttempts && purpose != TxPurposePricingSetPriceSnapshot {
 		retryAt = time.Now().UTC().Add(autoRetryDelay(attempts))
 	}
 	if _, err := tx.Exec(ctx, `
@@ -447,12 +453,15 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 		Nonce       *int64
 		FailureKind string
 	}
+	var receiptOutcome *string
+	var toAddress []byte
+	var rowSignerID string
 	if err := tx.QueryRow(ctx, `
-		SELECT chain_eid, purpose, guid, nonce, COALESCE(failure_kind, '')
+		SELECT chain_eid, purpose, guid, nonce, COALESCE(failure_kind, ''), receipt_outcome, to_address, signer_id
 		FROM tx_outbox
 		WHERE id = $1 AND status = $2
 		FOR UPDATE
-	`, id, TxStatusFailed).Scan(&row.ChainEID, &row.Purpose, &row.GUID, &row.Nonce, &row.FailureKind); errors.Is(err, pgx.ErrNoRows) {
+	`, id, TxStatusFailed).Scan(&row.ChainEID, &row.Purpose, &row.GUID, &row.Nonce, &row.FailureKind, &receiptOutcome, &toAddress, &rowSignerID); errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("outbox tx %d is not failed", id)
 	} else if err != nil {
 		return 0, err
@@ -463,6 +472,66 @@ func (s *Store) RetryFailedTx(ctx context.Context, id int64) (int64, error) {
 	// either in place would try to reuse a consumed nonce.
 	if row.FailureKind == TxFailureCanceled || row.FailureKind == TxFailureNonceConsumedExternally {
 		return 0, fmt.Errorf("outbox tx %d failure kind %s is not retryable", id, row.FailureKind)
+	}
+
+	// A pinned receipt resolution means an attempt of this row mined and its
+	// nonce is consumed. Rows whose failure kind was finalized to NULL (for
+	// example an lzReceive failure whose executor job already advanced or
+	// parked) would otherwise take the requeue-in-place branch below, re-sign
+	// on the consumed nonce, and wedge the signer lane with an attempt the
+	// broadcast claim always refuses. Only the receipt-failed clone branch may
+	// act on such evidence, and it leaves the original row terminal.
+	if receiptOutcome != nil && row.FailureKind != TxFailureReceiptFailed {
+		return 0, fmt.Errorf("outbox tx %d has a pinned receipt resolution and its nonce is consumed; the row cannot be requeued in place", id)
+	}
+
+	// Pricing calldata carries a time-bound market observation: re-signing it
+	// later would write a price whose updatedAt may already be past its own
+	// staleAfter, so nonce-less pricing failures are refused and the bot
+	// rebuilds from a fresh observation. The exception is a failed pricing row
+	// still HOLDING an unconsumed nonce (an upgraded database can carry
+	// historical sign/broadcast failures from before the attempts cutover):
+	// nothing else can fill that nonce — failed rows do not block the
+	// lower-nonce selector, so newer transactions would sign above the gap and
+	// never mine — and the strictly-increasing on-chain timestamp makes a
+	// superseded re-send a harmless skip. The in-place requeue below keeps the
+	// nonce; pinned rows (consumed nonce) were already refused above.
+	// A receipt-failed pricing row is refused too: its nonce was consumed by
+	// the mined attempt, and the clone branch would re-sign the stale
+	// observation on a fresh nonce.
+	if row.Purpose == TxPurposePricingSetPriceSnapshot && (row.Nonce == nil || row.FailureKind == TxFailureReceiptFailed) {
+		return 0, fmt.Errorf("outbox tx %d carries a pricing observation and is not retryable; the price bot rebuilds automatically", id)
+	}
+	// The legacy in-place requeue participates in the same per-feed invariant
+	// as the bot's enqueue: under the feed advisory lock, an in-flight snapshot
+	// for the feed refuses the requeue, so two snapshots can never race and the
+	// stale calldata only re-signs to fill the nonce once the feed is idle.
+	if row.Purpose == TxPurposePricingSetPriceSnapshot {
+		if _, err := tx.Exec(ctx,
+			"SELECT pg_advisory_xact_lock($1::integer, hashtext($2)::integer)",
+			int32(row.ChainEID), "pricing_feed:"+common.BytesToAddress(toAddress).Hex(),
+		); err != nil {
+			return 0, err
+		}
+		// A same-signer in-flight row at a HIGHER nonce does not block: it can
+		// never mine before this row's nonce gap is filled, so refusing here
+		// would deadlock both (the pre-round-9 bot could enqueue such a row
+		// before gap rows became feed gates). Everything else — un-nonced
+		// queued rows, lower/equal nonces, other signers' lanes — still
+		// refuses, keeping the one-snapshot-per-feed race closed.
+		var blockingExists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM tx_outbox
+				WHERE chain_eid = $1 AND purpose = $2 AND to_address = $3 AND status = ANY($4)
+					AND NOT (signer_id = $5 AND nonce IS NOT NULL AND nonce > $6)
+			)
+		`, row.ChainEID, row.Purpose, toAddress, txPricingPendingStatuses, rowSignerID, *row.Nonce).Scan(&blockingExists); err != nil {
+			return 0, err
+		}
+		if blockingExists {
+			return 0, fmt.Errorf("outbox tx %d cannot be requeued while another snapshot for its feed is in flight; retry after it resolves", id)
+		}
 	}
 
 	if row.Nonce == nil || row.FailureKind != TxFailureReceiptFailed {
@@ -573,6 +642,9 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 			AND next_retry_at IS NOT NULL
 			AND next_retry_at <= now()
 			AND failure_kind IN ($5, $6)
+			-- Pricing calldata carries a time-bound market observation and must
+			-- never be re-signed; the bot rebuilds from a fresh observation.
+			AND purpose <> $7
 			AND NOT EXISTS (
 				SELECT 1
 				FROM tx_outbox child
@@ -581,7 +653,7 @@ func (s *Store) PrepareNextFailedTxRetry(ctx context.Context, chainEID uint32, s
 		ORDER BY next_retry_at, id
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`, chainEID, signerID, TxStatusFailed, TxAutoRetryMaxAttempts, TxFailureEstimateGasRevert, TxFailureReceiptFailed).Scan(
+	`, chainEID, signerID, TxStatusFailed, TxAutoRetryMaxAttempts, TxFailureEstimateGasRevert, TxFailureReceiptFailed, TxPurposePricingSetPriceSnapshot).Scan(
 		&row.ID,
 		&row.ChainEID,
 		&row.Purpose,
@@ -681,6 +753,10 @@ func deferFailedTxRetry(ctx context.Context, tx pgx.Tx, id int64) error {
 }
 
 func requeueFailedTx(ctx context.Context, tx pgx.Tx, id int64) error {
+	// receipt_outcome IS NULL is a structural invariant, not just an entry
+	// guard: a pinned resolution means the nonce is consumed, and a requeued
+	// row would re-sign an attempt the broadcast claim always refuses,
+	// wedging the signer lane behind it.
 	tag, err := tx.Exec(ctx, `
 		UPDATE tx_outbox
 		SET
@@ -690,13 +766,13 @@ func requeueFailedTx(ctx context.Context, tx pgx.Tx, id int64) error {
 			next_retry_at = NULL,
 			last_error = NULL,
 			updated_at = now()
-		WHERE id = $2 AND status = $3
+		WHERE id = $2 AND status = $3 AND receipt_outcome IS NULL
 	`, TxStatusQueued, id, TxStatusFailed)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("outbox tx %d is not failed", id)
+		return fmt.Errorf("outbox tx %d is not failed without a pinned receipt resolution", id)
 	}
 	return nil
 }

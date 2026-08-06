@@ -171,6 +171,7 @@ func (s *Store) ClaimOutboxForSigning(ctx context.Context, id int64, chainEID ui
 		WHERE id = $1 AND chain_eid = $2 AND signer_id = $3
 			AND (lease_until IS NULL OR lease_until <= now())
 			AND cancel_requested_at IS NULL
+			AND receipt_outcome IS NULL
 		FOR UPDATE
 	`, id, chainEID, signerID).Scan(&status, &purpose, &guid, &nonce)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -847,11 +848,12 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 	}
 
 	var attempts uint32
+	var purpose string
 	var pinnedOutcome *string
 	var pinnedAttemptID *int64
 	if err := tx.QueryRow(ctx, `
-		SELECT attempts, receipt_outcome, receipt_attempt_id FROM tx_outbox WHERE id = $1 FOR UPDATE
-	`, outboxID).Scan(&attempts, &pinnedOutcome, &pinnedAttemptID); errors.Is(err, pgx.ErrNoRows) {
+		SELECT attempts, purpose, receipt_outcome, receipt_attempt_id FROM tx_outbox WHERE id = $1 FOR UPDATE
+	`, outboxID).Scan(&attempts, &purpose, &pinnedOutcome, &pinnedAttemptID); errors.Is(err, pgx.ErrNoRows) {
 		return "", fmt.Errorf("outbox tx %d not found", outboxID)
 	} else if err != nil {
 		return "", err
@@ -871,7 +873,9 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 	case ReceiptOutcomeFailed:
 		status = TxStatusFailed
 		failureKindArg = TxFailureReceiptFailed
-		if attempts < TxAutoRetryMaxAttempts {
+		// A failed pricing row is terminal (its calldata carries a time-bound
+		// observation the retry paths refuse), so it never gets a retry window.
+		if attempts < TxAutoRetryMaxAttempts && purpose != TxPurposePricingSetPriceSnapshot {
 			retryAtArg = time.Now().UTC().Add(autoRetryDelay(attempts))
 		}
 		lastErrorArg = fmt.Sprintf("transaction receipt status %d", facts.Status)
@@ -896,6 +900,7 @@ func (s *Store) FinalizeAttemptReceipt(ctx context.Context, attemptID int64, fac
 			lease_until = NULL,
 			replace_requested_at = NULL,
 			cancel_requested_at = NULL,
+			cancel_defer_until = NULL,
 			next_sign_at = NULL,
 			updated_at = now()
 		WHERE id = $8
@@ -1009,9 +1014,9 @@ func (s *Store) RecordPreSignFailure(ctx context.Context, id int64, leaseToken u
 					WHEN replace_requested_at IS NOT NULL THEN now() + $2::interval
 					ELSE NULL
 				END,
-				cancel_requested_at = CASE
+				cancel_defer_until = CASE
 					WHEN cancel_requested_at IS NOT NULL THEN now() + $2::interval
-					ELSE NULL
+					ELSE cancel_defer_until
 				END,
 				lease_token = NULL, lease_until = NULL, updated_at = now()
 			WHERE id = $3

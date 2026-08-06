@@ -83,7 +83,7 @@ Implementation evidence:
 5. Fund the new signer for gas.
 6. Stop the worker, deploy the config, and restart.
 7. Confirm `/readyz`, `/metrics`, and tx outbox progress.
-8. Keep the old signer funded until queued/broadcast transactions are confirmed or explicitly abandoned.
+8. Keep the old signer funded AND configured in `signers` until its queued/broadcast transactions are confirmed or explicitly abandoned. For the pricing signer this is enforced at startup: while any old-signer pricing transaction is still pending, the worker keeps a transaction-manager target for that signer so the rows converge, and it refuses to start if the old signer's backend was removed from `signers` too early — those rows would otherwise gate their price feed forever.
 
 ## Rejection Criteria
 

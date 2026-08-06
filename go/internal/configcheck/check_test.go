@@ -50,6 +50,35 @@ func TestCheckWithClientsReportsMismatches(t *testing.T) {
 				RequiredDVNs:         []common.Address{common.HexToAddress("0x3333333333333333333333333333333333333333")},
 			}
 		},
+		// The on-chain set keeps the right size and still contains the local OpenDVN,
+		// so only the exact-set comparison can catch the unapproved peer entry.
+		"unapprovedPeerDVN": func(clients map[uint32]*fakeChainClient) {
+			clients[40161].ulnConfigs[configKey(common.HexToAddress("0x7777777777777777777777777777777777777777"), common.HexToAddress("0x9999999999999999999999999999999999999999"), 40449)] = ulnConfig{
+				Confirmations:        12,
+				RequiredDVNCount:     2,
+				OptionalDVNCount:     nilDVNCount,
+				OptionalDVNThreshold: 0,
+				RequiredDVNs: []common.Address{
+					common.HexToAddress("0x3333333333333333333333333333333333333333"),
+					common.HexToAddress("0x1212121212121212121212121212121212121212"),
+				},
+			}
+		},
+		// A third required DVN beyond the approved set changes the verification quorum
+		// even though every approved entry is present.
+		"extraRequiredDVN": func(clients map[uint32]*fakeChainClient) {
+			clients[40161].ulnConfigs[configKey(common.HexToAddress("0x7777777777777777777777777777777777777777"), common.HexToAddress("0x9999999999999999999999999999999999999999"), 40449)] = ulnConfig{
+				Confirmations:        12,
+				RequiredDVNCount:     3,
+				OptionalDVNCount:     nilDVNCount,
+				OptionalDVNThreshold: 0,
+				RequiredDVNs: []common.Address{
+					common.HexToAddress("0x3333333333333333333333333333333333333333"),
+					common.HexToAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+					common.HexToAddress("0x1212121212121212121212121212121212121212"),
+				},
+			}
+		},
 		"workerGas": func(clients map[uint32]*fakeChainClient) {
 			cfg := clients[40161].workerPathways[workerPathwayKey(common.HexToAddress("0x2222222222222222222222222222222222222222"), 40449, common.HexToAddress("0x7777777777777777777777777777777777777777"))]
 			cfg.MaxLzReceiveGas = big.NewInt(1)
@@ -75,6 +104,33 @@ func TestCheckWithClientsReportsMismatches(t *testing.T) {
 				t.Fatalf("CheckWithClients() report = %+v, want mismatch issues", report)
 			}
 		})
+	}
+}
+
+func TestCheckWithClientsReportsSendConfirmationsBelowReceive(t *testing.T) {
+	registry, clients := testRegistryAndClients(t)
+	key := configKey(common.HexToAddress("0x7777777777777777777777777777777777777777"), common.HexToAddress("0x9999999999999999999999999999999999999999"), 40449)
+	uln := clients[40161].ulnConfigs[key]
+	uln.Confirmations = 5
+	clients[40161].ulnConfigs[key] = uln
+	report, err := CheckWithClients(t.Context(), registry, chainClients(clients))
+	if err != nil {
+		t.Fatalf("CheckWithClients() error = %v", err)
+	}
+	if report.OK {
+		t.Fatal("CheckWithClients() ok = true, want uln confirmations mismatch")
+	}
+	found := false
+	for _, issue := range report.Issues {
+		if strings.HasSuffix(issue.Path, ".uln_confirmations") {
+			found = true
+			if !strings.Contains(issue.Message, "below receive uln confirmations") {
+				t.Fatalf("issue message = %q", issue.Message)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("issues = %+v, want a .uln_confirmations issue", report.Issues)
 	}
 }
 
@@ -506,6 +562,14 @@ func testConfig() config.Config {
 				DestinationWorkers: config.DestinationWorkerContractsConfig{
 					OpenDVN: config.MustEVMAddress("0x6666666666666666666666666666666666666666"),
 				},
+				SendRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x3333333333333333333333333333333333333333"),
+					config.MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				},
+				ReceiveRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x6666666666666666666666666666666666666666"),
+					config.MustEVMAddress("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+				},
 				DVN:             config.PathwayDVNConfig{Mode: config.DVNModeShadow},
 				Pricing:         testPathwayPricingConfig(),
 				Enabled:         true,
@@ -527,6 +591,14 @@ func testConfig() config.Config {
 				},
 				DestinationWorkers: config.DestinationWorkerContractsConfig{
 					OpenDVN: config.MustEVMAddress("0x3333333333333333333333333333333333333333"),
+				},
+				SendRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x6666666666666666666666666666666666666666"),
+					config.MustEVMAddress("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+				},
+				ReceiveRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x3333333333333333333333333333333333333333"),
+					config.MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
 				},
 				DVN:             config.PathwayDVNConfig{Mode: config.DVNModeShadow},
 				Pricing:         testPathwayPricingConfig(),

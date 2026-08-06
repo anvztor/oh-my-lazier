@@ -83,6 +83,9 @@ chains:
     # Supports http(s), ws(s), and absolute IPC socket paths.
     rpc_urls:
       - http://localhost:8545
+    # Optional: force type-0 (legacy) transactions even when the chain reports
+    # a base fee, for mempools that drop EIP-1559 transactions.
+    # legacy_transactions: true
     tx_roles:
       executor:
         signer: "0x9999999999999999999999999999999999999999"
@@ -129,6 +132,14 @@ pathways:
       price_feed: "0x4444444444444444444444444444444444444444"
     destination_workers:
       open_dvn: "0x6666666666666666666666666666666666666666"
+    # Exact required DVN sets expected on each ULN side: the pathway's own OpenDVN
+    # plus every approved independently operated peer DVN.
+    send_required_dvns:
+      - "0x3333333333333333333333333333333333333333"
+      - "0xdddddddddddddddddddddddddddddddddddddddd"
+    receive_required_dvns:
+      - "0x6666666666666666666666666666666666666666"
+      - "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     dvn:
       mode: shadow
     pricing:
@@ -158,6 +169,12 @@ pathways:
       price_feed: "0x9999999999999999999999999999999999999999"
     destination_workers:
       open_dvn: "0x3333333333333333333333333333333333333333"
+    send_required_dvns:
+      - "0x6666666666666666666666666666666666666666"
+      - "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    receive_required_dvns:
+      - "0x3333333333333333333333333333333333333333"
+      - "0xdddddddddddddddddddddddddddddddddddddddd"
     dvn:
       mode: shadow
     pricing:

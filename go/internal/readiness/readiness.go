@@ -13,6 +13,25 @@ const (
 	dvnSourceStream      = "dvn_source"
 	dvnDestStream        = "dvn_destination"
 
+	// pricingPendingStallSeconds is how long a pricing snapshot transaction may
+	// stay pending before readiness escalates. A pending write gates its feed
+	// against new snapshots, so one stuck behind a wedged lane or fee cap lets
+	// the on-chain price age toward the staleness cutoff. Config validation
+	// guarantees the schedule leaves at least a 600-second margin
+	// (MinPricingFreshnessMarginSeconds) between the worst healthy write
+	// evaluation and snapshot expiry; escalating at half that margin keeps a
+	// real operator window even when the pending row was created at the very
+	// end of the schedule.
+	pricingPendingStallSeconds = 5 * 60
+
+	// cancelHeldStallSeconds is how long a pending operator cancel may age
+	// before readiness escalates it. The cancel pipeline converges within a
+	// few defer cycles when it can outbid the active attempt; a cancel this
+	// old is stalled — typically the mandatory bump exceeds the configured
+	// fee cap, deferring every attempt — and needs the operator (a cap fix,
+	// then the cancel proceeds automatically).
+	cancelHeldStallSeconds = 15 * 60
+
 	// repriceHeldStallSeconds is how long a held(reprice_required) lane may age
 	// before readiness treats it as stalled. Healthy automatic repricing cycles
 	// on a one-minute cooldown and escalates to reprice_exhausted within five
@@ -113,7 +132,7 @@ func EvaluateWithServices(snapshot db.StatsSnapshot, services Services) Report {
 		// signer lane so no higher nonce is signed until it is resolved.
 		// reprice_required (below the automatic replacement cap) and
 		// nonce_reconcile_required self-heal through the automatic replacement
-		// and nonce reconciliation loops, and cancel_requested is an
+		// and nonce reconciliation loops, and a fresh cancel_requested is an
 		// operator-initiated cancel already converging; a reprice hold past
 		// the cap surfaces as the synthetic reprice_exhausted reason and needs
 		// the operator.
@@ -123,6 +142,17 @@ func EvaluateWithServices(snapshot db.StatsSnapshot, services Services) Report {
 				Code:    "held_signer_lane",
 				Message: fmt.Sprintf("chain %d signer %s has %d held(%s) tx_outbox rows blocking the nonce lane", held.ChainEID, held.SignerID, held.Count, held.HeldReason),
 			})
+		case db.HeldCancelRequested:
+			// The cancel age counts from the immutable cancel_requested_at, so
+			// deferrals cannot reset it. A cancel this old cannot outbid the
+			// active attempt — typically the mandatory bump exceeds the
+			// configured fee cap and every attempt defers before signing.
+			if held.OldestAgeSeconds > cancelHeldStallSeconds {
+				issues = append(issues, Issue{
+					Code:    "held_signer_lane",
+					Message: fmt.Sprintf("chain %d signer %s has %d pending cancel(s) stalled for %ds, likely blocked by the fee cap", held.ChainEID, held.SignerID, held.Count, held.OldestAgeSeconds),
+				})
+			}
 		case db.HeldRepriceRequired:
 			// Self-healing only while the automatic reprice can actually land
 			// a bump. When the configured fee cap blocks the mandatory bump,
@@ -137,6 +167,40 @@ func EvaluateWithServices(snapshot db.StatsSnapshot, services Services) Report {
 					Message: fmt.Sprintf("chain %d signer %s has %d held(reprice_required) tx_outbox rows stalled for %ds, likely blocked by the fee cap", held.ChainEID, held.SignerID, held.Count, held.OldestAgeSeconds),
 				})
 			}
+		}
+	}
+	for _, orphaned := range snapshot.TxOutboxOrphaned {
+		if orphaned.Count == 0 {
+			continue
+		}
+		if _, ok := activeChains[orphaned.ChainEID]; !ok {
+			continue
+		}
+		// No age threshold: the signing path writes the active attempt and the
+		// status together, so this state is never produced by a healthy code
+		// path. A 'signed' row here blocks the nonce lane and a 'broadcast' one
+		// is invisible to receipt polling, and neither self-heals — the
+		// operator has to clear it with `txretry -action cancel-nonce`.
+		issues = append(issues, Issue{
+			Code:    "orphaned_outbox_row",
+			Message: fmt.Sprintf("chain %d signer %s has %d %s tx_outbox row(s) with no active attempt, oldest %ds old; durable send state was lost and the lane needs `txretry -action cancel-nonce`", orphaned.ChainEID, orphaned.SignerID, orphaned.Count, orphaned.Status, orphaned.OldestAgeSeconds),
+		})
+	}
+	for _, pending := range snapshot.PricingPending {
+		if pending.Count == 0 {
+			continue
+		}
+		if _, ok := activeChains[pending.ChainEID]; !ok {
+			continue
+		}
+		// A fresh pending write is the normal enqueue-to-confirmation window;
+		// one this old is stuck (wedged lane, fee cap) while it gates the feed
+		// and the on-chain snapshot ages toward the staleness cutoff.
+		if pending.OldestAgeSeconds > pricingPendingStallSeconds {
+			issues = append(issues, Issue{
+				Code:    "pricing_pending_stalled",
+				Message: fmt.Sprintf("chain %d has %d pending pricing tx(s), oldest %ds old, gating price writes while the snapshot ages", pending.ChainEID, pending.Count, pending.OldestAgeSeconds),
+			})
 		}
 	}
 	for _, packet := range snapshot.Packets {

@@ -300,19 +300,21 @@ func TestEnqueueGatesRefuseInactiveScope(t *testing.T) {
 }
 
 func TestFailedRetryDefersWhileScopePausedAndResumes(t *testing.T) {
+	// Retry semantics are exercised with a packet-scoped purpose: pricing rows
+	// carry time-bound observations and are excluded from every retry path.
 	h := newAttemptHarness(t, "0x5c0be000000000000000000000000000000000a6", 750)
 	restoreScopeFlags(t, h.store)
-	id := h.enqueue()
-	h.signAttempt(id, 750, common.HexToHash("0x750a"))
+	_, id := seedScopedPacketRow(t, h, 750)
 	if _, err := h.store.pool.Exec(h.ctx, `
 		UPDATE tx_outbox
-		SET status = 'failed', failure_kind = 'receipt_failed', next_retry_at = now() - interval '1 second',
+		SET status = 'failed', failure_kind = 'receipt_failed', nonce = 750,
+			next_retry_at = now() - interval '1 second',
 			lease_token = NULL, lease_until = NULL, updated_at = now()
 		WHERE id = $1
 	`, id); err != nil {
 		t.Fatalf("seed receipt-failed row: %v", err)
 	}
-	setChainFlags(t, h, 40161, true, true)
+	setChainFlags(t, h, 40449, true, true)
 
 	if _, err := h.store.RetryFailedTx(h.ctx, id); !errors.Is(err, ErrTxSendScopeInactive) {
 		t.Fatalf("RetryFailedTx(paused chain) error = %v, want ErrTxSendScopeInactive", err)
@@ -338,7 +340,7 @@ func TestFailedRetryDefersWhileScopePausedAndResumes(t *testing.T) {
 	if _, err := h.store.pool.Exec(h.ctx, "UPDATE tx_outbox SET next_retry_at = now() - interval '1 second' WHERE id = $1", id); err != nil {
 		t.Fatalf("make row due: %v", err)
 	}
-	if _, err := h.store.PrepareNextFailedTxRetry(h.ctx, 40161, h.signerID); !errors.Is(err, ErrNoFailedTxRetry) {
+	if _, err := h.store.PrepareNextFailedTxRetry(h.ctx, 40449, h.signerID); !errors.Is(err, ErrNoFailedTxRetry) {
 		t.Fatalf("PrepareNextFailedTxRetry(paused chain) error = %v, want ErrNoFailedTxRetry", err)
 	}
 	if err := h.store.pool.QueryRow(h.ctx, "SELECT next_retry_at FROM tx_outbox WHERE id = $1", id).Scan(&nextRetryAt); err != nil {
@@ -349,7 +351,7 @@ func TestFailedRetryDefersWhileScopePausedAndResumes(t *testing.T) {
 	}
 
 	// Unpause: the retry clones normally with the failure budget intact.
-	setChainFlags(t, h, 40161, true, false)
+	setChainFlags(t, h, 40449, true, false)
 	retryID, err := h.store.RetryFailedTx(h.ctx, id)
 	if err != nil {
 		t.Fatalf("RetryFailedTx(active again) error = %v", err)
@@ -645,9 +647,11 @@ func TestSyncConfigConcurrentFirstStartupDoesNotDeadlock(t *testing.T) {
 }
 
 func TestEstimateRevertRetryDefersWhileScopePausedAndResumes(t *testing.T) {
+	// Retry semantics are exercised with a packet-scoped purpose: pricing rows
+	// carry time-bound observations and are excluded from every retry path.
 	h := newAttemptHarness(t, "0x5c0be000000000000000000000000000000000a7", 760)
 	restoreScopeFlags(t, h.store)
-	id := h.enqueue()
+	_, id := seedScopedPacketRow(t, h, 760)
 	if _, err := h.store.pool.Exec(h.ctx, `
 		UPDATE tx_outbox
 		SET status = 'failed', failure_kind = 'estimate_gas_revert', attempts = 4,
@@ -656,7 +660,7 @@ func TestEstimateRevertRetryDefersWhileScopePausedAndResumes(t *testing.T) {
 	`, id); err != nil {
 		t.Fatalf("seed estimate-revert row: %v", err)
 	}
-	setChainFlags(t, h, 40161, true, true)
+	setChainFlags(t, h, 40449, true, true)
 
 	// Requeueing charges attempts + 1 and clears failure metadata, so a paused
 	// scope must defer the retry without mutating anything: otherwise every
@@ -664,7 +668,7 @@ func TestEstimateRevertRetryDefersWhileScopePausedAndResumes(t *testing.T) {
 	if _, err := h.store.RetryFailedTx(h.ctx, id); !errors.Is(err, ErrTxSendScopeInactive) {
 		t.Fatalf("RetryFailedTx(paused chain) error = %v, want ErrTxSendScopeInactive", err)
 	}
-	if _, err := h.store.PrepareNextFailedTxRetry(h.ctx, 40161, h.signerID); !errors.Is(err, ErrNoFailedTxRetry) {
+	if _, err := h.store.PrepareNextFailedTxRetry(h.ctx, 40449, h.signerID); !errors.Is(err, ErrNoFailedTxRetry) {
 		t.Fatalf("PrepareNextFailedTxRetry(paused chain) error = %v, want ErrNoFailedTxRetry", err)
 	}
 	var status, failureKind string
@@ -686,7 +690,7 @@ func TestEstimateRevertRetryDefersWhileScopePausedAndResumes(t *testing.T) {
 	if _, err := h.store.pool.Exec(h.ctx, "UPDATE tx_outbox SET next_retry_at = now() - interval '1 second' WHERE id = $1", id); err != nil {
 		t.Fatalf("make row due: %v", err)
 	}
-	setChainFlags(t, h, 40161, true, false)
+	setChainFlags(t, h, 40449, true, false)
 	retryID, err := h.store.RetryFailedTx(h.ctx, id)
 	if err != nil {
 		t.Fatalf("RetryFailedTx(active again) error = %v", err)

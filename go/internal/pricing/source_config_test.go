@@ -434,6 +434,10 @@ func (unavailableEVMReader) CallContract(context.Context, ethereum.CallMsg, *big
 	return nil, errors.New("rpc unavailable")
 }
 
+func (unavailableEVMReader) CallContractAtHash(context.Context, ethereum.CallMsg, common.Hash) ([]byte, error) {
+	return nil, errors.New("rpc unavailable")
+}
+
 func (unavailableEVMReader) HeaderByNumber(context.Context, *big.Int) (*gethtypes.Header, error) {
 	return nil, errors.New("rpc unavailable")
 }
@@ -444,6 +448,10 @@ type staticEVMResponseReader struct {
 }
 
 func (r staticEVMResponseReader) CallContract(context.Context, ethereum.CallMsg, *big.Int) ([]byte, error) {
+	return append([]byte(nil), r.response...), r.err
+}
+
+func (r staticEVMResponseReader) CallContractAtHash(context.Context, ethereum.CallMsg, common.Hash) ([]byte, error) {
 	return append([]byte(nil), r.response...), r.err
 }
 
@@ -498,6 +506,13 @@ func (r methodErrorCallReader) CallContract(ctx context.Context, call ethereum.C
 		return nil, r.err
 	}
 	return r.fallback.CallContract(ctx, call, blockNumber)
+}
+
+func (r methodErrorCallReader) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error) {
+	if len(call.Data) >= 4 && string(call.Data[:4]) == r.selector {
+		return nil, r.err
+	}
+	return r.fallback.CallContractAtHash(ctx, call, blockHash)
 }
 
 func configuredChainlinkTestReader(t *testing.T, caller staticEVMResponseReader) ConfiguredPriceReader {

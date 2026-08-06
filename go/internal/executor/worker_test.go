@@ -16,6 +16,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/config"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 func TestProcessCommitterOnceEnqueuesCommitTx(t *testing.T) {
@@ -712,6 +713,9 @@ func (s *fakeStore) DeferExecutorJob(_ context.Context, guid common.Hash, expect
 	return nil
 }
 
+// testAnchorHash is the fixed verified-head hash the fake callers report.
+const testAnchorHash = "0x00000000000000000000000000000000000000000000000000000000000f4240"
+
 type failingCaller struct{}
 
 func (failingCaller) CallContract(context.Context, ethereum.CallMsg, *big.Int) ([]byte, error) {
@@ -722,9 +726,25 @@ func (failingCaller) BlockNumber(context.Context) (uint64, error) {
 	return 0, fmt.Errorf("unexpected block number")
 }
 
+func (failingCaller) CallContractAtHash(context.Context, ethereum.CallMsg, common.Hash) ([]byte, error) {
+	return nil, fmt.Errorf("unexpected eth_call at hash")
+}
+
+func (failingCaller) CheckHead(context.Context) (rpcquorum.HeadResult, error) {
+	return rpcquorum.HeadResult{}, fmt.Errorf("unexpected head check")
+}
+
 type fakeCommitReadyCaller struct{}
 
 func (fakeCommitReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
+
+func (fakeCommitReadyCaller) CheckHead(context.Context) (rpcquorum.HeadResult, error) {
+	return rpcquorum.HeadResult{Number: big.NewInt(1_000_000), Hash: testAnchorHash}, nil
+}
+
+func (c fakeCommitReadyCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	return c.CallContract(ctx, call, nil)
+}
 
 func (fakeCommitReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -757,6 +777,14 @@ func (fakeCommitAlreadyCommittedCaller) BlockNumber(context.Context) (uint64, er
 	return 1_000_000, nil
 }
 
+func (fakeCommitAlreadyCommittedCaller) CheckHead(context.Context) (rpcquorum.HeadResult, error) {
+	return rpcquorum.HeadResult{Number: big.NewInt(1_000_000), Hash: testAnchorHash}, nil
+}
+
+func (c fakeCommitAlreadyCommittedCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	return c.CallContract(ctx, call, nil)
+}
+
 func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
 	if err != nil {
@@ -773,6 +801,14 @@ func (c fakeCommitAlreadyCommittedCaller) CallContract(_ context.Context, call e
 type fakeCommitNotReadyCaller struct{}
 
 func (fakeCommitNotReadyCaller) BlockNumber(context.Context) (uint64, error) { return 1_000_000, nil }
+
+func (fakeCommitNotReadyCaller) CheckHead(context.Context) (rpcquorum.HeadResult, error) {
+	return rpcquorum.HeadResult{Number: big.NewInt(1_000_000), Hash: testAnchorHash}, nil
+}
+
+func (c fakeCommitNotReadyCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	return c.CallContract(ctx, call, nil)
+}
 
 func (fakeCommitNotReadyCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	method, err := methodBySelector(call.Data)
@@ -803,6 +839,18 @@ func (c fakeExecutableCaller) BlockNumber(context.Context) (uint64, error) {
 		return c.headBlock, nil
 	}
 	return 1_000_000, nil
+}
+
+func (c fakeExecutableCaller) CheckHead(ctx context.Context) (rpcquorum.HeadResult, error) {
+	head, err := c.BlockNumber(ctx)
+	if err != nil {
+		return rpcquorum.HeadResult{}, err
+	}
+	return rpcquorum.HeadResult{Number: new(big.Int).SetUint64(head), Hash: testAnchorHash}, nil
+}
+
+func (c fakeExecutableCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	return c.CallContract(ctx, call, nil)
 }
 
 func (c fakeExecutableCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {

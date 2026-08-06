@@ -457,6 +457,14 @@ func TestChainlinkClientPriceUSD(t *testing.T) {
 			t.Fatalf("CallContract() block[%d] = %v, want %s", index, blockNumber, caller.header.Number)
 		}
 	}
+	if len(caller.callBlockHashes) != 3 {
+		t.Fatalf("CallContractAtHash() calls = %d, want 3", len(caller.callBlockHashes))
+	}
+	for index, blockHash := range caller.callBlockHashes {
+		if blockHash != caller.header.Hash() {
+			t.Fatalf("CallContractAtHash() hash[%d] = %s, want %s", index, blockHash, caller.header.Hash())
+		}
+	}
 }
 
 func TestChainlinkClientRejectsInvalidLatestHeader(t *testing.T) {
@@ -674,6 +682,7 @@ type fakeEVMReader struct {
 	headerErr        error
 	headerCalls      int
 	callBlockNumbers []*big.Int
+	callBlockHashes  []common.Hash
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -710,6 +719,13 @@ func (c *fakeEVMReader) addResponse(t *testing.T, selector []byte, outputs inter
 		t.Fatalf("Pack() error = %v", err)
 	}
 	c.responses[string(selector)] = encoded
+}
+
+// CallContractAtHash records the pinned hash and serves the same responses,
+// keeping the per-call number bookkeeping via delegation.
+func (c *fakeEVMReader) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error) {
+	c.callBlockHashes = append(c.callBlockHashes, blockHash)
+	return c.CallContract(ctx, call, c.header.Number)
 }
 
 func (c *fakeEVMReader) CallContract(_ context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {

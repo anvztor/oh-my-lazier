@@ -32,6 +32,28 @@ func TestQuoteDynamicFeeClampsPriorityTip(t *testing.T) {
 	}
 }
 
+func TestQuoteFeeForceLegacyIgnoresBaseFee(t *testing.T) {
+	// A legacy-forced chain quotes type-0 fees even when the header reports a
+	// base fee: its mempool drops EIP-1559 transactions.
+	client := &fakeChainClient{
+		header:            dynamicHeader(),
+		suggestedGasPrice: big.NewInt(1_000_000_000),
+	}
+	quote, err := quoteFee(context.Background(), db.QueuedOutboxTx{ID: 1}, FeePolicy{
+		ConfiguredMaxFeePerGas:  big.NewInt(3_000_000_000),
+		ForceLegacyTransactions: true,
+	}, client)
+	if err != nil {
+		t.Fatalf("quoteFee() error = %v", err)
+	}
+	if quote.Dynamic {
+		t.Fatal("quote.Dynamic = true, want a legacy quote on a legacy-forced chain")
+	}
+	if quote.MaxFeePerGas.Cmp(big.NewInt(1_000_000_000)) != 0 {
+		t.Fatalf("gas price = %s, want the suggested legacy price", quote.MaxFeePerGas)
+	}
+}
+
 func TestQuoteFeeDefersOverCap(t *testing.T) {
 	client := &fakeChainClient{
 		header:             dynamicHeader(),

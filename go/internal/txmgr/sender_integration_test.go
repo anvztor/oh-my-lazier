@@ -529,8 +529,11 @@ func TestProcessNextMarksEstimateGasRevertFailedBeforeNonceAssignment(t *testing
 	if outboxTx.Attempts != 0 {
 		t.Fatalf("outbox attempts = %d, want 0", outboxTx.Attempts)
 	}
-	if outboxTx.FailureKind != db.TxFailureEstimateGasRevert || outboxTx.NextRetryAt == nil {
-		t.Fatalf("failure metadata = %q/%v, want retryable estimate gas revert", outboxTx.FailureKind, outboxTx.NextRetryAt)
+	// A pricing row is terminal on the deterministic revert: no retry window,
+	// because its calldata carries a time-bound observation the retry paths
+	// refuse; the bot rebuilds from a fresh observation instead.
+	if outboxTx.FailureKind != db.TxFailureEstimateGasRevert || outboxTx.NextRetryAt != nil {
+		t.Fatalf("failure metadata = %q/%v, want terminal estimate gas revert without a retry window", outboxTx.FailureKind, outboxTx.NextRetryAt)
 	}
 	if client.pendingNonceCalls != 0 {
 		t.Fatalf("PendingNonceAt() calls = %d, want 0", client.pendingNonceCalls)
@@ -2018,20 +2021,36 @@ func TestNonceReconciliationReleasesAndParksExternally(t *testing.T) {
 	if consumed.Status != db.TxStatusHeld {
 		t.Fatalf("consumed status = %q, want held for operator resolution", consumed.Status)
 	}
-	cloneID, err := store.ResolveExternalNonceRetry(t.Context(), id)
+	// A pricing row refuses the retry resolution (its calldata is a time-bound
+	// observation); the operator abandons it and the bot rebuilds. Fresh work
+	// still signs at the fast-forwarded cursor, past the consumed range.
+	if _, err := store.ResolveExternalNonceRetry(t.Context(), id); err == nil || !strings.Contains(err.Error(), "pricing observation") {
+		t.Fatalf("ResolveExternalNonceRetry(pricing) error = %v, want pricing refusal", err)
+	}
+	if err := store.ResolveExternalNonceAbandon(t.Context(), id); err != nil {
+		t.Fatalf("ResolveExternalNonceAbandon() error = %v", err)
+	}
+	freshID, err := store.EnqueueTx(t.Context(), db.TxRequest{
+		ChainEID: 40161,
+		Purpose:  db.TxPurposePricingSetPriceSnapshot,
+		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
+		Calldata: []byte{0x0a},
+		Value:    big.NewInt(0),
+		SignerID: signer.Address().Hex(),
+	})
 	if err != nil {
-		t.Fatalf("ResolveExternalNonceRetry() error = %v", err)
+		t.Fatalf("EnqueueTx(fresh) error = %v", err)
 	}
 	client.sendErr = nil
 	if _, err := manager.ProcessNext(t.Context(), target); err != nil {
-		t.Fatalf("ProcessNext(clone) error = %v", err)
+		t.Fatalf("ProcessNext(fresh) error = %v", err)
 	}
-	clone, err := store.GetOutboxTx(t.Context(), cloneID)
+	fresh, err := store.GetOutboxTx(t.Context(), freshID)
 	if err != nil {
-		t.Fatalf("GetOutboxTx(clone) error = %v", err)
+		t.Fatalf("GetOutboxTx(fresh) error = %v", err)
 	}
-	if clone.Nonce != held.Nonce+5 {
-		t.Fatalf("clone nonce = %d, want the fast-forwarded confirmed nonce %d", clone.Nonce, held.Nonce+5)
+	if fresh.Nonce != held.Nonce+5 {
+		t.Fatalf("fresh nonce = %d, want the fast-forwarded confirmed nonce %d", fresh.Nonce, held.Nonce+5)
 	}
 }
 

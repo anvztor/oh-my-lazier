@@ -262,6 +262,9 @@ contract OpenWorkersTest {
     }
 
     function test_priceFeedSubmitterCanBatchUpdateMultipleEIDs() public {
+        // Advance past the setUp seed's timestamp: stored snapshots only accept
+        // strictly newer updates.
+        vm.warp(1_000_000);
         WorkerTypes.PriceSnapshotUpdate[] memory updates = new WorkerTypes.PriceSnapshotUpdate[](2);
         updates[0] = WorkerTypes.PriceSnapshotUpdate({
             dstEid: DST_EID,
@@ -349,12 +352,12 @@ contract OpenWorkersTest {
     function test_priceFeedSkipsSupersededSnapshotWithoutRevertingBatch() public {
         // The default test timestamp is too small to express an older-but-valid
         // snapshot (updatedAt = 0 is invalid), so pin a realistic clock first.
+        // Anchor the stored snapshot one second in the past so both the older
+        // and the strictly-newer cases fit without a second warp.
         vm.warp(1_000_000);
+        uint64 baseline = uint64(block.timestamp - 1);
         WorkerTypes.PriceSnapshot memory first = WorkerTypes.PriceSnapshot({
-            dstGasPriceInSrcToken: 20 gwei,
-            dstDataFeePerByteInSrcToken: 0,
-            updatedAt: uint64(block.timestamp),
-            staleAfter: 30 minutes
+            dstGasPriceInSrcToken: 20 gwei, dstDataFeePerByteInSrcToken: 0, updatedAt: baseline, staleAfter: 30 minutes
         });
         setPriceSnapshot(priceFeed, DST_EID, first);
 
@@ -366,7 +369,7 @@ contract OpenWorkersTest {
             snapshot: WorkerTypes.PriceSnapshot({
                 dstGasPriceInSrcToken: 10 gwei,
                 dstDataFeePerByteInSrcToken: 0,
-                updatedAt: uint64(block.timestamp - 1),
+                updatedAt: baseline - 1,
                 staleAfter: 30 minutes
             })
         });
@@ -375,7 +378,7 @@ contract OpenWorkersTest {
             snapshot: WorkerTypes.PriceSnapshot({
                 dstGasPriceInSrcToken: 40 gwei,
                 dstDataFeePerByteInSrcToken: 4 gwei,
-                updatedAt: uint64(block.timestamp),
+                updatedAt: baseline,
                 staleAfter: 30 minutes
             })
         });
@@ -383,23 +386,66 @@ contract OpenWorkersTest {
 
         (uint256 dstGasPriceInSrcToken,, uint64 updatedAt,) = priceFeed.priceSnapshot(DST_EID);
         require(dstGasPriceInSrcToken == 20 gwei, "superseded entry overwrote the newer snapshot");
-        require(updatedAt == uint64(block.timestamp), "superseded entry changed the stored timestamp");
+        require(updatedAt == baseline, "superseded entry changed the stored timestamp");
         (dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(ALT_DST_EID);
         require(dstGasPriceInSrcToken == 40 gwei, "fresh entry in a batch with a superseded entry was not stored");
 
-        // A snapshot with an equal (non-decreasing) timestamp is still accepted.
+        // An equal-timestamp snapshot is skipped: the first landed write for a
+        // second stays authoritative, so a same-second batch built from an older
+        // market observation cannot overwrite a newer stored result.
         WorkerTypes.PriceSnapshot memory same = WorkerTypes.PriceSnapshot({
-            dstGasPriceInSrcToken: 30 gwei,
-            dstDataFeePerByteInSrcToken: 0,
-            updatedAt: uint64(block.timestamp),
-            staleAfter: 30 minutes
+            dstGasPriceInSrcToken: 30 gwei, dstDataFeePerByteInSrcToken: 0, updatedAt: baseline, staleAfter: 30 minutes
         });
         setPriceSnapshot(priceFeed, DST_EID, same);
         (dstGasPriceInSrcToken,,,) = priceFeed.priceSnapshot(DST_EID);
-        require(dstGasPriceInSrcToken == 30 gwei, "equal-timestamp update was not stored");
+        require(dstGasPriceInSrcToken == 20 gwei, "equal-timestamp entry overwrote the stored snapshot");
+
+        // A strictly newer timestamp still updates the stored snapshot.
+        WorkerTypes.PriceSnapshot memory newer = WorkerTypes.PriceSnapshot({
+            dstGasPriceInSrcToken: 30 gwei,
+            dstDataFeePerByteInSrcToken: 0,
+            updatedAt: baseline + 1,
+            staleAfter: 30 minutes
+        });
+        setPriceSnapshot(priceFeed, DST_EID, newer);
+        uint64 storedUpdatedAt;
+        (dstGasPriceInSrcToken,, storedUpdatedAt,) = priceFeed.priceSnapshot(DST_EID);
+        require(dstGasPriceInSrcToken == 30 gwei, "strictly newer update was not stored");
+        require(storedUpdatedAt == baseline + 1, "strictly newer update kept the old timestamp");
+    }
+
+    function test_priceFeedFirstEntryWinsForDuplicateDstEidInOneBatch() public {
+        vm.warp(1_000_000);
+        WorkerTypes.PriceSnapshotUpdate[] memory updates = new WorkerTypes.PriceSnapshotUpdate[](2);
+        updates[0] = WorkerTypes.PriceSnapshotUpdate({
+            dstEid: DST_EID,
+            snapshot: WorkerTypes.PriceSnapshot({
+                dstGasPriceInSrcToken: 20 gwei,
+                dstDataFeePerByteInSrcToken: 0,
+                updatedAt: uint64(block.timestamp),
+                staleAfter: 30 minutes
+            })
+        });
+        updates[1] = WorkerTypes.PriceSnapshotUpdate({
+            dstEid: DST_EID,
+            snapshot: WorkerTypes.PriceSnapshot({
+                dstGasPriceInSrcToken: 10 gwei,
+                dstDataFeePerByteInSrcToken: 0,
+                updatedAt: uint64(block.timestamp),
+                staleAfter: 30 minutes
+            })
+        });
+        priceFeed.setPriceSnapshot(updates);
+
+        (uint256 dstGasPriceInSrcToken,, uint64 storedUpdatedAt,) = priceFeed.priceSnapshot(DST_EID);
+        require(dstGasPriceInSrcToken == 20 gwei, "duplicate dstEid entry overwrote the first entry in the batch");
+        require(storedUpdatedAt == uint64(block.timestamp), "duplicate dstEid batch stored the wrong timestamp");
     }
 
     function test_sharedPriceFeedUpdateChangesExecutorAndDVNQuotes() public {
+        // Advance past the setUp seed's timestamp: stored snapshots only accept
+        // strictly newer updates.
+        vm.warp(1_000_000);
         WorkerTypes.PriceSnapshot memory snapshot = WorkerTypes.PriceSnapshot({
             dstGasPriceInSrcToken: 20 gwei,
             dstDataFeePerByteInSrcToken: 0,

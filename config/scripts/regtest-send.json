@@ -1,0 +1,10 @@
+{
+  "input": {
+    "tmpDir": "tmp/regtest",
+    "direction": "ab",
+    "amountLD": "1000000000000000000",
+    "timeoutMs": "180000"
+  },
+  "apply": true,
+  "confirmation": "approved"
+}

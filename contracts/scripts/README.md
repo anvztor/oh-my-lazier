@@ -316,6 +316,32 @@ The E2E command input files contain public paths and URLs only; deployer keys,
 keystore passwords, KMS settings, database credentials, and other
 infrastructure secrets remain in the existing test infrastructure environment.
 
+## Local GOATED regtest
+
+`regtest:deploy` and `regtest:send` reuse the same `LocalE2EChain` and
+`LocalE2EPathway` Ignition modules on the `regtest-a`/`regtest-b` Hardhat
+networks (chain ids 31337/31338) to stand up the two-chain GOATED topology
+with an autonomous two-worker relay: worker 1 runs OpenExecutor plus the
+primary OpenDVN, worker 2 runs the secondary OpenDVN, and each worker signs
+with its own pre-generated keystore (`go/cmd/e2ekeystore`) and uses its own
+database. Both take the strict `OML_SCRIPT_PARAMS` envelope
+(`config/scripts/regtest-deploy.json`, `config/scripts/regtest-send.json`):
+deployment-affecting settings (`confirmations`, `initialSupply`, `dvnMode`)
+are validated envelope fields, while RPC endpoints and the optional
+`REGTEST_<A|B>_GAS_PRICE` legacy-fee pin resolve from `REGTEST_*` environment
+variables. Ignition journals stay under `tmp/regtest/ignition` via
+`OML_IGNITION_DIR`. A gas-price-pinned chain sends every transaction as
+type 0 — the deploy and send connections interpose on the provider, and the
+generated worker configs set `legacy_transactions: true` so DVN and executor
+writes stay legacy too. The initial price snapshots expire after 24 hours and
+nothing refreshes them (worker pricing is disabled); rerunning an aged
+environment requires recreating `tmp/regtest` (deployments, Ignition
+journals, and `ignition-parameters`) and redeploying.
+The regtest is a single trust domain (one deployer, shared price feed and
+infrastructure): it exercises the 2-of-2 required-DVN protocol flow only and
+is not a production topology template. The worker compose stack lives at
+`deploy/regtest/docker-compose.regtest.yml`.
+
 ## Tests
 
 Script tests live under `contracts/test/nodejs` and import command cores, not

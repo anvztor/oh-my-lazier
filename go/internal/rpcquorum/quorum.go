@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,13 +69,23 @@ type Provider struct {
 	// provider whose last log-window answer disagreed with the log quorum, and
 	// only a later agreeing log window clears it (head checks never do).
 	LogConflict bool
+	// StateConflict marks a provider whose last comparable state-read answer
+	// disagreed with the state-read quorum; only a later agreeing state read
+	// clears it.
+	StateConflict bool
 }
 
 type configuredProvider struct {
 	url         string
 	status      ProviderStatus
 	logConflict bool
-	client      *ethclient.Client
+	// stateConflict is a separate sticky dimension from the head status: it
+	// marks a provider whose last comparable state-read answer disagreed with
+	// the state-read quorum, and only a later agreeing state read clears it.
+	// State reads never touch the head status, so a historical read agreeing
+	// across providers cannot re-promote a lagging or forked provider.
+	stateConflict bool
+	client        *ethclient.Client
 }
 
 type providerOperationError struct {
@@ -305,7 +316,7 @@ func (c *Client) Providers() []Provider {
 	defer c.mu.Unlock()
 	out := make([]Provider, len(c.providers))
 	for index, provider := range c.providers {
-		out[index] = Provider{ID: providerID(index), Status: provider.status, LogConflict: provider.logConflict}
+		out[index] = Provider{ID: providerID(index), Status: provider.status, LogConflict: provider.logConflict, StateConflict: provider.stateConflict}
 	}
 	return out
 }
@@ -582,20 +593,6 @@ func (c *Client) headSnapshotRef() *headSnapshot {
 	return c.head
 }
 
-// CallContract performs an eth_call against the first currently healthy provider.
-func (c *Client) CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
-	index, err := c.firstHealthyProvider()
-	if err != nil {
-		return nil, err
-	}
-	client, err := c.providerClient(ctx, index)
-	if err != nil {
-		return nil, err
-	}
-	result, err := client.CallContract(ctx, call, blockNumber)
-	return result, wrapProviderOperationError(index, "eth_call", err)
-}
-
 // BlockNumber returns the quorum canonical head number: the height a fixed
 // configured majority of providers has reached. Confirmation-depth gates built
 // on it can no longer be lifted by a single provider's inflated tip.
@@ -656,34 +653,6 @@ func (c *Client) ValidateChainID(ctx context.Context, expected *big.Int) error {
 		return errors.Join(providerErrs...)
 	}
 	return validateProviderChainIDs(c.chainName, expected, ids)
-}
-
-// CodeAt returns contract code at the first healthy provider's selected block.
-func (c *Client) CodeAt(ctx context.Context, account common.Address, blockNumber *big.Int) ([]byte, error) {
-	index, err := c.firstHealthyProvider()
-	if err != nil {
-		return nil, err
-	}
-	client, err := c.providerClient(ctx, index)
-	if err != nil {
-		return nil, err
-	}
-	result, err := client.CodeAt(ctx, account, blockNumber)
-	return result, wrapProviderOperationError(index, "eth_getCode", err)
-}
-
-// EstimateGas returns the first healthy provider's gas limit estimate.
-func (c *Client) EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error) {
-	index, err := c.firstHealthyProvider()
-	if err != nil {
-		return 0, err
-	}
-	client, err := c.providerClient(ctx, index)
-	if err != nil {
-		return 0, err
-	}
-	result, err := client.EstimateGas(ctx, call)
-	return result, wrapProviderOperationError(index, "eth_estimateGas", err)
 }
 
 // FilterLogs returns a bounded log window only when a fixed configured
@@ -1004,18 +973,35 @@ func (c *Client) HeaderByNumber(ctx context.Context, number *big.Int) (*gethtype
 	return nil, fmt.Errorf("no healthy provider served the canonical header for chain %s", c.chainName)
 }
 
-// PendingNonceAt returns the first healthy provider's pending account nonce.
+// PendingNonceAt returns the pending account nonce agreed IDENTICALLY by the
+// fixed configured majority, floored by the majority latest confirmed nonce.
+// This value initializes the durable signer nonce cursor, and reconciliation
+// only ever moves the cursor forward — a single provider fabricating an
+// inflated pending nonce would permanently bootstrap the lane into the future.
+// A pending split fails closed (no cursor write) instead of guessing.
 func (c *Client) PendingNonceAt(ctx context.Context, account common.Address) (uint64, error) {
-	index, err := c.firstHealthyProvider()
+	confirmed, err := c.NonceAt(ctx, account, nil)
 	if err != nil {
 		return 0, err
 	}
-	client, err := c.providerClient(ctx, index)
+	payload, err := c.voteStateRead(ctx, "eth_getTransactionCount(pending)", func(ctx context.Context, client *ethclient.Client) ([]byte, error) {
+		nonce, err := client.PendingNonceAt(ctx, account)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(strconv.FormatUint(nonce, 10)), nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	result, err := client.PendingNonceAt(ctx, account)
-	return result, wrapProviderOperationError(index, "eth_getTransactionCount", err)
+	pending, err := strconv.ParseUint(string(payload), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse pending nonce quorum payload: %w", err)
+	}
+	if pending < confirmed {
+		return 0, &StateReadConflictError{ChainName: c.chainName, Operation: "eth_getTransactionCount(pending)", Votes: map[string]int{"below-confirmed": 1}}
+	}
+	return pending, nil
 }
 
 // NonceAt returns the account nonce at the given block (nil means latest)

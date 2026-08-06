@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/islishude/oh-my-lazier/go/internal/abiutil"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 var (
@@ -57,11 +58,13 @@ func (c *ChainlinkClient) PriceUSD(ctx context.Context) (SourcePrice, error) {
 	if header == nil || header.Number == nil || header.Number.Sign() < 0 {
 		return SourcePrice{}, errors.New("chainlink returned invalid latest block header")
 	}
-	blockNumber := new(big.Int).Set(header.Number)
-	if err := c.validateSourceConfigurationAtBlock(ctx, blockNumber); err != nil {
+	// Pin every read of this observation to the fetched canonical header by
+	// hash, so one PriceUSD stays a single consistent state view.
+	anchor := &rpcquorum.StateAnchor{Number: new(big.Int).Set(header.Number), Hash: header.Hash()}
+	if err := c.validateSourceConfigurationAtBlock(ctx, anchor); err != nil {
 		return SourcePrice{}, err
 	}
-	decimalValues, err := c.call(ctx, "decimals", blockNumber)
+	decimalValues, err := c.call(ctx, "decimals", anchor)
 	if err != nil {
 		return SourcePrice{}, err
 	}
@@ -72,7 +75,7 @@ func (c *ChainlinkClient) PriceUSD(ctx context.Context) (SourcePrice, error) {
 	if !ok || decimals > 18 {
 		return SourcePrice{}, errors.New("chainlink returned unsupported decimals")
 	}
-	roundValues, err := c.call(ctx, "latestRoundData", blockNumber)
+	roundValues, err := c.call(ctx, "latestRoundData", anchor)
 	if err != nil {
 		return SourcePrice{}, err
 	}
@@ -101,8 +104,8 @@ func (c *ChainlinkClient) validateSourceConfiguration(ctx context.Context) error
 	return c.validateSourceConfigurationAtBlock(ctx, nil)
 }
 
-func (c *ChainlinkClient) validateSourceConfigurationAtBlock(ctx context.Context, blockNumber *big.Int) error {
-	descriptionValues, err := c.call(ctx, "description", blockNumber)
+func (c *ChainlinkClient) validateSourceConfigurationAtBlock(ctx context.Context, anchor *rpcquorum.StateAnchor) error {
+	descriptionValues, err := c.call(ctx, "description", anchor)
 	if err != nil {
 		return classifySourceIdentityCallError("chainlink description response is incompatible with the AggregatorV3 ABI", err)
 	}
@@ -116,12 +119,12 @@ func (c *ChainlinkClient) validateSourceConfigurationAtBlock(ctx context.Context
 	return nil
 }
 
-func (c *ChainlinkClient) call(ctx context.Context, method string, blockNumber *big.Int) ([]any, error) {
+func (c *ChainlinkClient) call(ctx context.Context, method string, anchor *rpcquorum.StateAnchor) ([]any, error) {
 	calldata, err := chainlinkAggregatorV3ABI.Pack(method)
 	if err != nil {
 		return nil, err
 	}
-	result, err := c.caller.CallContract(ctx, ethereum.CallMsg{To: &c.feed, Data: calldata}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, c.caller, ethereum.CallMsg{To: &c.feed, Data: calldata}, anchor)
 	if err != nil {
 		return nil, wrapPriceSourceRequestError("chainlink", "execute", err)
 	}

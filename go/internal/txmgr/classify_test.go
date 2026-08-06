@@ -8,7 +8,22 @@ import (
 	"testing"
 
 	"github.com/islishude/oh-my-lazier/go/internal/db"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
+
+func TestIsEstimateGasRevertHonorsQuorumVerdict(t *testing.T) {
+	// A quorum-voted revert is terminal regardless of the client's wording:
+	// ganache's message-only shape carries no code 3 and no hex data, so the
+	// text classifier alone would leave the row queued and retrying forever.
+	ganache := errors.New("VM Exception while processing transaction: revert MyError")
+	if isEstimateGasRevert(ganache) {
+		t.Fatal("a plain non-rpc error must not be terminal without the quorum verdict")
+	}
+	voted := fmt.Errorf("estimate outbox tx 1: %w", &rpcquorum.VotedRevertError{Operation: "eth_estimateGas", Err: ganache})
+	if !isEstimateGasRevert(voted) {
+		t.Fatal("quorum-voted revert must classify as a terminal estimate revert")
+	}
+}
 
 func TestClassifyBroadcastError(t *testing.T) {
 	tests := []struct {

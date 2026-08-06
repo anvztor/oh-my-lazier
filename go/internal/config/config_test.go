@@ -113,8 +113,12 @@ func TestValidateRejectsInvalidPathwayGasBounds(t *testing.T) {
 }
 
 func TestValidateAcceptsConfiguredConfirmations(t *testing.T) {
+	// A source may assign more confirmations than the destination requires. Keep only
+	// the 40161 -> 40449 direction: with both directions configured the relationship
+	// forces equal values, which the default fixture already covers.
 	cfg := validConfig()
-	cfg.Chains[0].Confirmations = 6
+	cfg.Pathways = cfg.Pathways[:1]
+	cfg.Chains[1].Confirmations = 6
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
@@ -125,6 +129,64 @@ func TestValidateRejectsMissingConfirmations(t *testing.T) {
 	cfg.Chains[0].Confirmations = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() error = nil, want missing confirmations error")
+	}
+}
+
+func TestValidateRejectsInvalidRequiredDVNSets(t *testing.T) {
+	for name, mutate := range map[string]func(cfg *Config){
+		"missingSendSet": func(cfg *Config) {
+			cfg.Pathways[0].SendRequiredDVNs = nil
+		},
+		"singleEntry": func(cfg *Config) {
+			cfg.Pathways[0].SendRequiredDVNs = cfg.Pathways[0].SendRequiredDVNs[:1]
+		},
+		"zeroEntry": func(cfg *Config) {
+			cfg.Pathways[0].ReceiveRequiredDVNs[1] = EVMAddress{}
+		},
+		"duplicateEntry": func(cfg *Config) {
+			cfg.Pathways[0].ReceiveRequiredDVNs[1] = cfg.Pathways[0].ReceiveRequiredDVNs[0]
+		},
+		"missingOpenDVN": func(cfg *Config) {
+			cfg.Pathways[0].SendRequiredDVNs = []EVMAddress{
+				MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				MustEVMAddress("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig()
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want required DVN set error")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInsufficientPricingFreshnessMargin(t *testing.T) {
+	cfg := validConfig()
+	cfg.Pricing = validPricingConfig()
+	// heartbeat + interval < stale_after still holds, but the remaining margin
+	// (1800 - 1300 - 300 = 200) is below the enqueue/confirmation budget.
+	cfg.Pricing.HeartbeatSeconds = 1300
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want pricing freshness margin error")
+	}
+	if !strings.Contains(err.Error(), "by at least") {
+		t.Fatalf("Validate() error = %v, want pricing freshness margin error", err)
+	}
+}
+
+func TestValidateRejectsPathwaySourceConfirmationsBelowDestination(t *testing.T) {
+	cfg := validConfig()
+	cfg.Chains[0].Confirmations = 6
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want pathway confirmations relationship error")
+	}
+	if !strings.Contains(err.Error(), "below destination chain confirmations") {
+		t.Fatalf("Validate() error = %v, want pathway confirmations relationship error", err)
 	}
 }
 
@@ -1052,6 +1114,12 @@ pathways:
       price_feed: "0x4444444444444444444444444444444444444444"
     destination_workers:
       open_dvn: "0x6666666666666666666666666666666666666666"
+    send_required_dvns:
+      - "0x3333333333333333333333333333333333333333"
+      - "0xdddddddddddddddddddddddddddddddddddddddd"
+    receive_required_dvns:
+      - "0x6666666666666666666666666666666666666666"
+      - "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     enabled: true
     max_message_size: 10000
     min_lz_receive_gas: 100000
@@ -1319,6 +1387,14 @@ func validConfig() Config {
 				DestinationWorkers: DestinationWorkerContractsConfig{
 					OpenDVN: MustEVMAddress("0x6666666666666666666666666666666666666666"),
 				},
+				SendRequiredDVNs: []EVMAddress{
+					MustEVMAddress("0x3333333333333333333333333333333333333333"),
+					MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				},
+				ReceiveRequiredDVNs: []EVMAddress{
+					MustEVMAddress("0x6666666666666666666666666666666666666666"),
+					MustEVMAddress("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+				},
 				DVN:             PathwayDVNConfig{Mode: DVNModeShadow},
 				Pricing:         validPathwayPricingConfig(),
 				Enabled:         true,
@@ -1340,6 +1416,14 @@ func validConfig() Config {
 				},
 				DestinationWorkers: DestinationWorkerContractsConfig{
 					OpenDVN: MustEVMAddress("0x3333333333333333333333333333333333333333"),
+				},
+				SendRequiredDVNs: []EVMAddress{
+					MustEVMAddress("0x6666666666666666666666666666666666666666"),
+					MustEVMAddress("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+				},
+				ReceiveRequiredDVNs: []EVMAddress{
+					MustEVMAddress("0x3333333333333333333333333333333333333333"),
+					MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
 				},
 				DVN:             PathwayDVNConfig{Mode: DVNModeShadow},
 				Pricing:         validPathwayPricingConfig(),

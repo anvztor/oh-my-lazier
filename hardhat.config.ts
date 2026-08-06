@@ -62,6 +62,13 @@ const config = defineConfig({
       url: configVariable("HOODI_RPC_URL"),
       accounts: [configVariable("HOODI_PRIVATE_KEY")],
     },
+    bscTestnet: {
+      type: "http",
+      chainType: "l1",
+      chainId: 97,
+      url: configVariable("BSCTESTNET_RPC_URL"),
+      accounts: [configVariable("BSCTESTNET_PRIVATE_KEY")],
+    },
     "local-anvil-a": {
       type: "http",
       chainType: "l1",
@@ -75,6 +82,23 @@ const config = defineConfig({
       chainId: 31338,
       url: configVariable("E2E_CHAIN_B_HOST_RPC_URL"),
       accounts: [configVariable("E2E_DEPLOYER_PRIVATE_KEY")],
+    },
+    // The regtest URLs default to the local two-chain layout so the
+    // documented zero-config flow reaches the right endpoints; the deployer
+    // key always comes from the environment or keystore.
+    "regtest-a": {
+      type: "http",
+      chainType: "l1",
+      chainId: 31337,
+      url: process.env.REGTEST_A_HOST_RPC_URL ?? "http://127.0.0.1:18545",
+      accounts: [configVariable("REGTEST_DEPLOYER_PRIVATE_KEY")],
+    },
+    "regtest-b": {
+      type: "http",
+      chainType: "l1",
+      chainId: 31338,
+      url: process.env.REGTEST_B_HOST_RPC_URL ?? "http://127.0.0.1:18546",
+      accounts: [configVariable("REGTEST_DEPLOYER_PRIVATE_KEY")],
     },
   },
   ignition: {

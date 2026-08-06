@@ -909,6 +909,36 @@ type testEthService struct {
 	hang bool
 	// logsScript overrides logs/logsErr with per-call scripted answers.
 	logsScript *logsScript
+	// state-read fakes for the quorum voting paths.
+	callResult   []byte
+	callErr      error
+	callHang     bool
+	callDelay    time.Duration
+	callObserved *observedBlockRef
+	codeResult   []byte
+	codeErr      error
+	estimateGas  uint64
+	estimateErr  error
+	pendingNonce uint64
+	pendingErr   error
+}
+
+// observedBlockRef records the block reference a state read was served at.
+type observedBlockRef struct {
+	mu   sync.Mutex
+	refs []rpc.BlockNumberOrHash
+}
+
+func (o *observedBlockRef) record(ref rpc.BlockNumberOrHash) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.refs = append(o.refs, ref)
+}
+
+func (o *observedBlockRef) all() []rpc.BlockNumberOrHash {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]rpc.BlockNumberOrHash(nil), o.refs...)
 }
 
 // logsScript serves scripted GetLogs answers call by call; the last step
@@ -980,15 +1010,56 @@ func (s testEthService) GetTransactionReceipt(context.Context, common.Hash) (any
 	return s.receipt, nil
 }
 
-func (s testEthService) GetTransactionCount(ctx context.Context, _ common.Address, _ rpc.BlockNumberOrHash) (hexutil.Uint64, error) {
+func (s testEthService) GetTransactionCount(ctx context.Context, _ common.Address, blockNrOrHash rpc.BlockNumberOrHash) (hexutil.Uint64, error) {
 	if s.hang {
 		<-ctx.Done()
 		return 0, ctx.Err()
+	}
+	if number, ok := blockNrOrHash.Number(); ok && number == rpc.PendingBlockNumber {
+		if s.pendingErr != nil {
+			return 0, s.pendingErr
+		}
+		return hexutil.Uint64(s.pendingNonce), nil
 	}
 	if s.nonceErr != nil {
 		return 0, s.nonceErr
 	}
 	return hexutil.Uint64(s.nonce), nil
+}
+
+func (s testEthService) Call(ctx context.Context, _ map[string]interface{}, blockNrOrHash rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	if s.callObserved != nil {
+		s.callObserved.record(blockNrOrHash)
+	}
+	if s.callDelay > 0 {
+		select {
+		case <-time.After(s.callDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if s.callHang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if s.callErr != nil {
+		return nil, s.callErr
+	}
+	return hexutil.Bytes(s.callResult), nil
+}
+
+func (s testEthService) GetCode(_ context.Context, _ common.Address, _ rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	if s.codeErr != nil {
+		return nil, s.codeErr
+	}
+	return hexutil.Bytes(s.codeResult), nil
+}
+
+func (s testEthService) EstimateGas(_ context.Context, _ map[string]interface{}) (hexutil.Uint64, error) {
+	if s.estimateErr != nil {
+		return 0, s.estimateErr
+	}
+	return hexutil.Uint64(s.estimateGas), nil
 }
 
 func newTestEthClient(t *testing.T, service testEthService) *ethclient.Client {
@@ -1146,5 +1217,512 @@ func TestTransactionReceiptAtExcludesLaggingNegatives(t *testing.T) {
 	})
 	if _, err := client.TransactionReceiptAt(context.Background(), common.HexToHash("0x5001"), minBlock); !errors.Is(err, ethereum.NotFound) {
 		t.Fatalf("caught-up NotFound majority = %v, want ethereum.NotFound", err)
+	}
+}
+
+// testCodedRevertError is a data-carrying revert reported under an arbitrary
+// RPC error code (geth-family endpoints disagree on 3 vs -32000).
+type testCodedRevertError struct {
+	message string
+	code    int
+	data    any
+}
+
+func (e testCodedRevertError) Error() string  { return e.message }
+func (e testCodedRevertError) ErrorCode() int { return e.code }
+func (e testCodedRevertError) ErrorData() any { return e.data }
+
+type testRevertError struct {
+	message string
+	data    string
+}
+
+func (e testRevertError) Error() string  { return e.message }
+func (e testRevertError) ErrorCode() int { return 3 }
+func (e testRevertError) ErrorData() any { return e.data }
+
+func stateReadTestClient(t *testing.T, services ...testEthService) *Client {
+	t.Helper()
+	providers := make([]configuredProvider, len(services))
+	for index, service := range services {
+		providers[index] = configuredProvider{url: string(rune('a' + index)), status: ProviderHealthy, client: newTestEthClient(t, service)}
+	}
+	return &Client{chainName: "testnet", providers: providers}
+}
+
+func TestCallContractMajorityWinsAndMarksDissenter(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	agreed := []byte{0x0a}
+	// The agreeing majority answers after a short delay so the dissenter's
+	// vote always lands before the early-exit cancellation.
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callResult: agreed, callDelay: 50 * time.Millisecond},
+		testEthService{header: canonical, callResult: agreed, callDelay: 50 * time.Millisecond},
+		testEthService{header: canonical, callResult: []byte{0x0b}},
+	)
+
+	result, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if err != nil {
+		t.Fatalf("CallContract() error = %v", err)
+	}
+	if string(result) != string(agreed) {
+		t.Fatalf("result = %x, want the majority answer", result)
+	}
+	providers := client.Providers()
+	if providers[2].StateConflict != true {
+		t.Fatal("dissenting provider must carry the state conflict flag")
+	}
+	if providers[0].StateConflict || providers[1].StateConflict {
+		t.Fatal("agreeing providers must not carry the state conflict flag")
+	}
+	// State reads never move the head status dimension.
+	for index, provider := range providers {
+		if provider.Status != ProviderHealthy {
+			t.Fatalf("provider[%d] head status = %q, want untouched healthy", index, provider.Status)
+		}
+	}
+}
+
+func TestCallContractSplitIsConflictNotUnavailable(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callResult: []byte{0x01}},
+		testEthService{header: canonical, callResult: []byte{0x02}},
+		testEthService{header: canonical, callResult: []byte{0x03}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if !IsStateReadConflict(err) {
+		t.Fatalf("CallContract() error = %v, want state read conflict", err)
+	}
+	if IsQuorumUnavailable(err) {
+		t.Fatal("a comparable split must not read as unavailability")
+	}
+	for index, provider := range client.Providers() {
+		if !provider.StateConflict {
+			t.Fatalf("provider[%d] must be marked in a no-majority split", index)
+		}
+	}
+}
+
+func TestCallContractTooFewComparableIsUnavailable(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callResult: []byte{0x01}},
+		testEthService{header: canonical, callErr: testRPCError{message: "boom", code: -32000}},
+		testEthService{header: canonical, callErr: testRPCError{message: "boom", code: -32000}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("CallContract() error = %v, want quorum unavailable", err)
+	}
+}
+
+func TestCallContractRevertMajorityKeepsClassification(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	revert := testRevertError{message: "execution reverted: denied", data: "0x08c379a0"}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: revert},
+		testEthService{header: canonical, callErr: revert},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if err == nil {
+		t.Fatal("CallContract() error = nil, want the majority revert")
+	}
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != 3 {
+		t.Fatalf("majority revert must keep its rpc error identity, got %v", err)
+	}
+	if !IsVotedRevert(err) {
+		t.Fatalf("majority revert must carry the voted-revert marker, got %v", err)
+	}
+}
+
+func TestCallContractMessageOnlyRevertMajorityWins(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	revert := testRPCError{message: "execution reverted: denied", code: -32000}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: revert},
+		testEthService{header: canonical, callErr: revert},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if err == nil {
+		t.Fatal("CallContract() error = nil, want the majority message-only revert")
+	}
+	if IsQuorumUnavailable(err) || IsStateReadConflict(err) {
+		t.Fatalf("a message-only revert majority must win the vote, got %v", err)
+	}
+	// Downstream terminal classification walks the unwrap chain for the
+	// original rpc error text; it must survive the provider redaction wrapper.
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) || !strings.Contains(strings.ToLower(rpcErr.Error()), "execution reverted") {
+		t.Fatalf("majority message-only revert lost its revert text: %v", err)
+	}
+}
+
+func TestCallContractDataLessCode3ReasonsDoNotMerge(t *testing.T) {
+	// Two data-less code-3 reverts with different reasons must not merge into
+	// a false revert majority over a successful answer: the identity is the
+	// normalized message, never the shared RPC code.
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: testRPCError{message: "execution reverted: A", code: 3}},
+		testEthService{header: canonical, callErr: testRPCError{message: "execution reverted: B", code: 3}},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if !IsStateReadConflict(err) {
+		t.Fatalf("CallContract() error = %v, want conflict (shared code 3 must not merge distinct reasons)", err)
+	}
+}
+
+func TestCallContractSameRevertDataMergesAcrossRPCCodes(t *testing.T) {
+	// The same canonical revert data reported under different RPC codes is one
+	// semantic answer and must reach the revert majority.
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: testRevertError{message: "execution reverted: denied", data: "0x08c379a0"}},
+		testEthService{header: canonical, callErr: testCodedRevertError{message: "execution reverted: denied", code: -32000, data: "0x08c379a0"}},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if err == nil {
+		t.Fatal("CallContract() error = nil, want the majority revert")
+	}
+	if IsStateReadConflict(err) || IsQuorumUnavailable(err) {
+		t.Fatalf("same revert data across rpc codes must merge into a revert majority, got %v", err)
+	}
+}
+
+func TestEstimateGasNonRevertDataDoesNotFormRevertMajority(t *testing.T) {
+	// Two differently-coded transient failures carrying identical
+	// provider-specific ErrorData must stay non-comparable: merging them would
+	// out-vote the healthy estimate and terminally fail the queued transaction
+	// as an estimate revert.
+	canonical := testHeaderAt(42, 0x01)
+	diagnostic := map[string]string{"reason": "rate limited"}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: testCodedRevertError{message: "backend unavailable", code: -32603, data: diagnostic}},
+		testEthService{header: canonical, estimateErr: testCodedRevertError{message: "upstream busy", code: -32000, data: diagnostic}},
+		testEthService{header: canonical, estimateGas: 100},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("EstimateGas() error = %v, want quorum unavailable (non-revert data must not vote)", err)
+	}
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) {
+		t.Fatalf("unavailable error leaked an rpc revert identity: %v", err)
+	}
+}
+
+func TestRevertEvidenceAcrossClientShapes(t *testing.T) {
+	// One table over the revert shapes the common clients emit and the
+	// non-revert failures that must never be mistaken for them.
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"geth code 3", testRevertError{message: "execution reverted: denied", data: "0x08c379a0"}, true},
+		{"geth message only", testRPCError{message: "execution reverted", code: -32000}, true},
+		{"erigon message", testRPCError{message: "execution reverted: ERC20: insufficient balance", code: -32000}, true},
+		{"ganache vm exception", testRPCError{message: "VM Exception while processing transaction: revert MyError", code: -32000}, true},
+		{"hardhat reverted", testRPCError{message: "Error: VM Exception while processing transaction: reverted with reason string 'x'", code: -32603}, true},
+		{"bare revert", testRPCError{message: "revert", code: -32015}, true},
+		{"nethermind vm execution error with revert data", testCodedRevertError{message: "VM execution error.", code: -32015, data: "0x08c379a0"}, true},
+		{"nethermind vm execution error without data", testRPCError{message: "VM execution error.", code: -32015}, false},
+		{"vm execution error with opaque data", testCodedRevertError{message: "VM execution error.", code: -32015, data: map[string]string{"id": "1"}}, false},
+		{"transport failure", testRPCError{message: "backend unavailable", code: -32603}, false},
+		{"hex diagnostic without claim", testCodedRevertError{message: "upstream busy", code: -32000, data: "0xaabbcc"}, false},
+		{"unrelated wording", testRPCError{message: "reverting proxy misconfigured", code: -32000}, false},
+		{"non-rpc error", errors.New("execution reverted"), false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isDeterministicRevert(test.err); got != test.want {
+				t.Fatalf("isDeterministicRevert(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestEstimateGasNonGethRevertMajorityWins(t *testing.T) {
+	// A majority of non-geth endpoints reporting the same revert must reach
+	// terminal revert handling, not degrade to quorum-unavailable (which would
+	// keep a deterministically failing outbox row queued and retrying).
+	canonical := testHeaderAt(42, 0x01)
+	revert := testCodedRevertError{message: "VM execution error.", code: -32015, data: "0x08c379a0"}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateGas: 100},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if err == nil {
+		t.Fatal("EstimateGas() error = nil, want the majority revert")
+	}
+	if IsQuorumUnavailable(err) || IsEstimateGasConflict(err) {
+		t.Fatalf("non-geth revert majority must win the vote, got %v", err)
+	}
+	// Downstream terminal classification consumes the quorum's verdict instead
+	// of re-deriving it from this client's wording.
+	if !IsVotedRevert(err) {
+		t.Fatalf("majority revert must carry the voted-revert marker, got %v", err)
+	}
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("voted revert marker must unwrap to the provider rpc error: %v", err)
+	}
+}
+
+func TestEstimateGasHexDiagnosticWithoutRevertClaimDoesNotVote(t *testing.T) {
+	// Syntactically valid hex ErrorData is not revert semantics: an opaque
+	// diagnostic (a request or block hash) returned under non-revert codes and
+	// messages, even in differing case, must not form a revert majority that
+	// would terminally fail the queued transaction.
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: testCodedRevertError{message: "backend unavailable", code: -32603, data: "0xAABBCC"}},
+		testEthService{header: canonical, estimateErr: testCodedRevertError{message: "upstream busy", code: -32000, data: "0xaabbcc"}},
+		testEthService{header: canonical, estimateGas: 100},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if !IsQuorumUnavailable(err) {
+		t.Fatalf("EstimateGas() error = %v, want quorum unavailable (hex diagnostics must not vote)", err)
+	}
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) {
+		t.Fatalf("unavailable error leaked an rpc revert identity: %v", err)
+	}
+}
+
+func TestCallContractMessageOnlyRevertReasonsDoNotMerge(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: testRPCError{message: "execution reverted: A", code: -32000}},
+		testEthService{header: canonical, callErr: testRPCError{message: "execution reverted: B", code: -32000}},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if !IsStateReadConflict(err) {
+		t.Fatalf("CallContract() error = %v, want conflict (distinct revert reasons must not merge)", err)
+	}
+}
+
+func TestEstimateGasMessageOnlyRevertMajorityWins(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	revert := testRPCError{message: "execution reverted: denied", code: -32000}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateGas: 100},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if err == nil {
+		t.Fatal("EstimateGas() error = nil, want the majority message-only revert")
+	}
+	if IsQuorumUnavailable(err) || IsEstimateGasConflict(err) {
+		t.Fatalf("a message-only revert majority must win the vote, got %v", err)
+	}
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) || !strings.Contains(strings.ToLower(rpcErr.Error()), "execution reverted") {
+		t.Fatalf("majority message-only revert lost its revert text: %v", err)
+	}
+}
+
+func TestCallContractMixedRevertsDoNotMerge(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callErr: testRevertError{message: "execution reverted: A", data: "0x01"}},
+		testEthService{header: canonical, callErr: testRevertError{message: "execution reverted: B", data: "0x02"}},
+		testEthService{header: canonical, callResult: []byte{0x01}},
+	)
+
+	_, err := client.CallContract(context.Background(), ethereum.CallMsg{}, big.NewInt(42))
+	if !IsStateReadConflict(err) {
+		t.Fatalf("CallContract() error = %v, want conflict (distinct reverts must not merge)", err)
+	}
+	// The aggregate error must not expose any minority revert identity, so
+	// downstream deterministic-revert classification cannot misfire.
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) {
+		t.Fatalf("conflict error leaked an rpc revert identity: %v", err)
+	}
+}
+
+func TestCallContractNilAnchorsToCanonicalHash(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	observedA := &observedBlockRef{}
+	observedB := &observedBlockRef{}
+	observedC := &observedBlockRef{}
+	agreed := []byte{0x0a}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, callResult: agreed, callObserved: observedA},
+		testEthService{header: canonical, callResult: agreed, callObserved: observedB},
+		testEthService{header: canonical, callResult: agreed, callObserved: observedC},
+	)
+
+	if _, err := client.CallContract(context.Background(), ethereum.CallMsg{}, nil); err != nil {
+		t.Fatalf("CallContract(nil) error = %v", err)
+	}
+	want := canonical.Hash()
+	for index, observed := range []*observedBlockRef{observedA, observedB, observedC} {
+		refs := observed.all()
+		if len(refs) == 0 {
+			continue // canceled straggler after early majority
+		}
+		hash, ok := refs[0].Hash()
+		if !ok || hash != want {
+			t.Fatalf("provider[%d] served block ref %+v, want the canonical hash %s", index, refs[0], want)
+		}
+	}
+}
+
+func TestCodeAtNormalizesEmptyCode(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, codeResult: nil},
+		testEthService{header: canonical, codeResult: []byte{}},
+		testEthService{header: canonical, codeResult: []byte{0x60}},
+	)
+
+	code, err := client.CodeAt(context.Background(), common.Address{}, big.NewInt(42))
+	if err != nil {
+		t.Fatalf("CodeAt() error = %v", err)
+	}
+	if len(code) != 0 {
+		t.Fatalf("code = %x, want the empty-code majority", code)
+	}
+}
+
+func TestEstimateGasBoundedAggregation(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	tests := []struct {
+		name      string
+		estimates [3]uint64
+		want      uint64
+	}{
+		// The lone honest high estimate survives inside the bounded set.
+		{name: "honestHighSurvives", estimates: [3]uint64{50, 50, 100}, want: 100},
+		// Amplification is capped by the bounded set around the upper median.
+		{name: "amplificationBounded", estimates: [3]uint64{100, 200, 200}, want: 200},
+		// An extreme outlier is excluded and marked, majority remains.
+		{name: "outlierExcluded", estimates: [3]uint64{100, 100, 10_000}, want: 100},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := stateReadTestClient(t,
+				testEthService{header: canonical, estimateGas: test.estimates[0]},
+				testEthService{header: canonical, estimateGas: test.estimates[1]},
+				testEthService{header: canonical, estimateGas: test.estimates[2]},
+			)
+			gas, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+			if err != nil {
+				t.Fatalf("EstimateGas() error = %v", err)
+			}
+			if gas != test.want {
+				t.Fatalf("EstimateGas() = %d, want %d", gas, test.want)
+			}
+		})
+	}
+}
+
+func TestEstimateGasRevertMajorityKeepsClassification(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	revert := testRevertError{message: "execution reverted: denied", data: "0x08c379a0"}
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateErr: revert},
+		testEthService{header: canonical, estimateGas: 100},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if err == nil {
+		t.Fatal("EstimateGas() error = nil, want the majority revert")
+	}
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != 3 {
+		t.Fatalf("majority revert must keep its rpc error identity, got %v", err)
+	}
+}
+
+func TestEstimateGasSplitDoesNotExposeRevert(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateErr: testRevertError{message: "execution reverted: A", data: "0x01"}},
+		testEthService{header: canonical, estimateGas: 100},
+		testEthService{header: canonical, estimateErr: testRPCError{message: "boom", code: -32000}},
+	)
+
+	_, err := client.EstimateGas(context.Background(), ethereum.CallMsg{})
+	if err == nil {
+		t.Fatal("EstimateGas() error = nil, want conflict")
+	}
+	if !IsEstimateGasConflict(err) {
+		t.Fatalf("EstimateGas() error = %v, want estimate conflict", err)
+	}
+	var rpcErr rpc.Error
+	if errors.As(err, &rpcErr) {
+		t.Fatalf("conflict error leaked an rpc revert identity: %v", err)
+	}
+}
+
+func TestEstimateGasRejectsAboveBlockGasLimit(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	over := canonical.GasLimit + 1
+	client := stateReadTestClient(t,
+		testEthService{header: canonical, estimateGas: over},
+		testEthService{header: canonical, estimateGas: over},
+		testEthService{header: canonical, estimateGas: over},
+	)
+
+	if _, err := client.EstimateGas(context.Background(), ethereum.CallMsg{}); !IsEstimateGasConflict(err) {
+		t.Fatalf("EstimateGas() error = %v, want block-gas-limit refusal", err)
+	}
+}
+
+func TestPendingNonceAtRequiresIdenticalMajorityAboveConfirmed(t *testing.T) {
+	canonical := testHeaderAt(42, 0x01)
+	agree := stateReadTestClient(t,
+		testEthService{header: canonical, nonce: 7, pendingNonce: 9},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 9},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 11},
+	)
+	nonce, err := agree.PendingNonceAt(context.Background(), common.Address{})
+	if err != nil || nonce != 9 {
+		t.Fatalf("PendingNonceAt() = (%d, %v), want the identical majority 9", nonce, err)
+	}
+
+	split := stateReadTestClient(t,
+		testEthService{header: canonical, nonce: 7, pendingNonce: 9},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 10},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 11},
+	)
+	if _, err := split.PendingNonceAt(context.Background(), common.Address{}); !IsStateReadConflict(err) {
+		t.Fatalf("PendingNonceAt(split) error = %v, want fail-closed conflict", err)
+	}
+
+	// A majority pending below the confirmed majority nonce is inconsistent
+	// and must fail closed instead of bootstrapping a cursor into the past.
+	below := stateReadTestClient(t,
+		testEthService{header: canonical, nonce: 7, pendingNonce: 5},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 5},
+		testEthService{header: canonical, nonce: 7, pendingNonce: 5},
+	)
+	if _, err := below.PendingNonceAt(context.Background(), common.Address{}); !IsStateReadConflict(err) {
+		t.Fatalf("PendingNonceAt(below confirmed) error = %v, want fail-closed conflict", err)
 	}
 }

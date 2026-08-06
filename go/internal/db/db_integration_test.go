@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"sync"
@@ -537,6 +538,26 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 		t.Fatalf("SyncConfig() error = %v", err)
 	}
 
+	// Retry semantics are exercised with a packet-scoped purpose: pricing rows
+	// carry time-bound observations and are excluded from every retry path.
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+	packet.Nonce = big.NewInt(9101)
+	packet.PayloadHash = common.HexToHash("0xd1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1")
+	cleanPacketRows(ctx, t, store, packet.GUID)
+	t.Cleanup(func() {
+		cleanCtx, cancelClean := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelClean()
+		cleanStore, err := Connect(cleanCtx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect for packet cleanup: %v", err)
+		}
+		defer cleanStore.Close()
+		cleanPacketRows(cleanCtx, t, cleanStore, packet.GUID)
+	})
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
 	const signerID = "0x8888888888888888888888888888888888888888"
 	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE signer_id = $1", signerID); err != nil {
 		t.Fatalf("delete test rows: %v", err)
@@ -544,14 +565,15 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_nonce_cursors WHERE signer_id = $1", signerID); err != nil {
 		t.Fatalf("delete test cursor: %v", err)
 	}
-	if inserted, err := store.BootstrapTxNonceCursor(ctx, 40161, signerID, 42); err != nil {
+	if inserted, err := store.BootstrapTxNonceCursor(ctx, 40449, signerID, 42); err != nil {
 		t.Fatalf("BootstrapTxNonceCursor() error = %v", err)
 	} else if !inserted {
 		t.Fatal("BootstrapTxNonceCursor() inserted = false, want true")
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
-		ChainEID: 40161,
-		Purpose:  TxPurposePricingSetPriceSnapshot,
+		ChainEID: packet.DstEID,
+		Purpose:  txPurposeExecutorCommitVerification,
+		GUID:     packet.GUID.Bytes(),
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -560,7 +582,7 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueTx() error = %v", err)
 	}
-	claimed, err := store.ClaimOutboxForSigning(ctx, id, 40161, signerID, uuid.New(), 30*time.Second)
+	claimed, err := store.ClaimOutboxForSigning(ctx, id, 40449, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("ClaimOutboxForSigning() error = %v", err)
 	}
@@ -614,7 +636,7 @@ func TestRetryFailedTxClonesAssignedNonceAndFreshRetryUsesCursor(t *testing.T) {
 		t.Fatalf("duplicate RetryFailedTx() id = %d, want error", duplicateID)
 	}
 
-	reclaimed, err := store.ClaimOutboxForSigning(ctx, retryID, 40161, signerID, uuid.New(), 30*time.Second)
+	reclaimed, err := store.ClaimOutboxForSigning(ctx, retryID, 40449, signerID, uuid.New(), 30*time.Second)
 	if err != nil {
 		t.Fatalf("ClaimOutboxForSigning() after retry error = %v", err)
 	}
@@ -665,13 +687,34 @@ func TestRetryFailedTxRequeuesNoNonceRowInPlace(t *testing.T) {
 		t.Fatalf("SyncConfig() error = %v", err)
 	}
 
+	// Retry semantics are exercised with a packet-scoped purpose: pricing rows
+	// carry time-bound observations and are excluded from every retry path.
+	packet := testPacketRecord()
+	packet.GUID = common.HexToHash("0xa2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2")
+	packet.Nonce = big.NewInt(9102)
+	packet.PayloadHash = common.HexToHash("0xd2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2")
+	cleanPacketRows(ctx, t, store, packet.GUID)
+	t.Cleanup(func() {
+		cleanCtx, cancelClean := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelClean()
+		cleanStore, err := Connect(cleanCtx, databaseURL)
+		if err != nil {
+			t.Fatalf("connect for packet cleanup: %v", err)
+		}
+		defer cleanStore.Close()
+		cleanPacketRows(cleanCtx, t, cleanStore, packet.GUID)
+	})
+	if err := store.UpsertPacket(ctx, packet); err != nil {
+		t.Fatalf("UpsertPacket() error = %v", err)
+	}
 	const signerID = "0x6666666666666666666666666666666666666666"
 	if _, err := store.pool.Exec(ctx, "DELETE FROM tx_outbox WHERE signer_id = $1", signerID); err != nil {
 		t.Fatalf("delete test rows: %v", err)
 	}
 	id, err := store.EnqueueTx(ctx, TxRequest{
-		ChainEID: 40161,
-		Purpose:  TxPurposePricingSetPriceSnapshot,
+		ChainEID: packet.DstEID,
+		Purpose:  txPurposeExecutorCommitVerification,
+		GUID:     packet.GUID.Bytes(),
 		To:       common.HexToAddress("0x2222222222222222222222222222222222222222"),
 		Calldata: []byte{0x01, 0x02},
 		Value:    big.NewInt(0),
@@ -836,6 +879,36 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 		t.Fatalf("mark superseded child: %v", err)
 	}
 
+	// A legacy pricing failure still holding an unconsumed nonce (upgraded
+	// data) must NOT hide as superseded: RetryFailedTx keeps it retryable
+	// because the nonce gap can wedge the signer lane, so it falls through to
+	// the generic classification and pages as exhausted.
+	if _, err := store.pool.Exec(ctx, `
+		INSERT INTO tx_outbox (chain_eid, purpose, to_address, calldata, value, signer_id, status, failure_kind, nonce, attempts)
+		VALUES ($1, $2, $3, $4, 0, $5, $6, 'broadcast_failed', 9001, 1)
+	`, retryStatsChainEID, TxPurposePricingSetPriceSnapshot, common.HexToAddress("0x2222222222222222222222222222222222222222").Bytes(), []byte{0x08}, signerID, TxStatusFailed); err != nil {
+		t.Fatalf("seed legacy nonce-bearing pricing failure: %v", err)
+	}
+
+	// Generic (non-pricing) rows keep the exhausted/retrying buckets; they are
+	// seeded raw because stats classification does not consult scope validity.
+	for _, seed := range []struct {
+		calldata byte
+		attempts uint32
+		due      string
+	}{
+		{calldata: 0x06, attempts: TxAutoRetryMaxAttempts, due: "now() - interval '1 second'"},
+		{calldata: 0x07, attempts: 1, due: "now() + interval '1 minute'"},
+	} {
+		if _, err := store.pool.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO tx_outbox (chain_eid, purpose, to_address, calldata, value, signer_id, status, failure_kind, next_retry_at, attempts)
+			VALUES ($1, $2, $3, $4, 0, $5, $6, $7, %s, $8)
+		`, seed.due), retryStatsChainEID, txPurposeExecutorCommitVerification, common.HexToAddress("0x2222222222222222222222222222222222222222").Bytes(), []byte{seed.calldata}, signerID, TxStatusFailed, TxFailureEstimateGasRevert, seed.attempts); err != nil {
+			t.Fatalf("seed generic failed row: %v", err)
+		}
+	}
+
+	// Pricing rows never auto-retry, and the generic retrying row is not due.
 	if _, err := store.PrepareNextFailedTxRetry(ctx, retryStatsChainEID, signerID); !errors.Is(err, ErrNoFailedTxRetry) {
 		t.Fatalf("PrepareNextFailedTxRetry() error = %v, want ErrNoFailedTxRetry", err)
 	}
@@ -849,14 +922,17 @@ func TestPrepareNextFailedTxRetryStopsAtAttemptCapAndStatsExposeRetryState(t *te
 			counts[stat.RetryState] += stat.Count
 		}
 	}
-	if counts[TxOutboxRetryStateExhausted] != 1 {
-		t.Fatalf("exhausted count = %d, want 1; counts=%v", counts[TxOutboxRetryStateExhausted], counts)
+	// The exhausted generic row and the legacy nonce-bearing pricing row page;
+	// nonce-less pricing rows are terminal by design and report superseded
+	// (the bot rebuilds from fresh observations).
+	if counts[TxOutboxRetryStateExhausted] != 2 {
+		t.Fatalf("exhausted count = %d, want 2; counts=%v", counts[TxOutboxRetryStateExhausted], counts)
 	}
 	if counts[TxOutboxRetryStateRetrying] != 1 {
 		t.Fatalf("retrying count = %d, want 1; counts=%v", counts[TxOutboxRetryStateRetrying], counts)
 	}
-	if counts[TxOutboxRetryStateSuperseded] != 2 {
-		t.Fatalf("superseded count = %d, want 2; counts=%v", counts[TxOutboxRetryStateSuperseded], counts)
+	if counts[TxOutboxRetryStateSuperseded] != 4 {
+		t.Fatalf("superseded count = %d, want 4; counts=%v", counts[TxOutboxRetryStateSuperseded], counts)
 	}
 }
 

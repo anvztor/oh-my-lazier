@@ -56,6 +56,8 @@ const requiredDocs: RequiredDoc[] = [
       "LazIndexerPollStalled",
       "LazRPCProviderConflict",
       "LazRPCQuorumUnavailable",
+      "LazPricingSnapshotNearStale",
+      "LazPricingPendingStalled",
       "laz_chain_paused == 1",
       "laz_pathway_paused == 1",
       "laz_indexer_poll_success",
@@ -67,6 +69,7 @@ const requiredDocs: RequiredDoc[] = [
       "laz_indexer_cursor_last_block",
       "laz_rpc_provider_status",
       "laz_rpc_provider_log_conflict",
+      "laz_rpc_provider_state_conflict",
       "laz_signer_native_balance_wei",
       "laz_worker_fee_negative_margin_jobs",
       "laz_worker_fee_unpriced_receipts",
@@ -267,7 +270,28 @@ const requiredAlertRules: RequiredAlertRule[] = [
   {
     alert: "LazRPCProviderConflict",
     anchors: [
-      'laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1',
+      'laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1 or laz_rpc_provider_state_conflict == 1',
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazTxOutboxOrphaned",
+    anchors: [
+      "laz_tx_outbox_orphaned_total > 0",
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazPricingSnapshotNearStale",
+    anchors: [
+      "laz_pricing_snapshot_time_to_stale_seconds < 300",
+      "severity: page",
+    ],
+  },
+  {
+    alert: "LazPricingPendingStalled",
+    anchors: [
+      "laz_pricing_pending_oldest_age_seconds > 300",
       "severity: page",
     ],
   },

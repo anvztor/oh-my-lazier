@@ -33,6 +33,14 @@ var environmentVariableNamePattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 // MaxPriceSnapshotStaleAfterSeconds mirrors OpenPriceFeed.MAX_PRICE_SNAPSHOT_STALE_AFTER.
 const MaxPriceSnapshotStaleAfterSeconds uint64 = 24 * 60 * 60
 
+// MinPricingFreshnessMarginSeconds is the minimum margin stale_after_seconds
+// must leave after heartbeat_seconds + interval_seconds. It is the enqueue,
+// signing, and confirmation budget for the worst healthy write schedule;
+// readiness and the pending-stall alert escalate a pending pricing
+// transaction at half this margin, so a stuck write turns red while the
+// on-chain snapshot still has headroom instead of after it expired.
+const MinPricingFreshnessMarginSeconds uint64 = 600
+
 // MinUniswapTWAPWindowSeconds is the shortest accepted Uniswap V3 sanity-price lookback.
 const MinUniswapTWAPWindowSeconds uint64 = 30 * 60
 
@@ -162,6 +170,9 @@ type PricingConfig struct {
 	// MinUpdateDeviationBps is the minimum change from the last written price that triggers an update; it defaults to 50.
 	MinUpdateDeviationBps uint64 `yaml:"min_update_deviation_bps"`
 	// HeartbeatSeconds is the maximum time between price writes in a quiet market; it defaults to half stale_after_seconds.
+	// stale_after_seconds must exceed heartbeat_seconds + interval_seconds by
+	// MinPricingFreshnessMarginSeconds so a pending write cannot silently let
+	// the snapshot expire before readiness escalates.
 	HeartbeatSeconds uint64 `yaml:"heartbeat_seconds"`
 	// SourceRequestTimeoutSeconds bounds one concurrent market-source read; it defaults to 10.
 	SourceRequestTimeoutSeconds uint64 `yaml:"source_request_timeout_seconds"`
@@ -323,6 +334,10 @@ type ChainConfig struct {
 	IndexerPollIntervalSeconds uint64 `yaml:"indexer_poll_interval_seconds"`
 	// RPCURLs lists every RPC endpoint in the quorum; http(s), ws(s), and absolute IPC paths are supported.
 	RPCURLs []string `yaml:"rpc_urls"`
+	// LegacyTransactions forces type-0 (legacy) transactions on this chain even
+	// when it reports a base fee, for chains whose mempools drop EIP-1559
+	// transactions (for example a goat-geth regtest run with legacy tooling).
+	LegacyTransactions bool `yaml:"legacy_transactions"`
 	// TxRoles defines local send-time tx policies for worker submissions on this chain.
 	TxRoles ChainTxRolesConfig `yaml:"tx_roles"`
 }
@@ -375,6 +390,12 @@ type PathwayConfig struct {
 	SourceWorkers WorkerContractsConfig `yaml:"source_workers"`
 	// DestinationWorkers selects destination-side worker contracts used for verification checks.
 	DestinationWorkers DestinationWorkerContractsConfig `yaml:"destination_workers"`
+	// SendRequiredDVNs is the exact required DVN set expected on the source chain's send ULN,
+	// including the pathway's own OpenDVN and every approved peer DVN.
+	SendRequiredDVNs []EVMAddress `yaml:"send_required_dvns"`
+	// ReceiveRequiredDVNs is the exact required DVN set expected on the destination chain's
+	// receive ULN, including the pathway's own OpenDVN and every approved peer DVN.
+	ReceiveRequiredDVNs []EVMAddress `yaml:"receive_required_dvns"`
 	// DVN controls whether the local DVN stays in shadow mode or actively submits verification.
 	DVN PathwayDVNConfig `yaml:"dvn"`
 	// Pricing holds pathway-scoped worker quote models; it is required only when pricing is enabled.
@@ -564,6 +585,16 @@ func (c Config) Validate() error {
 		if pathway.SrcEID == pathway.DstEID {
 			return fmt.Errorf("pathway %d -> %d must cross chains", pathway.SrcEID, pathway.DstEID)
 		}
+		// The send ULN assigns the source chain's confirmations to every DVN job while the
+		// receive ULN enforces the destination chain's value, so a lower source value is a
+		// deterministic misconfiguration that would reject every verification at runtime.
+		if chains[pathway.SrcEID].Confirmations < chains[pathway.DstEID].Confirmations {
+			return fmt.Errorf(
+				"pathway %d -> %d source chain confirmations %d are below destination chain confirmations %d",
+				pathway.SrcEID, pathway.DstEID,
+				chains[pathway.SrcEID].Confirmations, chains[pathway.DstEID].Confirmations,
+			)
+		}
 		for label, value := range map[string]EVMAddress{
 			"src_oapp":                     pathway.SrcOApp,
 			"dst_oapp":                     pathway.DstOApp,
@@ -577,6 +608,18 @@ func (c Config) Validate() error {
 			if value.IsZero() {
 				return fmt.Errorf("pathway %d -> %d %s is required", pathway.SrcEID, pathway.DstEID, label)
 			}
+		}
+		if err := validateRequiredDVNSet(
+			fmt.Sprintf("pathway %d -> %d send_required_dvns", pathway.SrcEID, pathway.DstEID),
+			pathway.SendRequiredDVNs, pathway.SourceWorkers.OpenDVN,
+		); err != nil {
+			return err
+		}
+		if err := validateRequiredDVNSet(
+			fmt.Sprintf("pathway %d -> %d receive_required_dvns", pathway.SrcEID, pathway.DstEID),
+			pathway.ReceiveRequiredDVNs, pathway.DestinationWorkers.OpenDVN,
+		); err != nil {
+			return err
 		}
 		switch pathway.DVN.Mode {
 		case DVNModeShadow:
@@ -823,6 +866,14 @@ func (c Config) validatePricing(chains map[uint32]struct{}, signers map[string]s
 	if c.Pricing.IntervalSeconds >= c.Pricing.StaleAfterSeconds-c.Pricing.HeartbeatSeconds {
 		return errors.New("pricing heartbeat_seconds plus interval_seconds must be less than stale_after_seconds")
 	}
+	// The margin left after the worst healthy write schedule is the budget for
+	// enqueue, signing, and confirmation. Readiness escalates a pending pricing
+	// transaction after the fixed stall threshold, so the margin must be at
+	// least that threshold or a stuck write could let the snapshot expire while
+	// readiness stays green.
+	if c.Pricing.StaleAfterSeconds-c.Pricing.HeartbeatSeconds-c.Pricing.IntervalSeconds < MinPricingFreshnessMarginSeconds {
+		return fmt.Errorf("pricing stale_after_seconds must exceed heartbeat_seconds plus interval_seconds by at least %d seconds", MinPricingFreshnessMarginSeconds)
+	}
 	if c.Pricing.SourceRequestTimeoutSeconds == 0 {
 		return errors.New("pricing source_request_timeout_seconds is required")
 	}
@@ -869,6 +920,33 @@ func (c Config) validatePricing(chains map[uint32]struct{}, signers map[string]s
 		if err := validatePricingChainSources(chain, c.Pricing.CoinMarketCapAPIKeyEnv); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateRequiredDVNSet enforces the phase-1 required DVN topology for one ULN side:
+// the pathway's own OpenDVN plus at least one independently operated DVN, with every
+// entry explicit and no duplicates, so startup can pin the exact approved set.
+func validateRequiredDVNSet(label string, dvns []EVMAddress, openDVN EVMAddress) error {
+	if len(dvns) < 2 {
+		return fmt.Errorf("%s must list the pathway's OpenDVN plus at least one independently operated DVN", label)
+	}
+	seen := make(map[EVMAddress]struct{}, len(dvns))
+	containsOpenDVN := false
+	for i, dvn := range dvns {
+		if dvn.IsZero() {
+			return fmt.Errorf("%s[%d] is required", label, i)
+		}
+		if _, ok := seen[dvn]; ok {
+			return fmt.Errorf("%s[%d] duplicates %s", label, i, dvn)
+		}
+		seen[dvn] = struct{}{}
+		if dvn == openDVN {
+			containsOpenDVN = true
+		}
+	}
+	if !containsOpenDVN {
+		return fmt.Errorf("%s must include the pathway's OpenDVN %s", label, openDVN)
 	}
 	return nil
 }

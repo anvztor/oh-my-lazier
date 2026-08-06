@@ -19,6 +19,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/bigutil"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 	"github.com/islishude/oh-my-lazier/go/internal/signer"
 	"github.com/jackc/pgx/v5"
 )
@@ -59,6 +60,10 @@ type ChainClient interface {
 type FeePolicy struct {
 	ConfiguredMaxFeePerGas         *big.Int
 	ConfiguredMaxPriorityFeePerGas *big.Int
+	// ForceLegacyTransactions quotes type-0 fees even when the chain reports
+	// a base fee: some mempools (goat-geth regtest) drop EIP-1559
+	// transactions, and a dropped worker write would stall the relay.
+	ForceLegacyTransactions bool
 }
 
 type feeQuote struct {
@@ -1183,7 +1188,7 @@ func quoteFee(ctx context.Context, queued db.QueuedOutboxTx, policy FeePolicy, c
 	if header == nil {
 		return feeQuote{}, errors.New("latest block header is required")
 	}
-	if header.BaseFee == nil {
+	if header.BaseFee == nil || policy.ForceLegacyTransactions {
 		return quoteLegacyFee(ctx, queued, policy, client)
 	}
 	return quoteDynamicFee(ctx, queued, policy, client, header.BaseFee)
@@ -1470,6 +1475,13 @@ func signOutboxTxWithStatuses(ctx context.Context, outboxTx db.OutboxTx, chainID
 func isEstimateGasRevert(err error) bool {
 	if err == nil {
 		return false
+	}
+	// A quorum-voted revert is authoritative: the RPC layer already agreed by
+	// fixed majority that the EVM rejected this call, across every client
+	// revert shape it recognizes. Re-deriving that verdict from text here
+	// would drift from the quorum's own classifier.
+	if rpcquorum.IsVotedRevert(err) {
+		return true
 	}
 	if dataErr, ok := errors.AsType[rpc.DataError](err); ok {
 		if isRevertErrorData(dataErr.ErrorData()) {

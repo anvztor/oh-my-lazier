@@ -1,6 +1,7 @@
 package configcheck
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/hex"
@@ -56,6 +57,43 @@ type ChainClient interface {
 
 type chainIDValidator interface {
 	ValidateChainID(context.Context, *big.Int) error
+}
+
+// anchoredChainClient pins nil-block reads to one verified canonical anchor
+// so every read in a chain's config check shares a single consistent state
+// view. When the underlying client supports hash addressing, the anchor's
+// block hash pins the reads to the verified branch even across a tip reorg.
+type anchoredChainClient struct {
+	ChainClient
+	block *big.Int
+	hash  common.Hash
+}
+
+type hashAddressedClient interface {
+	CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error)
+	CodeAtHash(ctx context.Context, account common.Address, blockHash common.Hash) ([]byte, error)
+}
+
+// CallContract substitutes the verified anchor for nil block numbers.
+func (a anchoredChainClient) CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
+	if blockNumber == nil {
+		if hashed, ok := a.ChainClient.(hashAddressedClient); ok && a.hash != (common.Hash{}) {
+			return hashed.CallContractAtHash(ctx, call, a.hash)
+		}
+		blockNumber = a.block
+	}
+	return a.ChainClient.CallContract(ctx, call, blockNumber)
+}
+
+// CodeAt substitutes the verified anchor for nil block numbers.
+func (a anchoredChainClient) CodeAt(ctx context.Context, account common.Address, blockNumber *big.Int) ([]byte, error) {
+	if blockNumber == nil {
+		if hashed, ok := a.ChainClient.(hashAddressedClient); ok && a.hash != (common.Hash{}) {
+			return hashed.CodeAtHash(ctx, account, a.hash)
+		}
+		blockNumber = a.block
+	}
+	return a.ChainClient.CodeAt(ctx, account, blockNumber)
 }
 
 // Issue describes one config mismatch against on-chain state.
@@ -180,12 +218,21 @@ func (c *checker) checkChain(ctx context.Context, client ChainClient, configured
 	}
 	// Establish the quorum head before the first on-chain config read, so the
 	// provider trust state is set by the configured majority rather than by
-	// whichever provider happens to be listed first.
+	// whichever provider happens to be listed first. The verified head also
+	// anchors every subsequent read for this chain: dozens of serial config
+	// reads must not each re-establish a head quorum (a black-holed minority
+	// provider would charge every read a probe deadline), and one immutable
+	// height keeps the whole check a single consistent state view.
 	if headChecker, ok := client.(interface {
 		CheckHead(context.Context) (rpcquorum.HeadResult, error)
 	}); ok {
-		if _, err := headChecker.CheckHead(ctx); err != nil {
+		head, err := headChecker.CheckHead(ctx)
+		if err != nil {
 			return fmt.Errorf("check chain %d rpc head quorum: %w", configured.EID, err)
+		}
+		if head.Number != nil {
+			c.clients[configured.EID] = anchoredChainClient{ChainClient: client, block: new(big.Int).Set(head.Number), hash: common.HexToHash(head.Hash)}
+			client = c.clients[configured.EID]
 		}
 	}
 	actualChainID, err := client.ChainID(ctx)
@@ -321,12 +368,22 @@ func (c *checker) checkLibraries(ctx context.Context, srcClient, dstClient Chain
 	if err != nil {
 		return err
 	}
-	c.compareULNConfig(base+".send_uln_config", sendULNConfig, srcChain.Confirmations, pathway.SourceWorkers.OpenDVN)
+	c.compareULNConfig(base+".send_uln_config", sendULNConfig, srcChain.Confirmations, pathway.SendRequiredDVNs)
 	receiveULNConfig, err := c.readULNConfig(ctx, dstClient, dstChain.EndpointAddress, pathway.DstOApp, pathway.ReceiveLib, pathway.SrcEID, base+".receive_uln_config")
 	if err != nil {
 		return err
 	}
-	c.compareULNConfig(base+".receive_uln_config", receiveULNConfig, dstChain.Confirmations, pathway.DestinationWorkers.OpenDVN)
+	c.compareULNConfig(base+".receive_uln_config", receiveULNConfig, dstChain.Confirmations, pathway.ReceiveRequiredDVNs)
+	// ReceiveUln302 rejects verifications whose assigned confirmations fall below its own
+	// threshold, and DVN jobs are assigned the send-side value, so this relationship must
+	// hold on chain regardless of what either side was configured to match.
+	if sendULNConfig.Confirmations < receiveULNConfig.Confirmations {
+		c.add(
+			base+".uln_confirmations",
+			"send uln confirmations %d are below receive uln confirmations %d; every DVN verification for this pathway would be rejected",
+			sendULNConfig.Confirmations, receiveULNConfig.Confirmations,
+		)
+	}
 	return nil
 }
 
@@ -427,7 +484,7 @@ func (c *checker) readULNConfig(ctx context.Context, client ChainClient, endpoin
 	return config, nil
 }
 
-func (c *checker) compareULNConfig(path string, config ulnConfig, confirmations uint64, openDVN common.Address) {
+func (c *checker) compareULNConfig(path string, config ulnConfig, confirmations uint64, requiredDVNs []common.Address) {
 	if config.Confirmations != confirmations {
 		c.add(path+".confirmations", "confirmations %d does not match configured %d", config.Confirmations, confirmations)
 	}
@@ -443,12 +500,24 @@ func (c *checker) compareULNConfig(path string, config ulnConfig, confirmations 
 	if len(config.OptionalDVNs) != 0 {
 		c.add(path+".optional_dvns", "optional DVNs are configured: %s", addressesString(config.OptionalDVNs))
 	}
-	if len(config.RequiredDVNs) < 2 {
-		c.add(path+".required_dvns", "required DVNs must include OpenDVN plus at least one independent DVN, got %s", addressesString(config.RequiredDVNs))
+	// An unapproved, stale, or missing entry silently changes the pathway's verification
+	// quorum, so the on-chain set must match the approved set exactly (order ignored).
+	if !equalAddressSets(config.RequiredDVNs, requiredDVNs) {
+		c.add(path+".required_dvns", "required DVNs %s do not match the configured required set %s", addressesString(config.RequiredDVNs), addressesString(requiredDVNs))
 	}
-	if !slices.Contains(config.RequiredDVNs, openDVN) {
-		c.add(path+".required_dvns", "required DVNs %s do not include configured OpenDVN %s", addressesString(config.RequiredDVNs), openDVN)
+}
+
+// equalAddressSets reports whether both slices hold the same addresses ignoring order.
+func equalAddressSets(a, b []common.Address) bool {
+	if len(a) != len(b) {
+		return false
 	}
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	compare := func(x, y common.Address) int { return bytes.Compare(x.Bytes(), y.Bytes()) }
+	slices.SortFunc(sortedA, compare)
+	slices.SortFunc(sortedB, compare)
+	return slices.Equal(sortedA, sortedB)
 }
 
 func (c *checker) requireCode(ctx context.Context, client ChainClient, path string, eid uint32, address common.Address) error {

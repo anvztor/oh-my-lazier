@@ -123,7 +123,7 @@ groups:
           runbook: docs/runbooks/monitoring.md
 
       - alert: LazRPCProviderConflict
-        expr: laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1
+        expr: laz_rpc_provider_status{status="conflict"} == 1 or laz_rpc_provider_log_conflict == 1 or laz_rpc_provider_state_conflict == 1
         for: 5m
         labels:
           severity: page
@@ -155,3 +155,42 @@ groups:
         annotations:
           summary: Worker indexer has not completed a poll within twice its configured interval
           runbook: docs/runbooks/monitoring.md
+
+      - alert: LazTxOutboxOrphaned
+        # The signing path writes the active attempt and the send status in one
+        # statement, so this state is never produced by a healthy code path: a
+        # signed row here blocks its nonce lane and a broadcast row is invisible
+        # to receipt polling, and neither self-heals. Page on the first sample.
+        # The series already excludes disabled (retired) chains, matching the
+        # readiness escalation, so a retained row cannot page forever.
+        expr: laz_tx_outbox_orphaned_total > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: A send-state tx_outbox row lost its active attempt; the signer lane needs operator recovery
+          runbook: docs/runbooks/monitoring.md
+
+      - alert: LazPricingSnapshotNearStale
+        expr: laz_pricing_snapshot_time_to_stale_seconds < 300
+        # No hold time: time-to-stale decreases monotonically between writes,
+        # so any delay here consumes the 300-second warning window and the
+        # alert would fire only once quotes are already failing closed.
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: On-chain price snapshot is close to its staleAfter cutoff; quotes fail closed once it crosses
+          runbook: docs/runbooks/price-bot.md
+
+      - alert: LazPricingPendingStalled
+        # Half the validated 600-second freshness margin: escalation must land
+        # while the on-chain snapshot still has headroom, even when the pending
+        # row was created at the very end of the write schedule.
+        expr: laz_pricing_pending_oldest_age_seconds > 300
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: A pending pricing transaction is stuck and gating new price writes while the snapshot ages
+          runbook: docs/runbooks/price-bot.md

@@ -95,6 +95,32 @@ Required runtime checks:
 - Every enabled pathway has advanced indexer cursors for the roles enabled in that process: executor requires `executor_source` and `executor_destination`; DVN requires `dvn_source` and `dvn_destination`.
 - `go run ./go/cmd/readinesscheck -config <worker.yaml>` exits successfully.
 
+### Schema upgrade: drain the send side before applying 002
+
+`002_txmgr_attempts.sql` moves the transaction hash, gas limit, and fee caps
+off `tx_outbox` and onto the new `tx_attempts` rows, dropping those columns.
+It does not backfill an attempt for a row that is already in flight, so a
+`signed` or `broadcast` row that survives the upgrade loses its only hash and
+gets no `active_attempt_id`. Receipt polling joins the active attempt, so such
+a row is never polled or replaced even if its transaction lands, and a
+`signed` row keeps its nonce and blocks that signer lane.
+
+Before upgrading an already-initialized database across 002:
+
+- Stop the worker, then confirm no `tx_outbox` row on any active chain is in
+  `signed` or `broadcast`:
+
+```sql
+SELECT chain_eid, signer_id, status, count(*)
+FROM tx_outbox
+WHERE status IN ('signed', 'broadcast')
+GROUP BY 1, 2, 3;
+```
+
+- If any row is listed, restart the worker and let receipt polling terminalize
+  it (or resolve it with `txretry`) before applying the migration. A fresh
+  database is unaffected: it applies 001 + 002 with an empty outbox.
+
 ## Contract / LayerZero Checks
 
 Required commands:
@@ -111,8 +137,8 @@ Required state:
 - OpenExecutor and OpenDVN allow only intended SendLib addresses.
 - Worker pathway config is enabled only for approved OApps.
 - Endpoint executor config points to each pathway's configured `source_workers.open_executor` only after the executor migration step.
-- Source SendUln config includes each pathway's configured `source_workers.open_dvn` plus the approved independent external DVN only during the DVN join step.
-- Destination ReceiveUln config includes each pathway's configured `destination_workers.open_dvn` plus the same approved independent external DVN only during the DVN join step.
+- Source SendUln config matches each pathway's configured `send_required_dvns` exactly (the pathway's `source_workers.open_dvn` plus every approved independently operated DVN, no extras) only during the DVN join step.
+- Destination ReceiveUln config matches each pathway's configured `receive_required_dvns` exactly (the pathway's `destination_workers.open_dvn` plus every approved independently operated DVN, no extras) only during the DVN join step.
 - Destination OpenDVN authorizes the active destination `tx_roles.dvn` signer before active DVN mode is enabled.
 - Optional DVNs are explicitly disabled for the first-phase required-DVN migration.
 - Source OpenPriceFeed `priceSnapshot(dstEid)` is fresh, the pricing signer is an authorized PriceFeed submitter, OpenExecutor/OpenDVN `priceFeed()` both point to the configured feed, and each worker's `feeModel(dstEid)` matches the approved price evidence. Same-native pathways document the 1:1 route; cross-asset pathways document the selected primary, explicit freshness limit, optional sanity set, and deviation threshold. Chainlink and Uniswap are required only when explicitly referenced, and Uniswap may only be sanity.

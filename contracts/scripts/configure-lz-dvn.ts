@@ -22,19 +22,40 @@ export type ConfigureLzDVNInput = {
   sendUln: Address;
   receiveUln: Address;
   requiredDVNs: Address[];
-  confirmations: bigint;
+  sendConfirmations: bigint;
+  receiveConfirmations: bigint;
 };
 
 export function buildConfigureLzDVNPlan(input: ConfigureLzDVNInput) {
-  const ulnConfig = requiredDVNsConfig(input.confirmations, input.requiredDVNs);
+  if (input.sendConfirmations < 1n || input.receiveConfirmations < 1n) {
+    throw new Error("ULN confirmations must be at least 1 on both libraries");
+  }
+  // The worker startup validation enforces send >= receive per pathway; reject
+  // the inconsistent write here instead of producing a pathway the worker
+  // refuses to run.
+  if (input.sendConfirmations < input.receiveConfirmations) {
+    throw new Error(
+      `send confirmations ${input.sendConfirmations} must be at least receive confirmations ${input.receiveConfirmations}`
+    );
+  }
+  const sendUlnConfig = requiredDVNsConfig(
+    input.sendConfirmations,
+    input.requiredDVNs
+  );
+  const receiveUlnConfig = requiredDVNsConfig(
+    input.receiveConfirmations,
+    input.requiredDVNs
+  );
   return {
     endpoint: input.endpoint,
     oapp: input.oapp,
     remoteEid: input.remoteEid,
     sendUln: input.sendUln,
     receiveUln: input.receiveUln,
-    ulnConfig,
-    encodedConfig: encodeUlnConfig(ulnConfig),
+    sendUlnConfig,
+    receiveUlnConfig,
+    encodedSendConfig: encodeUlnConfig(sendUlnConfig),
+    encodedReceiveConfig: encodeUlnConfig(receiveUlnConfig),
   };
 }
 
@@ -44,9 +65,9 @@ export async function configureLzDVN(
 ): Promise<void> {
   const plan = buildConfigureLzDVNPlan(input);
 
-  for (const [label, library] of [
-    ["SendUln302", input.sendUln],
-    ["ReceiveUln302", input.receiveUln],
+  for (const [label, library, encodedConfig] of [
+    ["SendUln302", input.sendUln, plan.encodedSendConfig],
+    ["ReceiveUln302", input.receiveUln, plan.encodedReceiveConfig],
   ] as const) {
     await waitForTx(
       clients.publicClient,
@@ -62,7 +83,7 @@ export async function configureLzDVN(
             {
               eid: input.remoteEid,
               configType: CONFIG_TYPE_ULN,
-              config: plan.encodedConfig,
+              config: encodedConfig,
             },
           ],
         ],
@@ -79,7 +100,8 @@ export async function configureLzDVN(
       remoteEid: plan.remoteEid,
       sendUln: plan.sendUln,
       receiveUln: plan.receiveUln,
-      ulnConfig: plan.ulnConfig,
+      sendUlnConfig: plan.sendUlnConfig,
+      receiveUlnConfig: plan.receiveUlnConfig,
     })
   );
 }

@@ -72,7 +72,10 @@ go run ./go/cmd/configcheck -config config/proposed.yaml
 ```
 
 The check compares the YAML with live chain state, including chain ID, Endpoint
-EID, deployed code, OApp peers, send/receive libraries, ULN required DVNs, and
+EID, deployed code, OApp peers, send/receive libraries, ULN required DVNs
+(each side must match the pathway's `send_required_dvns` /
+`receive_required_dvns` exactly, so an unapproved, stale, or extra required DVN
+fails the check), send-versus-receive ULN confirmations, and
 the configured `pathways[].source_workers` pathway configuration. Every
 configured RPC URL must return the configured `chain_id` from `eth_chainId`.
 Worker startup and `price-once` run the same check before database sync.

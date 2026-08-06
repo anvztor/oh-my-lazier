@@ -125,13 +125,16 @@ func TestEvaluateRejectsOperatorActionHeldLanes(t *testing.T) {
 		// An aged reprice hold cannot be self-healing: the mandatory bump is
 		// blocked (typically the fee cap) or it would have escalated already.
 		{ChainEID: 40449, SignerID: "0x5555", HeldReason: db.HeldRepriceRequired, Count: 1, OldestAgeSeconds: 3600},
+		// The cancel age counts from the immutable request time, so an aged
+		// pending cancel is stalled (typically fee-cap blocked), not converging.
+		{ChainEID: 40449, SignerID: "0x6666", HeldReason: db.HeldCancelRequested, Count: 1, OldestAgeSeconds: 3600},
 	}
 	report := Evaluate(blocking)
 	if report.Ready {
 		t.Fatal("ready = true with operator-action held lanes, want false")
 	}
-	if len(report.Issues) != 5 {
-		t.Fatalf("issues = %+v, want 5 held_signer_lane issues", report.Issues)
+	if len(report.Issues) != 6 {
+		t.Fatalf("issues = %+v, want 6 held_signer_lane issues", report.Issues)
 	}
 	for _, issue := range report.Issues {
 		if issue.Code != "held_signer_lane" {
@@ -139,11 +142,33 @@ func TestEvaluateRejectsOperatorActionHeldLanes(t *testing.T) {
 		}
 	}
 
+	orphaned := base
+	orphaned.TxOutboxOrphaned = []db.TxOutboxOrphanedStat{
+		// A send-state row with no active attempt is never produced by a
+		// healthy path, so it escalates immediately with no age threshold.
+		{ChainEID: 40449, SignerID: "0x7777", Status: db.TxStatusSigned, Count: 1, OldestAgeSeconds: 5},
+		{ChainEID: 40449, SignerID: "0x7777", Status: db.TxStatusBroadcast, Count: 2, OldestAgeSeconds: 5},
+		// A disabled chain's rows cannot be acted on and must not page.
+		{ChainEID: 50505, SignerID: "0x8888", Status: db.TxStatusSigned, Count: 1},
+	}
+	orphanedReport := Evaluate(orphaned)
+	if orphanedReport.Ready {
+		t.Fatal("ready = true with orphaned send-state rows, want false")
+	}
+	if len(orphanedReport.Issues) != 2 {
+		t.Fatalf("issues = %+v, want 2 orphaned_outbox_row issues", orphanedReport.Issues)
+	}
+	for _, issue := range orphanedReport.Issues {
+		if issue.Code != "orphaned_outbox_row" {
+			t.Fatalf("issue code = %q, want orphaned_outbox_row", issue.Code)
+		}
+	}
+
 	selfHealing := base
 	selfHealing.TxOutboxHeld = []db.TxOutboxHeldStat{
 		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldRepriceRequired, Count: 1},
 		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldNonceReconcileRequired, Count: 1},
-		{ChainEID: 40449, SignerID: "0x1111", HeldReason: "cancel_requested", Count: 1},
+		{ChainEID: 40449, SignerID: "0x1111", HeldReason: db.HeldCancelRequested, Count: 1, OldestAgeSeconds: 60},
 	}
 	report = Evaluate(selfHealing)
 	if !report.Ready {
@@ -157,6 +182,21 @@ func TestEvaluateRejectsOperatorActionHeldLanes(t *testing.T) {
 	report = Evaluate(inactiveChain)
 	if !report.Ready {
 		t.Fatalf("ready = false for a held lane on an inactive chain, issues = %+v", report.Issues)
+	}
+
+	pricingStalled := base
+	pricingStalled.PricingPending = []db.PricingPendingStat{
+		// A fresh pending write is the normal confirmation window.
+		{ChainEID: 40161, Count: 1, OldestAgeSeconds: 60},
+		// A stalled one gates the feed while the snapshot ages toward stale.
+		{ChainEID: 40449, Count: 2, OldestAgeSeconds: 400},
+	}
+	report = Evaluate(pricingStalled)
+	if report.Ready {
+		t.Fatal("ready = true with a stalled pending pricing tx, want false")
+	}
+	if len(report.Issues) != 1 || report.Issues[0].Code != "pricing_pending_stalled" {
+		t.Fatalf("issues = %+v, want one pricing_pending_stalled issue", report.Issues)
 	}
 }
 

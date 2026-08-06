@@ -14,9 +14,42 @@ type StatsSnapshot struct {
 	DVNJobs           []StatusStat
 	TxOutbox          []TxOutboxStat
 	TxOutboxHeld      []TxOutboxHeldStat
+	TxOutboxOrphaned  []TxOutboxOrphanedStat
 	TxReceiptGasCosts []TxReceiptGasCostStat
 	WorkerFees        []WorkerFeeStat
 	IndexerCursors    []IndexerCursorStat
+	PricingPending    []PricingPendingStat
+}
+
+// PricingPendingStat counts one chain's pricing snapshot transactions that can
+// still land on chain. OldestAge counts from the oldest pending row's
+// creation: a pending write normally resolves within a confirmation window, so
+// an old one means the feed is gated while its snapshot keeps aging toward the
+// on-chain staleness cutoff.
+type PricingPendingStat struct {
+	ChainEID         uint32
+	Count            int64
+	OldestAgeSeconds uint64
+}
+
+// TxOutboxOrphanedStat counts rows in a send state that no longer have an
+// active attempt. The signing path writes active_attempt_id and the status
+// together, so 'signed' or 'broadcast' with a NULL active attempt is a broken
+// invariant, not a transient state: receipt polling joins the active attempt
+// and never sees such a row again, a 'signed' one keeps its nonce and blocks
+// the signer lane, and a 'broadcast' one leaves its workflow job enqueued
+// forever. The known producer is the 002 schema upgrade applied while rows
+// were in flight; recovery is `txretry -action cancel-nonce` per row.
+//
+// A 'held' row is deliberately NOT counted: an exhausted pre-sign budget parks
+// a row that never signed an attempt, which is legitimate. Rows on disabled
+// (retired) chains are excluded too, matching the readiness escalation.
+type TxOutboxOrphanedStat struct {
+	ChainEID         uint32
+	SignerID         string
+	Status           string
+	Count            int64
+	OldestAgeSeconds uint64
 }
 
 // ChainStat summarizes one configured chain.
@@ -141,6 +174,10 @@ func (s *Store) Stats(ctx context.Context) (StatsSnapshot, error) {
 	if err != nil {
 		return StatsSnapshot{}, err
 	}
+	txOutboxOrphaned, err := s.txOutboxOrphanedStats(ctx)
+	if err != nil {
+		return StatsSnapshot{}, err
+	}
 	txReceiptGasCosts, err := s.txReceiptGasCostStats(ctx)
 	if err != nil {
 		return StatsSnapshot{}, err
@@ -153,6 +190,10 @@ func (s *Store) Stats(ctx context.Context) (StatsSnapshot, error) {
 	if err != nil {
 		return StatsSnapshot{}, err
 	}
+	pricingPending, err := s.pricingPendingStats(ctx)
+	if err != nil {
+		return StatsSnapshot{}, err
+	}
 	return StatsSnapshot{
 		Chains:            chains,
 		Pathways:          pathways,
@@ -161,8 +202,10 @@ func (s *Store) Stats(ctx context.Context) (StatsSnapshot, error) {
 		DVNJobs:           dvnJobs,
 		TxOutbox:          txOutbox,
 		TxOutboxHeld:      txOutboxHeld,
+		TxOutboxOrphaned:  txOutboxOrphaned,
 		TxReceiptGasCosts: txReceiptGasCosts,
 		WorkerFees:        workerFees,
+		PricingPending:    pricingPending,
 		IndexerCursors:    indexerCursors,
 	}, nil
 }
@@ -271,6 +314,12 @@ func (s *Store) statusStats(ctx context.Context, table string) ([]StatusStat, er
 // or cancel-nonce) can move the lane — readiness treats it like a manual hold.
 const HeldRepriceExhausted = "reprice_exhausted"
 
+// HeldCancelRequested is a synthetic stats-only reason: a row with pending
+// operator cancel intent, regardless of its held reason. Its age counts from
+// the immutable cancel_requested_at, so deferrals (fee-cap blocks, receipts
+// awaiting confirmation depth) cannot hide a cancel that never converges.
+const HeldCancelRequested = "cancel_requested"
+
 // txOutboxHeldStats surfaces every blocked or cancel-pending signer lane. A
 // pending cancel is reported under the synthetic reason 'cancel_requested' in
 // addition to its held reason, because a cancel can also sit on non-held rows.
@@ -337,6 +386,47 @@ func (s *Store) txOutboxHeldStats(ctx context.Context) ([]TxOutboxHeldStat, erro
 	return stats, rows.Err()
 }
 
+// txOutboxOrphanedStats surfaces send-state rows whose active attempt is
+// missing. The predicate is an invariant check, not a threshold: the signing
+// path sets active_attempt_id and the status in one statement, so any row here
+// means durable send state was lost and the lane needs operator recovery.
+// The age counts from updated_at — the moment the row entered its send state,
+// since nothing touches it afterwards.
+func (s *Store) txOutboxOrphanedStats(ctx context.Context) ([]TxOutboxOrphanedStat, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT chain_eid, signer_id, status, count(*)::bigint,
+			COALESCE(floor(extract(epoch FROM now() - min(updated_at)))::bigint, 0)
+		FROM tx_outbox
+		WHERE status IN ($1, $2) AND active_attempt_id IS NULL
+			-- Disabled (retired) chains are excluded so the metric matches the
+			-- readiness escalation, which only considers enabled chains: their
+			-- retained rows cannot be acted on and would page forever.
+			AND EXISTS (SELECT 1 FROM chains c WHERE c.eid = tx_outbox.chain_eid AND c.enabled)
+		GROUP BY chain_eid, signer_id, status
+		ORDER BY chain_eid, signer_id, status
+	`, TxStatusSigned, TxStatusBroadcast)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var stats []TxOutboxOrphanedStat
+	for rows.Next() {
+		var stat TxOutboxOrphanedStat
+		var oldest int64
+		if err := rows.Scan(&stat.ChainEID, &stat.SignerID, &stat.Status, &stat.Count, &oldest); err != nil {
+			return nil, err
+		}
+		if oldest > 0 {
+			stat.OldestAgeSeconds = uint64(oldest)
+		}
+		stats = append(stats, stat)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
 func (s *Store) txOutboxStats(ctx context.Context) ([]TxOutboxStat, error) {
 	// Packet-linked rows follow the packet's scope; rows without a packet
 	// (pricing) follow their send chain.
@@ -357,6 +447,17 @@ func (s *Store) txOutboxStats(ctx context.Context) ([]TxOutboxStat, error) {
 				-- rejects both, so classifying them exhausted would hold /readyz
 				-- red and page LazTxOutboxFailed forever with nothing to act on.
 				WHEN tx.failure_kind IN ($6, $7) THEN $2
+				-- A failed pricing row is terminal by design (its calldata
+				-- carries a time-bound observation and is never re-signed);
+				-- the bot supersedes it with a fresh observation, and the
+				-- pricing snapshot-age alerts own the outcome. The exception
+				-- is a row still HOLDING an unconsumed nonce (legacy upgraded
+				-- data): RetryFailedTx keeps it retryable because the nonce
+				-- gap can wedge the signer lane, so it falls through to the
+				-- generic classification and pages instead of hiding. A legacy
+				-- receipt failure consumed its nonce when it mined, so it is
+				-- superseded like every other terminal pricing failure.
+				WHEN tx.purpose = $8 AND (tx.nonce IS NULL OR tx.receipt_outcome IS NOT NULL OR tx.failure_kind = $9) THEN $2
 				WHEN tx.failure_kind IS NOT NULL AND tx.attempts < $3 AND tx.next_retry_at IS NOT NULL THEN $4
 				ELSE $5
 			END AS retry_state,
@@ -369,7 +470,7 @@ func (s *Store) txOutboxStats(ctx context.Context) ([]TxOutboxStat, error) {
 		END
 		GROUP BY tx.chain_eid, tx.status, retry_state
 		ORDER BY tx.chain_eid, tx.status, retry_state
-	`, fmt.Sprintf(statsEnabledPacketScopeSQL, "p")), TxStatusFailed, TxOutboxRetryStateSuperseded, TxAutoRetryMaxAttempts, TxOutboxRetryStateRetrying, TxOutboxRetryStateExhausted, TxFailureCanceled, TxFailureNonceConsumedExternally)
+	`, fmt.Sprintf(statsEnabledPacketScopeSQL, "p")), TxStatusFailed, TxOutboxRetryStateSuperseded, TxAutoRetryMaxAttempts, TxOutboxRetryStateRetrying, TxOutboxRetryStateExhausted, TxFailureCanceled, TxFailureNonceConsumedExternally, TxPurposePricingSetPriceSnapshot, TxFailureReceiptFailed)
 	if err != nil {
 		return nil, err
 	}
@@ -402,6 +503,42 @@ func (s *Store) indexerCursorStats(ctx context.Context) ([]IndexerCursorStat, er
 		var stat IndexerCursorStat
 		if err := rows.Scan(&stat.ChainEID, &stat.Stream, &stat.LastBlock); err != nil {
 			return nil, err
+		}
+		stats = append(stats, stat)
+	}
+	return stats, rows.Err()
+}
+
+func (s *Store) pricingPendingStats(ctx context.Context) ([]PricingPendingStat, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT chain_eid, count(*)::bigint,
+			COALESCE(floor(extract(epoch FROM now() - min(created_at)))::bigint, 0)
+		FROM tx_outbox
+		WHERE purpose = $1
+			-- Retryable legacy failures (an unconsumed nonce gap) gate their
+			-- feed exactly like pending rows and need the same stall pressure:
+			-- only the operator's in-place requeue can recover them.
+			AND (status = ANY($2) OR `+txRetryableLegacyPricingSQL+`)
+			-- Disabled (retired) chains are excluded like every other outbox
+			-- statistic; their in-flight rows cannot be acted on and would page
+			-- the pending-stall alert forever.
+			AND EXISTS (SELECT 1 FROM chains c WHERE c.eid = tx_outbox.chain_eid AND c.enabled)
+		GROUP BY chain_eid
+		ORDER BY chain_eid
+	`, TxPurposePricingSetPriceSnapshot, txPricingPendingStatuses)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var stats []PricingPendingStat
+	for rows.Next() {
+		var stat PricingPendingStat
+		var oldest int64
+		if err := rows.Scan(&stat.ChainEID, &stat.Count, &oldest); err != nil {
+			return nil, err
+		}
+		if oldest > 0 {
+			stat.OldestAgeSeconds = uint64(oldest)
 		}
 		stats = append(stats, stat)
 	}

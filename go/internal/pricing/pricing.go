@@ -1,6 +1,7 @@
 package pricing
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"errors"
@@ -13,18 +14,25 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/islishude/oh-my-lazier/go/internal/abiutil"
 	"github.com/islishude/oh-my-lazier/go/internal/bigutil"
 	"github.com/islishude/oh-my-lazier/go/internal/chain"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 const (
 	// TxPurposeSetPriceSnapshot identifies OpenPriceFeed.setPriceSnapshot updates.
 	TxPurposeSetPriceSnapshot = "pricing_set_price_snapshot"
 )
+
+// errPendingRaceLost reports that another instance enqueued a snapshot for the
+// feed between this instance's pending pre-check and its own enqueue; callers
+// treat it as a skip but must not advance gas-spike baselines.
+var errPendingRaceLost = errors.New("pricing pending enqueue race lost")
 
 var (
 	//go:embed abis/price_snapshot.json
@@ -42,10 +50,85 @@ type Bot struct {
 	sources       map[uint32]ChainSources
 	snapshots     PriceSnapshotReader
 	lastGasPrices map[string]*big.Int
-	lastWritten   map[string]writtenPrice
-	loadedWritten map[string]bool
-	now           func() time.Time
-	logger        *slog.Logger
+	// cycleWritten caches the on-chain gate baseline for ONE evaluation cycle.
+	// The chain snapshot is the only durable write state: an enqueued update is
+	// tracked through its pending outbox row, never through an optimistic
+	// local cache, so crash restarts and superseded (skipped) entries cannot
+	// desynchronize the deviation/heartbeat gate from chain truth.
+	cycleWritten map[string]cycleWrittenState
+	// cycleAnchors memoizes each source chain's verified canonical height for
+	// ONE evaluation cycle, so per-key snapshot reads share a single verified
+	// anchor instead of re-establishing a head quorum per read.
+	cycleAnchors map[uint32]cycleAnchorState
+	// pendingFeeds remembers which feeds were gated by a pending row on the
+	// previous check, so the first gas-spike check after a feed drains forces a
+	// full evaluation: a restart seeds gas baselines while a pending row is in
+	// flight, and without the forced pass an elevated-but-flat gas price would
+	// silently wait for the next periodic cycle.
+	pendingFeeds map[string]struct{}
+	metrics      MetricsRecorder
+	now          func() time.Time
+	logger       *slog.Logger
+}
+
+type cycleWrittenState struct {
+	previous writtenPrice
+	exists   bool
+}
+
+type cycleAnchorState struct {
+	anchor *rpcquorum.StateAnchor
+	err    error
+}
+
+// anchoredSnapshotReader is the optional anchored read surface of a snapshot
+// reader; the on-chain reader implements it so cycle reads share one anchor.
+type anchoredSnapshotReader interface {
+	PriceSnapshotAt(ctx context.Context, srcEID uint32, priceFeed common.Address, dstEID uint32, anchor *rpcquorum.StateAnchor) (PriceSnapshot, error)
+}
+
+// snapshotAnchor resolves (once per cycle per source chain) the verified
+// canonical hash-pinned anchor used for that chain's snapshot reads.
+func (b *Bot) snapshotAnchor(ctx context.Context, srcEID uint32) (*rpcquorum.StateAnchor, error) {
+	if b.cycleAnchors == nil {
+		b.cycleAnchors = make(map[uint32]cycleAnchorState)
+	}
+	if state, ok := b.cycleAnchors[srcEID]; ok {
+		return state.anchor, state.err
+	}
+	srcChain, err := b.registry.Get(srcEID)
+	if err != nil {
+		b.cycleAnchors[srcEID] = cycleAnchorState{err: err}
+		return nil, err
+	}
+	if srcChain.RPC == nil {
+		b.cycleAnchors[srcEID] = cycleAnchorState{}
+		return nil, nil
+	}
+	head, err := srcChain.RPC.CheckHead(ctx)
+	if err != nil {
+		b.cycleAnchors[srcEID] = cycleAnchorState{err: err}
+		return nil, err
+	}
+	state := cycleAnchorState{}
+	if head.Number != nil {
+		anchor, err := rpcquorum.AnchorFromHead(head)
+		if err != nil {
+			b.cycleAnchors[srcEID] = cycleAnchorState{err: err}
+			return nil, err
+		}
+		state.anchor = anchor
+	}
+	b.cycleAnchors[srcEID] = state
+	return state.anchor, nil
+}
+
+// WithMetrics attaches a pricing metrics recorder.
+func (b *Bot) WithMetrics(recorder MetricsRecorder) *Bot {
+	if b != nil {
+		b.metrics = recorder
+	}
+	return b
 }
 
 // New creates a price bot.
@@ -79,8 +162,6 @@ func NewWithDependencies(store Store, registry *chain.Registry, settings Setting
 		sources:       copied,
 		snapshots:     snapshots,
 		lastGasPrices: make(map[string]*big.Int),
-		lastWritten:   make(map[string]writtenPrice),
-		loadedWritten: make(map[string]bool),
 		now:           time.Now,
 		logger:        logger,
 	}, nil
@@ -118,9 +199,19 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
-// Store persists price update transactions.
+// Store persists price update transactions and exposes their pending state.
 type Store interface {
-	EnqueueTx(ctx context.Context, request db.TxRequest) (int64, error)
+	// EnqueuePricingSnapshotTx inserts a snapshot tx unless another one for the
+	// same feed is still pending (db.ErrPricingPendingExists).
+	EnqueuePricingSnapshotTx(ctx context.Context, request db.TxRequest) (int64, error)
+	// ListPendingPricingTxs returns the chain's pricing rows that can still
+	// land on chain, across all signers.
+	ListPendingPricingTxs(ctx context.Context, chainEID uint32) ([]db.PendingPricingTx, error)
+}
+
+// MetricsRecorder receives pricing snapshot observability samples.
+type MetricsRecorder interface {
+	RecordPricingSnapshot(srcEID, dstEID uint32, priceFeed common.Address, updatedAt time.Time, staleAfter time.Duration)
 }
 
 // GasPriceReader reads a destination-chain gas price.
@@ -148,6 +239,13 @@ func NewOnChainPriceSnapshotReader(registry *chain.Registry) PriceSnapshotReader
 }
 
 func (r *onChainPriceSnapshotReader) PriceSnapshot(ctx context.Context, srcEID uint32, priceFeed common.Address, dstEID uint32) (PriceSnapshot, error) {
+	return r.PriceSnapshotAt(ctx, srcEID, priceFeed, dstEID, nil)
+}
+
+// PriceSnapshotAt reads the stored snapshot at an explicit verified anchor so
+// one cycle's reads share a single hash-pinned state view; nil falls back to
+// the quorum client's own canonical anchoring.
+func (r *onChainPriceSnapshotReader) PriceSnapshotAt(ctx context.Context, srcEID uint32, priceFeed common.Address, dstEID uint32, anchor *rpcquorum.StateAnchor) (PriceSnapshot, error) {
 	if r == nil || r.registry == nil {
 		return PriceSnapshot{}, errors.New("pricing snapshot registry is required")
 	}
@@ -158,19 +256,19 @@ func (r *onChainPriceSnapshotReader) PriceSnapshot(ctx context.Context, srcEID u
 	if srcChain.RPC == nil {
 		return PriceSnapshot{}, fmt.Errorf("pricing snapshot RPC for chain %d is not configured", srcEID)
 	}
-	snapshot, err := readPriceSnapshot(ctx, srcChain.RPC, priceFeed, dstEID)
+	snapshot, err := readPriceSnapshot(ctx, srcChain.RPC, priceFeed, dstEID, anchor)
 	if err != nil {
 		return PriceSnapshot{}, fmt.Errorf("read price snapshot for %d -> %d: %w", srcEID, dstEID, err)
 	}
 	return snapshot, nil
 }
 
-func readPriceSnapshot(ctx context.Context, caller CallContractReader, priceFeed common.Address, dstEID uint32) (PriceSnapshot, error) {
+func readPriceSnapshot(ctx context.Context, caller CallContractReader, priceFeed common.Address, dstEID uint32, anchor *rpcquorum.StateAnchor) (PriceSnapshot, error) {
 	calldata, err := priceSnapshotABI.Pack("priceSnapshot", dstEID)
 	if err != nil {
 		return PriceSnapshot{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &priceFeed, Data: calldata}, nil)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &priceFeed, Data: calldata}, anchor)
 	if err != nil {
 		return PriceSnapshot{}, err
 	}
@@ -249,6 +347,9 @@ func (s Settings) Validate() error {
 	if s.Interval >= s.StaleAfter-s.Heartbeat {
 		return errors.New("pricing heartbeat plus interval must be less than stale_after")
 	}
+	if s.StaleAfter-s.Heartbeat-s.Interval < time.Duration(config.MinPricingFreshnessMarginSeconds)*time.Second {
+		return fmt.Errorf("pricing stale_after must exceed heartbeat plus interval by at least %d seconds", config.MinPricingFreshnessMarginSeconds)
+	}
 	if s.SourceRequestTimeout <= 0 {
 		return errors.New("pricing source request timeout must be positive")
 	}
@@ -319,14 +420,60 @@ func (b *Bot) EnqueueOnce(ctx context.Context) error {
 		b.logger.Debug("skipped price update batch", "reason", "no_pathways")
 		return nil
 	}
-	cycle, err := b.preparePriceCycle(ctx, updates, nil)
+	// Pending rows are loaded before any market-data request so an in-flight
+	// batch never burns source quota, and the gate baseline is re-read from
+	// chain each cycle.
+	b.cycleWritten = make(map[string]cycleWrittenState)
+	b.cycleAnchors = make(map[uint32]cycleAnchorState)
+	pending, err := b.loadPendingUpdateKeys(ctx, updates)
 	if err != nil {
 		return err
 	}
+	// Every pathway's on-chain snapshot is read before any market-data request:
+	// it primes the cycle's gate baseline AND creates/refreshes the age metric
+	// series, so a persistent market-source outage cannot suppress the
+	// near-stale alert while an existing snapshot expires. Failures only log;
+	// the gate re-reads (and surfaces errors) for the pathways it evaluates.
+	b.primeSnapshotBaselines(ctx, updates)
+	b.pendingFeeds = pending
+	updates = b.filterPendingUpdates(updates, pending)
+	if len(updates) == 0 {
+		b.logger.Debug("skipped price update batch", "reason", "all_updates_pending")
+		return nil
+	}
+	// Each (srcEID, priceFeed) batch is evaluated independently: one chain's
+	// failing RPC or market source skips only the feeds that need it this
+	// cycle, and the memoizing cycle asks each chain exactly once so isolation
+	// cannot multiply market-source calls. The cycle only fails as a whole
+	// when every batch failed.
+	cycle := b.newPriceCycle(nil)
+	var batchErrs []error
+	succeeded := 0
 	for _, batch := range priceUpdateBatches(updates) {
-		if _, _, err := b.enqueuePriceUpdateBatch(ctx, batch, cycle); err != nil {
-			return err
+		_, _, err := b.enqueuePriceUpdateBatch(ctx, batch, cycle)
+		if errors.Is(err, errPendingRaceLost) {
+			// The winner's transaction may confirm before this instance next
+			// lists pending rows; remembering the feed here guarantees the
+			// post-drain forced evaluation still happens for destinations the
+			// winner's batch did not carry.
+			b.rememberPendingFeed(batch.SrcEID, batch.PriceFeed)
+			succeeded++
+			continue
 		}
+		if err != nil {
+			// Caller cancellation is never feed-local: an interrupted one-shot
+			// must not report success after skipping remaining feeds.
+			if ctx.Err() != nil {
+				return errors.Join(append(batchErrs, ctx.Err())...)
+			}
+			b.logger.Warn("price update batch failed; continuing with remaining feeds", "src_eid", batch.SrcEID, "price_feed", batch.PriceFeed, "error", err.Error())
+			batchErrs = append(batchErrs, fmt.Errorf("feed %d:%s: %w", batch.SrcEID, batch.PriceFeed, err))
+			continue
+		}
+		succeeded++
+	}
+	if len(batchErrs) > 0 && succeeded == 0 {
+		return errors.Join(batchErrs...)
 	}
 	return nil
 }
@@ -347,21 +494,48 @@ func (b *Bot) EnqueueOnGasSpike(ctx context.Context) error {
 		b.logger.Debug("skipped price gas-spike check", "reason", "no_pathways")
 		return nil
 	}
-	gasPrices, err := b.readDestinationGasPrices(ctx, updates)
+	gasPrices := b.readDestinationGasPrices(ctx, updates)
+	// The pending set is loaded before baseline seeding: keys gated by a
+	// pending row are neither seeded nor evaluated (no source quota), and a
+	// feed observed pending on the previous check that has now drained gets a
+	// FORCED evaluation — its baselines were seeded while the in-flight batch
+	// carried older prices, so a flat-but-elevated gas price would otherwise
+	// wait for the next periodic cycle while quotes underprice.
+	pending, err := b.loadPendingUpdateKeys(ctx, updates)
 	if err != nil {
 		return err
 	}
 	spikes := make([]pricedGasSpike, 0, len(updates))
+	previousPending := b.pendingFeeds
+	carriedMarkers := make(map[string]struct{})
 	for _, update := range updates {
 		key := priceUpdateKey(update)
+		feedKey := pendingFeedKey(update.SrcEID, update.PriceFeed)
 		current := gasPrices[update.DstEID]
+		if current == nil {
+			// The key was not evaluated at all: keep any pending-observed
+			// marker alive so the post-drain forced evaluation survives the
+			// failed gas read instead of being consumed unseen.
+			if _, ok := previousPending[feedKey]; ok {
+				carriedMarkers[feedKey] = struct{}{}
+			}
+			continue
+		}
+		if _, isPending := pending[feedKey]; isPending {
+			b.logger.Debug("skipped gas-spike update", "reason", "pending", "src_eid", update.SrcEID, "dst_eid", update.DstEID, "price_feed", update.PriceFeed)
+			continue
+		}
 		previous := b.lastGasPrices[key]
-		if previous == nil {
+		_, wasPending := b.pendingFeeds[feedKey]
+		if previous == nil && !wasPending {
 			b.lastGasPrices[key] = bigutil.Clone(current)
 			continue
 		}
-		if GasIncreaseBps(previous, current) < b.settings.GasSpikeBps {
+		if !wasPending && GasIncreaseBps(previous, current) < b.settings.GasSpikeBps {
 			continue
+		}
+		if previous == nil {
+			previous = current
 		}
 		spikes = append(spikes, pricedGasSpike{
 			update:   update,
@@ -369,15 +543,41 @@ func (b *Bot) EnqueueOnGasSpike(ctx context.Context) error {
 			current:  bigutil.Clone(current),
 		})
 	}
-	selectedUpdates := spikeUpdates(spikes)
-	cycle, err := b.preparePriceCycle(ctx, selectedUpdates, gasPrices)
-	if err != nil {
-		return err
+	b.pendingFeeds = pending
+	if len(carriedMarkers) > 0 && b.pendingFeeds == nil {
+		b.pendingFeeds = make(map[string]struct{})
 	}
+	for feedKey := range carriedMarkers {
+		b.pendingFeeds[feedKey] = struct{}{}
+	}
+	if len(spikes) > 0 {
+		b.cycleWritten = make(map[string]cycleWrittenState)
+		b.cycleAnchors = make(map[uint32]cycleAnchorState)
+	}
+	selectedUpdates := spikeUpdates(spikes)
+	cycle := b.newPriceCycle(gasPrices)
+	raceLostFeeds := make(map[string]struct{})
+	failedFeeds := make(map[string]struct{})
+	var batchErrs []error
 	for _, batch := range priceUpdateBatches(selectedUpdates) {
 		txOutboxID, enqueued, err := b.enqueuePriceUpdateBatch(ctx, batch, cycle)
+		if errors.Is(err, errPendingRaceLost) {
+			raceLostFeeds[pendingFeedKey(batch.SrcEID, batch.PriceFeed)] = struct{}{}
+			// See EnqueueOnce: the race-lost feed counts as pending so the
+			// post-drain forced evaluation cannot be skipped.
+			b.rememberPendingFeed(batch.SrcEID, batch.PriceFeed)
+			continue
+		}
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return errors.Join(append(batchErrs, ctx.Err())...)
+			}
+			// A failed feed keeps its spike baselines so the spike re-fires
+			// on the next check instead of waiting for a further rise.
+			b.logger.Warn("gas-spike batch failed; continuing with remaining feeds", "src_eid", batch.SrcEID, "price_feed", batch.PriceFeed, "error", err.Error())
+			failedFeeds[pendingFeedKey(batch.SrcEID, batch.PriceFeed)] = struct{}{}
+			batchErrs = append(batchErrs, fmt.Errorf("feed %d:%s: %w", batch.SrcEID, batch.PriceFeed, err))
+			continue
 		}
 		if txOutboxID == 0 {
 			// Nothing was enqueued: the chain is paused/disabled, or every
@@ -393,6 +593,27 @@ func (b *Bot) EnqueueOnGasSpike(ctx context.Context) error {
 				break
 			}
 		}
+	}
+	// The baseline records the gas level this spike check has already reacted to. It
+	// must advance even when nothing was enqueued (paused chain or deviation-gated
+	// batch), otherwise the same spike re-triggers a full market-data cycle every
+	// check interval until gating clears; only a further rise past the threshold
+	// deserves another early evaluation, and the heartbeat still bounds staleness.
+	// Losing the enqueue race is the exception: the winner's batch may not carry
+	// these destinations, so their baselines stay put and the spike re-evaluates
+	// once the pending row resolves.
+	for _, selected := range spikes {
+		feedKey := pendingFeedKey(selected.update.SrcEID, selected.update.PriceFeed)
+		if _, ok := raceLostFeeds[feedKey]; ok {
+			continue
+		}
+		if _, ok := failedFeeds[feedKey]; ok {
+			continue
+		}
+		b.lastGasPrices[priceUpdateKey(selected.update)] = bigutil.Clone(selected.current)
+	}
+	if len(batchErrs) > 0 && len(batchErrs) == len(priceUpdateBatches(selectedUpdates)) {
+		return errors.Join(batchErrs...)
 	}
 	return nil
 }
@@ -415,9 +636,58 @@ type pricedUpdateBatch struct {
 	Targets   []pricedUpdate
 }
 
-type priceCycleInputs struct {
-	nativeUSD map[uint32]*big.Rat
-	gasWei    map[uint32]*big.Int
+// priceCycle lazily resolves and memoizes per-chain market and gas inputs for
+// one evaluation cycle. Failures are memoized too, so per-feed isolation never
+// multiplies market-source calls: a failing chain is asked exactly once per
+// cycle no matter how many feed batches reference it.
+type priceCycle struct {
+	bot       *Bot
+	nativeUSD map[uint32]nativeUSDResult
+	gasWei    map[uint32]gasPriceResult
+}
+
+type nativeUSDResult struct {
+	price *big.Rat
+	err   error
+}
+
+type gasPriceResult struct {
+	price *big.Int
+	err   error
+}
+
+func (b *Bot) newPriceCycle(knownGas map[uint32]*big.Int) *priceCycle {
+	cycle := &priceCycle{bot: b, nativeUSD: make(map[uint32]nativeUSDResult), gasWei: make(map[uint32]gasPriceResult)}
+	for eid, gas := range knownGas {
+		if gas != nil {
+			cycle.gasWei[eid] = gasPriceResult{price: bigutil.Clone(gas)}
+		}
+	}
+	return cycle
+}
+
+func (c *priceCycle) nativePrice(ctx context.Context, eid uint32) (*big.Rat, error) {
+	if result, ok := c.nativeUSD[eid]; ok {
+		return result.price, result.err
+	}
+	policy := PriceSelectionPolicy{
+		MaxDeviationBps:      c.bot.settings.MaxDeviation,
+		SourceRequestTimeout: c.bot.settings.SourceRequestTimeout,
+		Now:                  c.bot.now,
+		OnSourceFailure:      c.bot.logSourceFailure,
+	}
+	price, err := ChainNativePrice(ctx, c.bot.sources, eid, policy)
+	c.nativeUSD[eid] = nativeUSDResult{price: price, err: err}
+	return price, err
+}
+
+func (c *priceCycle) gasPrice(ctx context.Context, eid uint32) (*big.Int, error) {
+	if result, ok := c.gasWei[eid]; ok {
+		return result.price, result.err
+	}
+	price, err := c.bot.currentDstGasPrice(ctx, eid)
+	c.gasWei[eid] = gasPriceResult{price: price, err: err}
+	return price, err
 }
 
 type writtenPrice struct {
@@ -425,7 +695,7 @@ type writtenPrice struct {
 	writtenAt time.Time
 }
 
-func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBatch, cycle priceCycleInputs) (int64, []pricedUpdate, error) {
+func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBatch, cycle *priceCycle) (int64, []pricedUpdate, error) {
 	srcChain, err := b.registry.Get(batch.SrcEID)
 	if err != nil {
 		return 0, nil, err
@@ -440,13 +710,13 @@ func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBat
 		if err != nil {
 			return 0, nil, err
 		}
-		srcPrice, dstPrice, err := b.cyclePathwayPrices(cycle, target.SrcEID, target.DstEID)
+		srcPrice, dstPrice, err := b.cyclePathwayPrices(ctx, cycle, target.SrcEID, target.DstEID)
 		if err != nil {
 			return 0, nil, err
 		}
-		dstGasPrice := cycle.gasWei[target.DstEID]
-		if dstGasPrice == nil || dstGasPrice.Sign() <= 0 {
-			return 0, nil, fmt.Errorf("pricing gas source for chain %d is missing from prepared cycle", target.DstEID)
+		dstGasPrice, err := cycle.gasPrice(ctx, target.DstEID)
+		if err != nil {
+			return 0, nil, err
 		}
 		dstDataFeePerByte, err := b.currentDstDataFeePerByte(target.DstEID)
 		if err != nil {
@@ -485,12 +755,22 @@ func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBat
 	if err != nil {
 		return 0, nil, err
 	}
-	id, err := b.store.EnqueueTx(ctx, tx)
+	id, err := b.store.EnqueuePricingSnapshotTx(ctx, tx)
 	if errors.Is(err, db.ErrTxSendScopeInactive) {
 		// The chain was paused/disabled; skip this cycle's update for it instead
 		// of queueing snapshots that would all go stale behind the pause.
 		b.logger.Debug("skipped price update tx enqueue", "reason", "send_scope_inactive", "src_eid", srcChain.EID, "price_feed", batch.PriceFeed)
 		return 0, nil, nil
+	}
+	if errors.Is(err, db.ErrPricingPendingExists) {
+		// Another bot instance won the enqueue race for this feed; its pending
+		// row now gates the feed until it resolves. The race outcome is
+		// reported distinctly so the gas-spike path keeps its baselines: the
+		// winner's batch may not carry this instance's destinations, and an
+		// advanced baseline would silently drop the spike re-evaluation once
+		// the pending row resolves.
+		b.logger.Debug("skipped price update tx enqueue", "reason", "pending_exists", "src_eid", srcChain.EID, "price_feed", batch.PriceFeed)
+		return 0, nil, errPendingRaceLost
 	}
 	if err != nil {
 		return 0, nil, err
@@ -498,11 +778,17 @@ func (b *Bot) enqueuePriceUpdateBatch(ctx context.Context, batch pricedUpdateBat
 	if b.lastGasPrices == nil {
 		b.lastGasPrices = make(map[string]*big.Int)
 	}
+	// Only the gas-spike baseline advances here. The written-price gate baseline
+	// is never updated optimistically: the enqueued update is tracked through
+	// its pending outbox row and the chain snapshot stays the only authority.
 	for key, gas := range gasByKey {
 		b.lastGasPrices[key] = bigutil.Clone(gas)
-		snapshot := snapshotsByKey[key]
-		b.lastWritten[key] = writtenPrice{price: bigutil.Clone(snapshot.DstGasPriceInSrcToken), writtenAt: time.Unix(int64(snapshot.UpdatedAt), 0)}
 	}
+	// The enqueued row can terminalize (fast estimate revert, confirmed with a
+	// superseded entry) before the next pending poll ever observes it; marking
+	// the feed pending-observed guarantees the post-drain forced evaluation
+	// even for that fast path, since the baseline above has already advanced.
+	b.rememberPendingFeed(srcChain.EID, batch.PriceFeed)
 	b.logger.Info("price update tx enqueued", "tx_outbox_id", id, "purpose", TxPurposeSetPriceSnapshot, "src_eid", srcChain.EID, "dst_count", len(dstEIDs), "dst_eids", dstEIDs, "price_feed", batch.PriceFeed)
 	return id, enqueuedTargets, nil
 }
@@ -527,18 +813,53 @@ func (b *Bot) shouldWriteSnapshot(ctx context.Context, update pricedUpdate, snap
 	return false, deviation, elapsed, nil
 }
 
+// loadWrittenPrice reads the gate baseline from the on-chain snapshot, cached
+// only for the current evaluation cycle. Reading fresh each cycle keeps the
+// gate aligned with chain truth across restarts, other authorized submitters,
+// and confirmed batches whose entries were superseded (skipped) on chain.
 func (b *Bot) loadWrittenPrice(ctx context.Context, update pricedUpdate) (writtenPrice, bool, error) {
 	key := priceUpdateKey(update)
-	if b.loadedWritten[key] {
-		previous, ok := b.lastWritten[key]
-		return previous, ok, nil
+	if b.cycleWritten == nil {
+		b.cycleWritten = make(map[string]cycleWrittenState)
 	}
-	snapshot, err := b.snapshots.PriceSnapshot(ctx, update.SrcEID, update.PriceFeed, update.DstEID)
+	if state, ok := b.cycleWritten[key]; ok {
+		return state.previous, state.exists, nil
+	}
+	var snapshot PriceSnapshot
+	var err error
+	if anchored, ok := b.snapshots.(anchoredSnapshotReader); ok {
+		// The anchor gets its own SourceRequestTimeout budget, separate from
+		// the snapshot read's: the head quorum's per-provider deadline can
+		// exceed the configured request bound when a minority provider
+		// black-holes, and one slow anchor must neither consume the read's
+		// budget nor stretch past the configured bound.
+		anchorCtx, cancelAnchor := context.WithTimeout(ctx, b.settings.SourceRequestTimeout)
+		anchor, anchorErr := b.snapshotAnchor(anchorCtx, update.SrcEID)
+		cancelAnchor()
+		if anchorErr != nil {
+			return writtenPrice{}, false, anchorErr
+		}
+		readCtx, cancel := context.WithTimeout(ctx, b.settings.SourceRequestTimeout)
+		defer cancel()
+		snapshot, err = anchored.PriceSnapshotAt(readCtx, update.SrcEID, update.PriceFeed, update.DstEID, anchor)
+	} else {
+		readCtx, cancel := context.WithTimeout(ctx, b.settings.SourceRequestTimeout)
+		defer cancel()
+		snapshot, err = b.snapshots.PriceSnapshot(readCtx, update.SrcEID, update.PriceFeed, update.DstEID)
+	}
 	if err != nil {
 		return writtenPrice{}, false, err
 	}
 	if snapshot.UpdatedAt == 0 && snapshot.DstGasPriceInSrcToken != nil && snapshot.DstGasPriceInSrcToken.Sign() == 0 {
-		b.loadedWritten[key] = true
+		b.cycleWritten[key] = cycleWrittenState{}
+		// The all-zero sentinel is honest metric input: on-chain updatedAt is
+		// literally zero, so the derived age/time-to-stale mark the pathway as
+		// long expired and the near-stale alert fires — WorkerFeeLib already
+		// rejects every quote for it, and a failing market cycle must not
+		// leave the outage without a series.
+		if b.metrics != nil {
+			b.metrics.RecordPricingSnapshot(update.SrcEID, update.DstEID, update.PriceFeed, time.Unix(0, 0), 0)
+		}
 		return writtenPrice{}, false, nil
 	}
 	if err := snapshot.Validate(); err != nil {
@@ -548,55 +869,11 @@ func (b *Bot) loadWrittenPrice(ctx context.Context, update pricedUpdate) (writte
 		price:     bigutil.Clone(snapshot.DstGasPriceInSrcToken),
 		writtenAt: time.Unix(int64(snapshot.UpdatedAt), 0),
 	}
-	b.loadedWritten[key] = true
-	b.lastWritten[key] = previous
+	b.cycleWritten[key] = cycleWrittenState{previous: previous, exists: true}
+	if b.metrics != nil {
+		b.metrics.RecordPricingSnapshot(update.SrcEID, update.DstEID, update.PriceFeed, previous.writtenAt, time.Duration(snapshot.StaleAfter)*time.Second)
+	}
 	return previous, true, nil
-}
-
-func (b *Bot) preparePriceCycle(ctx context.Context, updates []pricedUpdate, knownGas map[uint32]*big.Int) (priceCycleInputs, error) {
-	cycle := priceCycleInputs{nativeUSD: make(map[uint32]*big.Rat), gasWei: make(map[uint32]*big.Int)}
-	if len(updates) == 0 {
-		return cycle, nil
-	}
-	priceEIDs := make(map[uint32]struct{})
-	gasEIDs := make(map[uint32]struct{})
-	for _, update := range updates {
-		src, srcOK := b.sources[update.SrcEID]
-		dst, dstOK := b.sources[update.DstEID]
-		if !srcOK || !dstOK {
-			return priceCycleInputs{}, fmt.Errorf("pricing sources for pathway %d -> %d are not configured", update.SrcEID, update.DstEID)
-		}
-		if src.NativeAssetID == "" || src.NativeAssetID != dst.NativeAssetID {
-			priceEIDs[update.SrcEID] = struct{}{}
-			priceEIDs[update.DstEID] = struct{}{}
-		}
-		gasEIDs[update.DstEID] = struct{}{}
-	}
-	policy := PriceSelectionPolicy{
-		MaxDeviationBps:      b.settings.MaxDeviation,
-		SourceRequestTimeout: b.settings.SourceRequestTimeout,
-		Now:                  b.now,
-		OnSourceFailure:      b.logSourceFailure,
-	}
-	for eid := range priceEIDs {
-		price, err := ChainNativePrice(ctx, b.sources, eid, policy)
-		if err != nil {
-			return priceCycleInputs{}, err
-		}
-		cycle.nativeUSD[eid] = price
-	}
-	for eid := range gasEIDs {
-		if gas := knownGas[eid]; gas != nil {
-			cycle.gasWei[eid] = bigutil.Clone(gas)
-			continue
-		}
-		gas, err := b.currentDstGasPrice(ctx, eid)
-		if err != nil {
-			return priceCycleInputs{}, err
-		}
-		cycle.gasWei[eid] = gas
-	}
-	return cycle, nil
 }
 
 func (b *Bot) logSourceFailure(failure PriceSourceFailure) {
@@ -615,7 +892,7 @@ func (b *Bot) logSourceFailure(failure PriceSourceFailure) {
 	b.logger.Warn("price source rejected", attributes...)
 }
 
-func (b *Bot) cyclePathwayPrices(cycle priceCycleInputs, srcEID, dstEID uint32) (*big.Rat, *big.Rat, error) {
+func (b *Bot) cyclePathwayPrices(ctx context.Context, cycle *priceCycle, srcEID, dstEID uint32) (*big.Rat, *big.Rat, error) {
 	src, srcOK := b.sources[srcEID]
 	dst, dstOK := b.sources[dstEID]
 	if !srcOK || !dstOK {
@@ -624,26 +901,39 @@ func (b *Bot) cyclePathwayPrices(cycle priceCycleInputs, srcEID, dstEID uint32) 
 	if src.NativeAssetID != "" && src.NativeAssetID == dst.NativeAssetID {
 		return big.NewRat(1, 1), big.NewRat(1, 1), nil
 	}
-	srcPrice, dstPrice := cycle.nativeUSD[srcEID], cycle.nativeUSD[dstEID]
-	if srcPrice == nil || dstPrice == nil {
-		return nil, nil, fmt.Errorf("pricing market inputs for pathway %d -> %d are missing from prepared cycle", srcEID, dstEID)
+	srcPrice, err := cycle.nativePrice(ctx, srcEID)
+	if err != nil {
+		return nil, nil, err
+	}
+	dstPrice, err := cycle.nativePrice(ctx, dstEID)
+	if err != nil {
+		return nil, nil, err
 	}
 	return bigutil.CloneRat(srcPrice), bigutil.CloneRat(dstPrice), nil
 }
 
-func (b *Bot) readDestinationGasPrices(ctx context.Context, updates []pricedUpdate) (map[uint32]*big.Int, error) {
+// readDestinationGasPrices reads each destination chain's gas price once,
+// skipping chains whose read fails (with a warning): a single failing chain
+// must not stop the spike check for every other chain.
+func (b *Bot) readDestinationGasPrices(ctx context.Context, updates []pricedUpdate) map[uint32]*big.Int {
 	prices := make(map[uint32]*big.Int)
+	failed := make(map[uint32]struct{})
 	for _, update := range updates {
 		if prices[update.DstEID] != nil {
 			continue
 		}
+		if _, ok := failed[update.DstEID]; ok {
+			continue
+		}
 		price, err := b.currentDstGasPrice(ctx, update.DstEID)
 		if err != nil {
-			return nil, err
+			b.logger.Warn("failed destination gas read; skipping its pathways this check", "dst_eid", update.DstEID, "error", err.Error())
+			failed[update.DstEID] = struct{}{}
+			continue
 		}
 		prices[update.DstEID] = price
 	}
-	return prices, nil
+	return prices
 }
 
 func (b *Bot) currentDstGasPrice(ctx context.Context, dstEID uint32) (*big.Int, error) {
@@ -651,7 +941,11 @@ func (b *Bot) currentDstGasPrice(ctx context.Context, dstEID uint32) (*big.Int, 
 	if !ok || dstSources.Gas == nil {
 		return nil, fmt.Errorf("pricing gas source for chain %d is not configured", dstEID)
 	}
-	dstGasPrice, err := dstSources.Gas.SuggestGasPrice(ctx)
+	// Every chain read carries its own deadline: a black-holed provider must
+	// delay one read, not freeze the whole pricing loop.
+	readCtx, cancel := context.WithTimeout(ctx, b.settings.SourceRequestTimeout)
+	defer cancel()
+	dstGasPrice, err := dstSources.Gas.SuggestGasPrice(readCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -708,6 +1002,120 @@ func (b *Bot) uniquePriceUpdates() ([]pricedUpdate, error) {
 	updates := make([]pricedUpdate, 0, len(keys))
 	for _, key := range keys {
 		updates = append(updates, seen[key])
+	}
+	return updates, nil
+}
+
+// loadPendingUpdateKeys returns the (src, feed) scopes covered by pricing
+// outbox rows that can still land on chain. Gating is per feed, matching the
+// enqueue gate exactly: one snapshot transaction per feed is in flight at a
+// time, so every destination sharing a pending feed is gated even when the
+// pending batch does not carry it. Each row's calldata is still decoded
+// strictly — a malformed pending row fails the cycle instead of being
+// silently ignored: it would otherwise gate nothing while still spending on
+// chain.
+func (b *Bot) loadPendingUpdateKeys(ctx context.Context, updates []pricedUpdate) (map[string]struct{}, error) {
+	srcEIDs := make(map[uint32]struct{}, 2)
+	for _, update := range updates {
+		srcEIDs[update.SrcEID] = struct{}{}
+	}
+	pending := make(map[string]struct{})
+	for srcEID := range srcEIDs {
+		rows, err := b.store.ListPendingPricingTxs(ctx, srcEID)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if _, err := decodeSetPriceSnapshotCalldata(row.Calldata); err != nil {
+				return nil, fmt.Errorf("pending pricing tx %d on chain %d is undecodable: %w", row.ID, srcEID, err)
+			}
+			pending[pendingFeedKey(srcEID, row.To)] = struct{}{}
+		}
+	}
+	return pending, nil
+}
+
+func pendingFeedKey(srcEID uint32, priceFeed common.Address) string {
+	return fmt.Sprintf("%d:%s", srcEID, priceFeed)
+}
+
+// rememberPendingFeed marks a feed as pending-observed for the next gas-spike
+// check, used when this instance loses the enqueue race and may never see the
+// winner's row in a pending listing.
+func (b *Bot) rememberPendingFeed(srcEID uint32, priceFeed common.Address) {
+	if b.pendingFeeds == nil {
+		b.pendingFeeds = make(map[string]struct{})
+	}
+	b.pendingFeeds[pendingFeedKey(srcEID, priceFeed)] = struct{}{}
+}
+
+func (b *Bot) filterPendingUpdates(updates []pricedUpdate, pending map[string]struct{}) []pricedUpdate {
+	if len(pending) == 0 {
+		return updates
+	}
+	filtered := make([]pricedUpdate, 0, len(updates))
+	for _, update := range updates {
+		if _, ok := pending[pendingFeedKey(update.SrcEID, update.PriceFeed)]; ok {
+			b.logger.Debug("skipped price snapshot update", "reason", "pending", "src_eid", update.SrcEID, "dst_eid", update.DstEID, "price_feed", update.PriceFeed)
+			continue
+		}
+		filtered = append(filtered, update)
+	}
+	return filtered
+}
+
+// primeSnapshotBaselines best-effort reads every pathway's on-chain snapshot
+// into the cycle cache, creating/refreshing the age metric series before any
+// market-data request and regardless of pending gating.
+func (b *Bot) primeSnapshotBaselines(ctx context.Context, updates []pricedUpdate) {
+	for _, update := range updates {
+		if _, _, err := b.loadWrittenPrice(ctx, update); err != nil {
+			b.logger.Debug("failed snapshot baseline read", "src_eid", update.SrcEID, "dst_eid", update.DstEID, "price_feed", update.PriceFeed, "error", err.Error())
+		}
+	}
+}
+
+// decodeSetPriceSnapshotCalldata strictly decodes a pending row's calldata:
+// exact selector, canonical re-encoding (no trailing bytes), a non-empty batch,
+// valid snapshots, and no duplicate destination EIDs.
+func decodeSetPriceSnapshotCalldata(calldata []byte) ([]PriceSnapshotUpdate, error) {
+	method, ok := priceSnapshotABI.Methods["setPriceSnapshot"]
+	if !ok {
+		return nil, errors.New("setPriceSnapshot method missing from pricing ABI")
+	}
+	if len(calldata) < 4 || !bytes.Equal(calldata[:4], method.ID) {
+		return nil, errors.New("calldata does not start with the setPriceSnapshot selector")
+	}
+	values, err := method.Inputs.Unpack(calldata[4:])
+	if err != nil {
+		return nil, err
+	}
+	if len(values) != 1 {
+		return nil, fmt.Errorf("setPriceSnapshot decoded %d arguments, want 1", len(values))
+	}
+	updates := *abi.ConvertType(values[0], new([]PriceSnapshotUpdate)).(*[]PriceSnapshotUpdate)
+	if len(updates) == 0 {
+		return nil, errors.New("setPriceSnapshot batch is empty")
+	}
+	reencoded, err := priceSnapshotABI.Pack("setPriceSnapshot", updates)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(reencoded, calldata) {
+		return nil, errors.New("calldata is not the canonical setPriceSnapshot encoding")
+	}
+	seen := make(map[uint32]struct{}, len(updates))
+	for _, update := range updates {
+		if update.DstEid == 0 {
+			return nil, errors.New("setPriceSnapshot entry has a zero destination eid")
+		}
+		if _, dup := seen[update.DstEid]; dup {
+			return nil, fmt.Errorf("setPriceSnapshot entry duplicates destination eid %d", update.DstEid)
+		}
+		seen[update.DstEid] = struct{}{}
+		if err := update.Snapshot.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	return updates, nil
 }

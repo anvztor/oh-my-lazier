@@ -154,7 +154,7 @@ func TestProcessConfirmationsOnceActivePausesPathwayOnInsufficientAssignedConfir
 		store,
 		testRegistry(t, packet, config.DVNModeActive),
 		nil,
-		nil,
+		map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
 		nil,
 		map[uint32]ContractCaller{
 			packet.DstEID: fakeDVNReconcileCaller{ulnConfig: ulnConfig},
@@ -346,7 +346,7 @@ func TestProcessReadyToVerifyOnceActiveSkipsInactiveSendScope(t *testing.T) {
 				SignerID: "0x8888888888888888888888888888888888888888",
 			},
 		},
-		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}, packet.DstEID: fakeHead{head: 1_000_000}},
 		nil,
 		map[uint32]ContractCaller{packet.DstEID: fakeDVNReconcileCaller{}},
 		logger,
@@ -394,7 +394,7 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTxWithAsymmetricConfirmatio
 				SignerID: "0x8888888888888888888888888888888888888888",
 			},
 		},
-		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}},
+		map[uint32]HeadReader{packet.SrcEID: fakeHead{head: packet.SrcBlockNumber + 12}, packet.DstEID: fakeHead{head: 1_000_000}},
 		nil,
 		map[uint32]ContractCaller{
 			packet.DstEID: fakeDVNReconcileCaller{ulnConfig: receiveUlnConfig{
@@ -462,10 +462,15 @@ func TestProcessReadyToVerifyOnceActiveEnqueuesVerifyTxWithAsymmetricConfirmatio
 	)
 }
 
-// fakeDVNDriftAtConfirmedCaller reports the configured receive library at latest
-// but a different (older) library at any historical block, simulating a recent
-// config change that has not yet reached confirmation depth.
+// fakeDVNDriftAtConfirmedCaller reports the configured receive library at the
+// latest (anchor) head but a different (older) library at any block below it,
+// simulating a recent config change that has not yet reached confirmation depth.
 type fakeDVNDriftAtConfirmedCaller struct{}
+
+func (c fakeDVNDriftAtConfirmedCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	// A hash-pinned read is a tip pin: serve the current (configured) state.
+	return c.CallContract(ctx, call, big.NewInt(1_000_000))
+}
 
 func (fakeDVNDriftAtConfirmedCaller) CallContract(_ context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error) {
 	method, err := dvnMethodBySelector(call.Data)
@@ -477,7 +482,7 @@ func (fakeDVNDriftAtConfirmedCaller) CallContract(_ context.Context, call ethere
 		return method.Outputs.Pack(common.Hash{})
 	case "getReceiveLibrary":
 		lib := common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-		if blockNumber != nil {
+		if blockNumber != nil && blockNumber.Cmp(big.NewInt(1_000_000)) < 0 {
 			lib = common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 		}
 		return method.Outputs.Pack(lib, false)
@@ -554,7 +559,7 @@ func TestProcessReadyToVerifyOnceActivePausesPathwayOnReceiveLibraryDrift(t *tes
 				SignerID: "0x8888888888888888888888888888888888888888",
 			},
 		},
-		nil,
+		map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
 		nil,
 		map[uint32]ContractCaller{
 			packet.DstEID: fakeDVNReconcileCaller{receiveLib: common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")},
@@ -607,7 +612,7 @@ func TestProcessReadyToVerifyOnceActivePausesPathwayOnInsufficientAssignedConfir
 				SignerID: "0x8888888888888888888888888888888888888888",
 			},
 		},
-		nil,
+		map[uint32]HeadReader{packet.DstEID: fakeHead{head: 1_000_000}},
 		nil,
 		map[uint32]ContractCaller{
 			packet.DstEID: fakeDVNReconcileCaller{ulnConfig: ulnConfig},
@@ -1200,6 +1205,14 @@ func testRegistry(t *testing.T, packet db.PacketRecord, mode config.DVNMode) *ch
 				DestinationWorkers: config.DestinationWorkerContractsConfig{
 					OpenDVN: config.MustEVMAddress("0x6666666666666666666666666666666666666666"),
 				},
+				SendRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x3333333333333333333333333333333333333333"),
+					config.MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				},
+				ReceiveRequiredDVNs: []config.EVMAddress{
+					config.MustEVMAddress("0x6666666666666666666666666666666666666666"),
+					config.MustEVMAddress("0xdddddddddddddddddddddddddddddddddddddddd"),
+				},
 				DVN:            config.PathwayDVNConfig{Mode: mode},
 				Enabled:        true,
 				MaxMessageSize: 10000,
@@ -1281,6 +1294,10 @@ func (r fakeReceiptErrorReader) TransactionReceipt(context.Context, common.Hash)
 
 type failingDVNCaller struct{}
 
+func (failingDVNCaller) CallContractAtHash(context.Context, ethereum.CallMsg, common.Hash) ([]byte, error) {
+	return nil, fmt.Errorf("unexpected eth_call at hash")
+}
+
 func (failingDVNCaller) CallContract(context.Context, ethereum.CallMsg, *big.Int) ([]byte, error) {
 	return nil, fmt.Errorf("eth_call unavailable")
 }
@@ -1291,6 +1308,10 @@ type fakeDVNReconcileCaller struct {
 	ulnConfig               receiveUlnConfig
 	hashLookupSubmitted     bool
 	hashLookupConfirmations uint64
+}
+
+func (c fakeDVNReconcileCaller) CallContractAtHash(ctx context.Context, call ethereum.CallMsg, _ common.Hash) ([]byte, error) {
+	return c.CallContract(ctx, call, nil)
 }
 
 func (c fakeDVNReconcileCaller) CallContract(_ context.Context, call ethereum.CallMsg, _ *big.Int) ([]byte, error) {

@@ -14,6 +14,7 @@ import (
 	gethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/islishude/oh-my-lazier/go/internal/abiutil"
 	"github.com/islishude/oh-my-lazier/go/internal/config"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 var (
@@ -31,9 +32,10 @@ const (
 	maxUniswapV3Tick = 887272
 )
 
-// CallContractReader reads EVM call results.
+// CallContractReader reads EVM call results, by number or pinned block hash.
 type CallContractReader interface {
 	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
+	CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error)
 }
 
 // HeaderReader reads EVM block headers.
@@ -98,18 +100,23 @@ func (c *UniswapV3Client) PriceUSD(ctx context.Context) (SourcePrice, error) {
 	if header == nil || header.Time == 0 {
 		return SourcePrice{}, errors.New("uniswap returned invalid latest block header")
 	}
-	if err := c.validatePoolTokens(ctx); err != nil {
+	// Every read in this observation anchors to the canonical header fetched
+	// above — pinned by the header's own hash, so one PriceUSD stays a single
+	// consistent state view even across a tip reorg, and the quorum client
+	// does not re-establish a head anchor per call.
+	anchor := &rpcquorum.StateAnchor{Number: header.Number, Hash: header.Hash()}
+	if err := c.validatePoolTokensAt(ctx, anchor); err != nil {
 		return SourcePrice{}, err
 	}
-	inDecimals, err := c.readDecimals(ctx, c.tokenIn)
+	inDecimals, err := c.readDecimalsAt(ctx, c.tokenIn, anchor)
 	if err != nil {
 		return SourcePrice{}, err
 	}
-	outDecimals, err := c.readDecimals(ctx, c.tokenOut)
+	outDecimals, err := c.readDecimalsAt(ctx, c.tokenOut, anchor)
 	if err != nil {
 		return SourcePrice{}, err
 	}
-	meanTick, harmonicLiquidity, err := c.observe(ctx)
+	meanTick, harmonicLiquidity, err := c.observeAt(ctx, anchor)
 	if err != nil {
 		return SourcePrice{}, err
 	}
@@ -143,11 +150,15 @@ func (c *UniswapV3Client) validateSourceConfiguration(ctx context.Context) error
 }
 
 func (c *UniswapV3Client) validatePoolTokens(ctx context.Context) error {
-	token0, err := c.readAddress(ctx, c.pool, uniswapV3PoolABI, "token0")
+	return c.validatePoolTokensAt(ctx, nil)
+}
+
+func (c *UniswapV3Client) validatePoolTokensAt(ctx context.Context, anchor *rpcquorum.StateAnchor) error {
+	token0, err := c.readAddress(ctx, c.pool, uniswapV3PoolABI, "token0", anchor)
 	if err != nil {
 		return classifySourceIdentityCallError("uniswap token0 response is incompatible with the pool ABI", err)
 	}
-	token1, err := c.readAddress(ctx, c.pool, uniswapV3PoolABI, "token1")
+	token1, err := c.readAddress(ctx, c.pool, uniswapV3PoolABI, "token1", anchor)
 	if err != nil {
 		return classifySourceIdentityCallError("uniswap token1 response is incompatible with the pool ABI", err)
 	}
@@ -160,11 +171,15 @@ func (c *UniswapV3Client) validatePoolTokens(ctx context.Context) error {
 }
 
 func (c *UniswapV3Client) observe(ctx context.Context) (int, *big.Int, error) {
+	return c.observeAt(ctx, nil)
+}
+
+func (c *UniswapV3Client) observeAt(ctx context.Context, anchor *rpcquorum.StateAnchor) (int, *big.Int, error) {
 	calldata, err := uniswapV3PoolABI.Pack("observe", []uint32{c.window, 0})
 	if err != nil {
 		return 0, nil, err
 	}
-	result, err := c.caller.CallContract(ctx, ethereum.CallMsg{To: &c.pool, Data: calldata}, nil)
+	result, err := rpcquorum.CallAtAnchor(ctx, c.caller, ethereum.CallMsg{To: &c.pool, Data: calldata}, anchor)
 	if err != nil {
 		return 0, nil, wrapPriceSourceRequestError("uniswap", "observe", err)
 	}
@@ -207,8 +222,8 @@ func (c *UniswapV3Client) observe(ctx context.Context) (int, *big.Int, error) {
 	return int(mean.Int64()), harmonicLiquidity, nil
 }
 
-func (c *UniswapV3Client) readDecimals(ctx context.Context, token common.Address) (uint8, error) {
-	values, err := c.call(ctx, token, erc20MetadataABI, "decimals")
+func (c *UniswapV3Client) readDecimalsAt(ctx context.Context, token common.Address, anchor *rpcquorum.StateAnchor) (uint8, error) {
+	values, err := c.call(ctx, token, erc20MetadataABI, "decimals", anchor)
 	if err != nil {
 		return 0, err
 	}
@@ -225,8 +240,8 @@ func (c *UniswapV3Client) readDecimals(ctx context.Context, token common.Address
 func (c *UniswapV3Client) readAddress(ctx context.Context, target common.Address, contractABI interface {
 	Pack(string, ...any) ([]byte, error)
 	Unpack(string, []byte) ([]any, error)
-}, method string) (common.Address, error) {
-	values, err := c.call(ctx, target, contractABI, method)
+}, method string, anchor *rpcquorum.StateAnchor) (common.Address, error) {
+	values, err := c.call(ctx, target, contractABI, method, anchor)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -243,12 +258,12 @@ func (c *UniswapV3Client) readAddress(ctx context.Context, target common.Address
 func (c *UniswapV3Client) call(ctx context.Context, target common.Address, contractABI interface {
 	Pack(string, ...any) ([]byte, error)
 	Unpack(string, []byte) ([]any, error)
-}, method string) ([]any, error) {
+}, method string, anchor *rpcquorum.StateAnchor) ([]any, error) {
 	calldata, err := contractABI.Pack(method)
 	if err != nil {
 		return nil, err
 	}
-	result, err := c.caller.CallContract(ctx, ethereum.CallMsg{To: &target, Data: calldata}, nil)
+	result, err := rpcquorum.CallAtAnchor(ctx, c.caller, ethereum.CallMsg{To: &target, Data: calldata}, anchor)
 	if err != nil {
 		return nil, wrapPriceSourceRequestError("uniswap", method, err)
 	}

@@ -159,9 +159,15 @@ export type PricingProfile = {
   coinGeckoAPIKeyEnv?: string;
 };
 
+// Every Hardhat deploy network must be listed with its chain_id/eid binding;
+// validateHardhatNetworkChain rejects networks missing from this map instead of
+// silently skipping the binding check.
 const hardhatNetworks = new Map<string, { chainId: number; eid: number }>([
   ["sepolia", { chainId: 11155111, eid: 40161 }],
   ["hoodi", { chainId: 560048, eid: 40449 }],
+  ["bscTestnet", { chainId: 97, eid: 40102 }],
+  ["local-anvil-a", { chainId: 31337, eid: 90101 }],
+  ["local-anvil-b", { chainId: 31338, eid: 90102 }],
 ]);
 
 export type TxRoleProfile = {
@@ -585,16 +591,39 @@ function requiredDVNsForPathway(
   source: ChainProfile,
   sourceState: ChainDeploymentState
 ): Address[] {
-  const dvns = [sourceState.workers.openDVN, ...source.externalDVNs];
-  if (source.includeLayerZeroLabsDVN) {
+  return requiredDVNSetForChain(source, sourceState.workers.openDVN);
+}
+
+// The chain's ULN required set: its own OpenDVN plus every approved external DVN.
+// The same set is applied to the chain's send and receive ULN configs and must
+// match the worker config's send/receive_required_dvns pins exactly.
+function requiredDVNSetForChain(chain: ChainProfile, openDVN: Address): Address[] {
+  const dvns = [openDVN, ...chain.externalDVNs];
+  if (chain.includeLayerZeroLabsDVN) {
     dvns.push(
       requireLayerZeroLabsDVNForLibraries(
-        source.layerZero,
-        `${source.key}.includeLayerZeroLabsDVN`
+        chain.layerZero,
+        `${chain.key}.includeLayerZeroLabsDVN`
       )
     );
   }
   return dvns;
+}
+
+function renderAddressList(field: string, addresses: readonly Address[]): string {
+  const lines = addresses.map((address) => `      - "${address}"`);
+  return [`    ${field}:`, ...lines].join("\n");
+}
+
+function profileChainByKey(
+  profile: DeploymentProfile,
+  key: string
+): ChainProfile {
+  const chain = profile.chains.find((candidate) => candidate.key === key);
+  if (chain === undefined) {
+    throw new Error(`profile is missing chain ${key}`);
+  }
+  return chain;
 }
 
 export function pathwayInput(input: {
@@ -707,6 +736,8 @@ function renderPricingConfig(profile: DeploymentProfile): string {
   interval_seconds: 300
   stale_after_seconds: 1800
   max_deviation_bps: ${profile.pricing.maxDeviationBps}
+  min_update_deviation_bps: 50
+  heartbeat_seconds: 900
   source_request_timeout_seconds: ${profile.pricing.sourceRequestTimeoutSeconds}
   gas_spike_bps: 1000
 ${renderOptionalPricingGlobal(profile.pricing)}  chains:
@@ -2303,7 +2334,9 @@ function validateHardhatNetworkChain(
 ): void {
   const expected = hardhatNetworks.get(network);
   if (expected === undefined) {
-    return;
+    throw new Error(
+      `${pathLabel}.network ${network} has no chain_id/eid binding in hardhatNetworks; add the network binding before deploying to it`
+    );
   }
   if (expected.chainId !== chainID) {
     throw new Error(
@@ -2733,6 +2766,14 @@ function renderWorkerPathway(
   profile: DeploymentProfile,
   direction: DeploymentDirectionState
 ): string {
+  const sendRequiredDVNs = requiredDVNSetForChain(
+    profileChainByKey(profile, direction.source),
+    direction.sourceWorkers.openDVN
+  );
+  const receiveRequiredDVNs = requiredDVNSetForChain(
+    profileChainByKey(profile, direction.destination),
+    direction.destinationWorkers.openDVN
+  );
   return `  - src_eid: ${direction.srcEid}
     dst_eid: ${direction.dstEid}
     src_oapp: "${direction.srcOApp}"
@@ -2745,6 +2786,8 @@ function renderWorkerPathway(
       price_feed: "${direction.sourceWorkers.priceFeed}"
     destination_workers:
       open_dvn: "${direction.destinationWorkers.openDVN}"
+${renderAddressList("send_required_dvns", sendRequiredDVNs)}
+${renderAddressList("receive_required_dvns", receiveRequiredDVNs)}
     dvn:
       mode: ${profile.dvnMode}
     pricing:
@@ -3137,6 +3180,17 @@ function validateTwoChainPair(chains: readonly ChainProfile[]) {
   const eids = new Set(chains.map((chain) => chain.eid));
   if (eids.size !== 2) {
     throw new Error("profile.chains eids must be unique");
+  }
+  // The profile deploys both reciprocal directions, and each direction's send
+  // ULN carries the source chain's confirmations while the receive ULN enforces
+  // the destination chain's value. Unequal values would deploy one direction
+  // whose verifications the receive ULN always rejects, and the worker config
+  // generated from this profile would fail the same validation at startup --
+  // after the chain mutations already ran. Reject before any deployment phase.
+  if (chains[0].confirmations !== chains[1].confirmations) {
+    throw new Error(
+      `profile.chains confirmations must match for reciprocal pathways: ${chains[0].key} uses ${chains[0].confirmations}, ${chains[1].key} uses ${chains[1].confirmations}`
+    );
   }
 }
 

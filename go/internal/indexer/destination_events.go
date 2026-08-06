@@ -183,12 +183,17 @@ func applyExecutorDestinationLogs(ctx context.Context, store ExecutorDestination
 func executorDestinationLogAlreadyApplied(status string, topic common.Hash) bool {
 	switch topic {
 	case lzabi.PacketVerifiedTopic():
+		// MANUAL_REVIEW mirrors the LzReceiveAlert branch: a parked job keeps
+		// its parked state. A lagging indexer replaying an old commit event
+		// must not un-park the job — that would bypass the delivery retry cap
+		// and could deliver a message the operator explicitly canceled.
 		switch status {
 		case string(packets.ExecutorCommitted),
 			string(packets.ExecutorExecutable),
 			string(packets.ExecutorLzReceiveTxEnqueued),
 			string(packets.ExecutorDelivered),
-			string(packets.ExecutorLzReceiveFailed):
+			string(packets.ExecutorLzReceiveFailed),
+			string(packets.ExecutorManualReview):
 			return true
 		}
 	case lzabi.PacketDeliveredTopic():
@@ -532,8 +537,7 @@ func executorCanApplyPacketVerified(status string) bool {
 	case string(packets.ExecutorAssigned),
 		string(packets.ExecutorWaitingDVNVerification),
 		string(packets.ExecutorVerifiable),
-		string(packets.ExecutorCommitTxEnqueued),
-		string(packets.ExecutorManualReview):
+		string(packets.ExecutorCommitTxEnqueued):
 		return true
 	default:
 		return false

@@ -13,6 +13,7 @@ import (
 	"github.com/islishude/oh-my-lazier/go/internal/chain"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/packets"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 const loopInterval = 5 * time.Second
@@ -46,6 +47,22 @@ func (w *Worker) confirmedReadBlock(ctx context.Context, eid uint32) (*big.Int, 
 	return new(big.Int).SetUint64(head - configuredChain.Confirmations), nil
 }
 
+// latestAnchor resolves one verified canonical tip anchor for a logical
+// multi-read check: serial reads must not each re-establish the head quorum
+// (a black-holed minority provider would charge every read a probe deadline),
+// and the pinned block hash keeps the whole check on the verified branch even
+// if the tip reorgs mid-check.
+func latestAnchor(ctx context.Context, caller ContractCaller) (*rpcquorum.StateAnchor, error) {
+	if caller == nil {
+		return nil, errors.New("destination caller is required")
+	}
+	head, err := caller.CheckHead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return rpcquorum.AnchorFromHead(head)
+}
+
 // commitConfirmedOnChain reports whether the packet's commit is still present at
 // the confirmation-deep block, so a shallow (reorg-vulnerable) commit is not
 // written as terminal state. A not-yet-deep chain reports false (defer).
@@ -57,7 +74,7 @@ func (w *Worker) commitConfirmedOnChain(ctx context.Context, eid uint32, endpoin
 	if err != nil {
 		return false, err
 	}
-	state, err := CheckCommitState(ctx, w.caller(eid), endpoint, receiveLib, packet, confBlock)
+	state, err := CheckCommitState(ctx, w.caller(eid), endpoint, receiveLib, packet, &rpcquorum.StateAnchor{Number: confBlock})
 	if err != nil {
 		return false, err
 	}
@@ -74,7 +91,7 @@ func (w *Worker) deliveryConfirmedOnChain(ctx context.Context, eid uint32, endpo
 	if err != nil {
 		return false, err
 	}
-	state, err := CheckDeliveryState(ctx, w.caller(eid), endpoint, packet, confBlock)
+	state, err := CheckDeliveryState(ctx, w.caller(eid), endpoint, packet, &rpcquorum.StateAnchor{Number: confBlock})
 	if err != nil {
 		return false, err
 	}
@@ -165,7 +182,11 @@ func (w *Worker) ProcessCommitterOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "destination_chain_lookup_error", err)
 	}
-	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, nil)
+	anchor, err := latestAnchor(ctx, w.caller(item.Packet.DstEID))
+	if err != nil {
+		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "commit_readiness_error", err)
+	}
+	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, anchor)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorVerifiable), "commit_readiness_error", err)
 	}
@@ -234,7 +255,11 @@ func (w *Worker) processCommitReadinessStatus(ctx context.Context, status string
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "destination_chain_lookup_error", err)
 	}
-	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, nil)
+	anchor, err := latestAnchor(ctx, w.caller(item.Packet.DstEID))
+	if err != nil {
+		return w.deferExecutorWorkError(ctx, item, status, "commit_readiness_error", err)
+	}
+	state, err := CheckCommitState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, pathway.ReceiveLib, item.Packet, anchor)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "commit_readiness_error", err)
 	}
@@ -299,7 +324,11 @@ func (w *Worker) processExecutableReadiness(ctx context.Context) (bool, error) {
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "destination_chain_lookup_error", err)
 	}
-	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, nil)
+	anchor, err := latestAnchor(ctx, w.caller(item.Packet.DstEID))
+	if err != nil {
+		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "delivery_readiness_error", err)
+	}
+	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, anchor)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, string(packets.ExecutorCommitted), "delivery_readiness_error", err)
 	}
@@ -346,7 +375,11 @@ func (w *Worker) processDelivererStatus(ctx context.Context, status string) (boo
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "destination_chain_lookup_error", err)
 	}
-	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, nil)
+	anchor, err := latestAnchor(ctx, w.caller(item.Packet.DstEID))
+	if err != nil {
+		return w.deferExecutorWorkError(ctx, item, status, "delivery_readiness_error", err)
+	}
+	state, err := CheckDeliveryState(ctx, w.caller(item.Packet.DstEID), dstChain.EndpointAddress, item.Packet, anchor)
 	if err != nil {
 		return w.deferExecutorWorkError(ctx, item, status, "delivery_readiness_error", err)
 	}

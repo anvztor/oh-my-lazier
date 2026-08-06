@@ -36,7 +36,8 @@ test("LayerZero dry-run plans reject invalid executor and DVN configuration", ()
     remoteEid: 40449,
     sendUln: address("33"),
     receiveUln: address("44"),
-    confirmations: 12n,
+    sendConfirmations: 12n,
+    receiveConfirmations: 12n,
   };
   assert.throws(
     () => buildConfigureLzDVNPlan({ ...base, requiredDVNs: [address("55")] }),
@@ -50,6 +51,25 @@ test("LayerZero dry-run plans reject invalid executor and DVN configuration", ()
       }),
     /duplicate DVN address/
   );
+  assert.throws(
+    () =>
+      buildConfigureLzDVNPlan({
+        ...base,
+        requiredDVNs: [address("55"), address("66")],
+        sendConfirmations: 11n,
+        receiveConfirmations: 12n,
+      }),
+    /send confirmations 11 must be at least receive confirmations 12/
+  );
+  const asymmetric = buildConfigureLzDVNPlan({
+    ...base,
+    requiredDVNs: [address("55"), address("66")],
+    sendConfirmations: 15n,
+    receiveConfirmations: 12n,
+  });
+  assert.equal(asymmetric.sendUlnConfig.confirmations, 15n);
+  assert.equal(asymmetric.receiveUlnConfig.confirmations, 12n);
+  assert.notEqual(asymmetric.encodedSendConfig, asymmetric.encodedReceiveConfig);
 });
 
 test("OFT send dry-run builds exact options and rejects conflicting input", () => {

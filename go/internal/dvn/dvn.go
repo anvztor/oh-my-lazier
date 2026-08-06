@@ -71,9 +71,11 @@ type ReceiptReader interface {
 	TransactionReceipt(ctx context.Context, txHash common.Hash) (*gethtypes.Receipt, error)
 }
 
-// ContractCaller is the eth_call surface used by destination-chain reconciliation.
+// ContractCaller is the anchor-routed eth_call surface used by
+// destination-chain reconciliation.
 type ContractCaller interface {
 	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
+	CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error)
 }
 
 // Settings controls active DVN verification transaction generation.
@@ -351,7 +353,14 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 		}
 		w.logger.Info("dvn shadow job would verify", "guid", item.Packet.GUID, "src_eid", item.Packet.SrcEID, "dst_eid", item.Packet.DstEID, "from_status", string(packets.DVNReadyToVerify), "to_status", string(packets.DVNWouldVerify))
 	case config.DVNModeActive:
-		complete, err := w.verificationAlreadyComplete(ctx, item.Packet, pathway, item.Job.ConfirmationsRequired, nil)
+		// One verified anchor covers this check's serial reads: re-establishing
+		// the head quorum per nil-block read would charge a probe deadline per
+		// read when a minority provider black-holes.
+		latestAnchor, err := w.destinationAnchor(ctx, item.Packet.DstEID)
+		if err != nil {
+			return w.deferDVNWorkError(ctx, item, string(packets.DVNReadyToVerify), "destination_anchor_error", err)
+		}
+		complete, err := w.verificationAlreadyComplete(ctx, item.Packet, pathway, item.Job.ConfirmationsRequired, latestAnchor)
 		if err != nil {
 			if isDestinationVerificationConfigMismatch(err) {
 				return w.markDestinationConfigMismatch(ctx, item, string(packets.DVNReadyToVerify), err)
@@ -400,7 +409,7 @@ func (w *Worker) ProcessReadyToVerifyOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, blockNumber *big.Int) (bool, error) {
+func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, anchor *rpcquorum.StateAnchor) (bool, error) {
 	if err := packet.Validate(); err != nil {
 		return false, err
 	}
@@ -418,17 +427,17 @@ func (w *Worker) verificationAlreadyComplete(ctx context.Context, packet db.Pack
 	if caller == nil {
 		return false, fmt.Errorf("missing destination caller for eid %d", packet.DstEID)
 	}
-	payloadHash, err := callInboundPayloadHash(ctx, caller, dstChain.EndpointAddress, packet, blockNumber)
+	payloadHash, err := callInboundPayloadHash(ctx, caller, dstChain.EndpointAddress, packet, anchor)
 	if err != nil {
 		return false, err
 	}
 	if payloadHash == packet.PayloadHash {
 		return true, nil
 	}
-	if err := validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, blockNumber); err != nil {
+	if err := validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, anchor); err != nil {
 		return false, err
 	}
-	submitted, observedConfirmations, err := callHashLookup(ctx, caller, pathway.ReceiveLib, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash, pathway.DestinationWorkers.OpenDVN, blockNumber)
+	submitted, observedConfirmations, err := callHashLookup(ctx, caller, pathway.ReceiveLib, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash, pathway.DestinationWorkers.OpenDVN, anchor)
 	if err != nil {
 		return false, err
 	}
@@ -446,7 +455,7 @@ func (w *Worker) verificationConfirmedOnChain(ctx context.Context, packet db.Pac
 	if err != nil {
 		return false, err
 	}
-	complete, err := w.verificationAlreadyComplete(ctx, packet, pathway, confirmations, confBlock)
+	complete, err := w.verificationAlreadyComplete(ctx, packet, pathway, confirmations, confirmedAnchor(confBlock))
 	if err != nil {
 		// The current config was already validated against latest before this
 		// re-check. A config mismatch at the historical confirmed block just means
@@ -461,6 +470,15 @@ func (w *Worker) verificationConfirmedOnChain(ctx context.Context, packet db.Pac
 }
 
 var errAwaitingConfirmations = errors.New("awaiting confirmation depth")
+
+// confirmedAnchor wraps a confirmation-deep block in a number-only anchor; a
+// nil block (no confirmation gate) keeps the caller's own latest anchoring.
+func confirmedAnchor(confBlock *big.Int) *rpcquorum.StateAnchor {
+	if confBlock == nil {
+		return nil
+	}
+	return &rpcquorum.StateAnchor{Number: confBlock}
+}
 
 // confirmedDstBlock returns the destination block that is chain.Confirmations
 // deep. A nil block with no error means no confirmation gate (read latest);
@@ -510,28 +528,48 @@ func (w *Worker) validateActiveDestinationConfig(ctx context.Context, packet db.
 	if caller == nil {
 		return fmt.Errorf("missing destination caller for eid %d", packet.DstEID)
 	}
-	return validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, nil)
+	anchor, err := w.destinationAnchor(ctx, packet.DstEID)
+	if err != nil {
+		return err
+	}
+	return validateDestinationVerificationConfig(ctx, caller, dstChain.EndpointAddress, packet, pathway, confirmations, anchor)
 }
 
-func validateDestinationVerificationConfig(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, blockNumber *big.Int) error {
-	receiveLib, err := callReceiveLibrary(ctx, caller, endpoint, packet.Receiver, packet.SrcEID, blockNumber)
+// destinationAnchor resolves one verified canonical tip anchor on the
+// destination chain for a logical multi-read check, so serial reads share a
+// single hash-pinned state view instead of re-establishing the head quorum
+// per call and drifting across branches on a mid-check reorg.
+func (w *Worker) destinationAnchor(ctx context.Context, dstEID uint32) (*rpcquorum.StateAnchor, error) {
+	head := w.head(dstEID)
+	if head == nil {
+		return nil, fmt.Errorf("missing destination head reader for eid %d", dstEID)
+	}
+	result, err := head.CheckHead(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return rpcquorum.AnchorFromHead(result)
+}
+
+func validateDestinationVerificationConfig(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, pathway chain.Pathway, confirmations uint64, anchor *rpcquorum.StateAnchor) error {
+	receiveLib, err := callReceiveLibrary(ctx, caller, endpoint, packet.Receiver, packet.SrcEID, anchor)
 	if err != nil {
 		return err
 	}
 	if receiveLib != pathway.ReceiveLib {
 		return fmt.Errorf("%w: destination receive library %s does not match configured %s", errDestinationVerificationConfigMismatch, receiveLib, pathway.ReceiveLib)
 	}
-	config, err := callReceiveUlnConfig(ctx, caller, pathway.ReceiveLib, packet.Receiver, packet.SrcEID, blockNumber)
+	config, err := callReceiveUlnConfig(ctx, caller, pathway.ReceiveLib, packet.Receiver, packet.SrcEID, anchor)
 	if err != nil {
 		return err
 	}
-	if err := validateReceiveUlnConfig(config, confirmations, pathway.DestinationWorkers.OpenDVN); err != nil {
+	if err := validateReceiveUlnConfig(config, confirmations, pathway.ReceiveRequiredDVNs); err != nil {
 		return fmt.Errorf("%w: %w", errDestinationVerificationConfigMismatch, err)
 	}
 	return nil
 }
 
-func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, blockNumber *big.Int) (common.Hash, error) {
+func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, anchor *rpcquorum.StateAnchor) (common.Hash, error) {
 	if endpoint == (common.Address{}) {
 		return common.Hash{}, errors.New("endpoint address is required")
 	}
@@ -545,7 +583,7 @@ func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint
 	if err != nil {
 		return common.Hash{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &endpoint, Data: data}, anchor)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -563,7 +601,7 @@ func callInboundPayloadHash(ctx context.Context, caller ContractCaller, endpoint
 	return common.BytesToHash(value[:]), nil
 }
 
-func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, receiver common.Address, srcEID uint32, blockNumber *big.Int) (common.Address, error) {
+func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, receiver common.Address, srcEID uint32, anchor *rpcquorum.StateAnchor) (common.Address, error) {
 	if endpoint == (common.Address{}) {
 		return common.Address{}, errors.New("endpoint address is required")
 	}
@@ -574,7 +612,7 @@ func callReceiveLibrary(ctx context.Context, caller ContractCaller, endpoint, re
 	if err != nil {
 		return common.Address{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &endpoint, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &endpoint, Data: data}, anchor)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -601,7 +639,7 @@ type receiveUlnConfig struct {
 	OptionalDVNs         []common.Address `abi:"optionalDVNs"`
 }
 
-func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32, blockNumber *big.Int) (receiveUlnConfig, error) {
+func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32, anchor *rpcquorum.StateAnchor) (receiveUlnConfig, error) {
 	if receiveLib == (common.Address{}) {
 		return receiveUlnConfig{}, errors.New("receive lib address is required")
 	}
@@ -612,7 +650,7 @@ func callReceiveUlnConfig(ctx context.Context, caller ContractCaller, receiveLib
 	if err != nil {
 		return receiveUlnConfig{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &receiveLib, Data: data}, anchor)
 	if err != nil {
 		return receiveUlnConfig{}, err
 	}
@@ -649,7 +687,7 @@ func receiveUlnConfigFromABI(value any) (receiveUlnConfig, error) {
 	}, nil
 }
 
-func validateReceiveUlnConfig(config receiveUlnConfig, confirmations uint64, openDVN common.Address) error {
+func validateReceiveUlnConfig(config receiveUlnConfig, confirmations uint64, requiredDVNs []common.Address) error {
 	// ReceiveUln302 accepts a DVN verification whose submitted confirmations meet or exceed this threshold.
 	if confirmations < config.Confirmations {
 		return fmt.Errorf("assigned confirmations %d are below receive uln required confirmations %d", confirmations, config.Confirmations)
@@ -666,16 +704,28 @@ func validateReceiveUlnConfig(config receiveUlnConfig, confirmations uint64, ope
 	if len(config.OptionalDVNs) != 0 {
 		return fmt.Errorf("receive uln optional DVNs are configured: %v", config.OptionalDVNs)
 	}
-	if len(config.RequiredDVNs) < 2 {
-		return fmt.Errorf("receive uln required DVNs must include OpenDVN plus at least one independent DVN, got %v", config.RequiredDVNs)
-	}
-	if !slices.Contains(config.RequiredDVNs, openDVN) {
-		return fmt.Errorf("receive uln required DVNs %v do not include configured OpenDVN %s", config.RequiredDVNs, openDVN)
+	// An unapproved, stale, or missing entry silently changes the verification quorum,
+	// so the on-chain set must match the approved set exactly (order ignored).
+	if !equalAddressSets(config.RequiredDVNs, requiredDVNs) {
+		return fmt.Errorf("receive uln required DVNs %v do not match configured required set %v", config.RequiredDVNs, requiredDVNs)
 	}
 	return nil
 }
 
-func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib common.Address, headerHash, payloadHash common.Hash, dvn common.Address, blockNumber *big.Int) (bool, uint64, error) {
+// equalAddressSets reports whether both slices hold the same addresses ignoring order.
+func equalAddressSets(a, b []common.Address) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	compare := func(x, y common.Address) int { return bytes.Compare(x.Bytes(), y.Bytes()) }
+	slices.SortFunc(sortedA, compare)
+	slices.SortFunc(sortedB, compare)
+	return slices.Equal(sortedA, sortedB)
+}
+
+func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib common.Address, headerHash, payloadHash common.Hash, dvn common.Address, anchor *rpcquorum.StateAnchor) (bool, uint64, error) {
 	if receiveLib == (common.Address{}) {
 		return false, 0, errors.New("receive lib address is required")
 	}
@@ -686,7 +736,7 @@ func callHashLookup(ctx context.Context, caller ContractCaller, receiveLib commo
 	if err != nil {
 		return false, 0, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &receiveLib, Data: data}, anchor)
 	if err != nil {
 		return false, 0, err
 	}

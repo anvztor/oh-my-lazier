@@ -4,9 +4,9 @@
 
 - Treat [README.md](README.md), [docs/runbooks](docs/runbooks), [docs/deployments](docs/deployments), and [docs/security](docs/security) as maintained documentation. Keep them aligned with behavior changes.
 - This repo is still in active development. Do not keep compatibility shims, fallback config/schema paths, dual decoders, retired fixtures, or legacy tests unless explicitly requested.
-- Phase 1 supports EVM chains only. Required DVNs are `OpenDVN` plus at least one independent 3rd-party DVN.
+- Phase 1 supports EVM chains only. Required DVNs are `OpenDVN` plus at least one independently operated DVN. Independence is organizational, judged relative to the OApp and its configuration owner: a separate legal and control entity with its own keys, infrastructure, RPC providers, and build/deploy pipeline. A reciprocal counterparty-operated DVN qualifies; document the concrete operator topology and its verification evidence in maintained scope docs.
 - Do not add non-EVM support, `composeMsg`, `lzCompose`, native drop, ordered execution, self-only DVN, hot config reload, or live testnet/mainnet execution unless maintained scope docs are updated first.
-- For repo-local schema changes, update `go/migrations/001_initial_schema.sql`. Do not add separate data migrations unless explicitly requested.
+- Committed files under `go/migrations` are immutable: `Store.Migrate` checksum-guards every applied migration, and initialized databases must keep an upgrade path. Make schema changes by adding the next numbered incremental migration (`003_*.sql` onward). Do not rewrite existing migrations in place, and do not add data-backfill migrations unless explicitly requested.
 
 ## Repository Layout
 

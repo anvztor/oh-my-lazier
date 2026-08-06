@@ -19,6 +19,8 @@
     "configure:open-workers-pathway": "hardhat run --no-compile --build-profile production contracts/scripts/commands/configure-open-workers-pathway.ts",
     "configure:open-dvn-pathway": "hardhat run --no-compile --build-profile production contracts/scripts/commands/configure-open-dvn-pathway.ts",
     "deploy:profile": "hardhat run --no-compile --build-profile production contracts/scripts/commands/deploy-profile.ts",
+    "regtest:deploy": "hardhat run --no-compile contracts/scripts/commands/regtest-deploy.ts",
+    "regtest:send": "hardhat run --no-compile contracts/scripts/commands/regtest-send.ts",
     "render:oft-pathway-params": "hardhat run --no-compile contracts/scripts/commands/render-oft-pathway-params.ts",
     "configure:workers": "hardhat run --no-compile contracts/scripts/commands/configure-workers.ts",
     "generate:lzabi": "hardhat run --no-compile contracts/scripts/commands/generate-lzabi.ts",

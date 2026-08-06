@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/islishude/oh-my-lazier/go/internal/db"
 	"github.com/islishude/oh-my-lazier/go/internal/lzabi"
+	"github.com/islishude/oh-my-lazier/go/internal/rpcquorum"
 )
 
 var (
@@ -24,10 +25,14 @@ var (
 	nilPayloadHash   = common.HexToHash("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
 )
 
-// ContractCaller is the eth_call surface used by executor readiness checks.
+// ContractCaller is the verified read surface used by executor readiness
+// checks: anchor-routed eth_call (by number or pinned block hash), the head
+// number for confirmation-depth math, and the verified head for tip anchors.
 type ContractCaller interface {
-	CallContract(ctx context.Context, call ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
+	CallContract(ctx context.Context, call ethereum.CallMsg, anchor *big.Int) ([]byte, error)
+	CallContractAtHash(ctx context.Context, call ethereum.CallMsg, blockHash common.Hash) ([]byte, error)
 	BlockNumber(ctx context.Context) (uint64, error)
+	CheckHead(ctx context.Context) (rpcquorum.HeadResult, error)
 }
 
 // CommitState describes destination-chain commitVerification readiness.
@@ -61,7 +66,7 @@ func IsCommitVerifiable(ctx context.Context, caller ContractCaller, endpoint, re
 }
 
 // CheckCommitState reconciles on-chain commit state before deciding whether commitVerification should be enqueued.
-func CheckCommitState(ctx context.Context, caller ContractCaller, endpoint, receiveLib common.Address, packet db.PacketRecord, blockNumber *big.Int) (CommitState, error) {
+func CheckCommitState(ctx context.Context, caller ContractCaller, endpoint, receiveLib common.Address, packet db.PacketRecord, anchor *rpcquorum.StateAnchor) (CommitState, error) {
 	if err := packet.Validate(); err != nil {
 		return CommitNotVerifiable, err
 	}
@@ -78,32 +83,32 @@ func CheckCommitState(ctx context.Context, caller ContractCaller, endpoint, rece
 		return CommitNotVerifiable, nil
 	}
 	origin := originFromPacket(packet)
-	payloadHash, err := callEndpointHash(ctx, caller, endpoint, "inboundPayloadHash", blockNumber, packet.Receiver, packet.SrcEID, origin.Sender, origin.Nonce)
+	payloadHash, err := callEndpointHash(ctx, caller, endpoint, "inboundPayloadHash", anchor, packet.Receiver, packet.SrcEID, origin.Sender, origin.Nonce)
 	if err != nil {
 		return CommitNotVerifiable, err
 	}
 	if payloadHash == packet.PayloadHash {
 		return CommitCommitted, nil
 	}
-	validReceiveLib, err := callBool(ctx, caller, endpointViewABI, endpoint, "isValidReceiveLibrary", blockNumber, packet.Receiver, packet.SrcEID, receiveLib)
+	validReceiveLib, err := callBool(ctx, caller, endpointViewABI, endpoint, "isValidReceiveLibrary", anchor, packet.Receiver, packet.SrcEID, receiveLib)
 	if err != nil {
 		return CommitNotVerifiable, err
 	}
 	if !validReceiveLib {
 		return CommitNotVerifiable, nil
 	}
-	endpointVerifiable, err := callBool(ctx, caller, endpointViewABI, endpoint, "verifiable", blockNumber, origin, packet.Receiver)
+	endpointVerifiable, err := callBool(ctx, caller, endpointViewABI, endpoint, "verifiable", anchor, origin, packet.Receiver)
 	if err != nil {
 		return CommitNotVerifiable, err
 	}
 	if !endpointVerifiable {
 		return CommitNotVerifiable, nil
 	}
-	config, err := callUlnConfig(ctx, caller, receiveLib, packet.Receiver, packet.SrcEID, blockNumber)
+	config, err := callUlnConfig(ctx, caller, receiveLib, packet.Receiver, packet.SrcEID, anchor)
 	if err != nil {
 		return CommitNotVerifiable, err
 	}
-	verifiable, err := callBool(ctx, caller, receiveUlnViewABI, receiveLib, "verifiable", blockNumber, config, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash)
+	verifiable, err := callBool(ctx, caller, receiveUlnViewABI, receiveLib, "verifiable", anchor, config, crypto.Keccak256Hash(packet.PacketHeader), packet.PayloadHash)
 	if err != nil || !verifiable {
 		return CommitNotVerifiable, err
 	}
@@ -117,7 +122,7 @@ func IsLzReceiveExecutable(ctx context.Context, caller ContractCaller, endpoint 
 }
 
 // CheckDeliveryState reconciles on-chain delivery state before deciding whether lzReceive should be enqueued.
-func CheckDeliveryState(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, blockNumber *big.Int) (DeliveryState, error) {
+func CheckDeliveryState(ctx context.Context, caller ContractCaller, endpoint common.Address, packet db.PacketRecord, anchor *rpcquorum.StateAnchor) (DeliveryState, error) {
 	if err := packet.Validate(); err != nil {
 		return DeliveryNotExecutable, err
 	}
@@ -128,11 +133,11 @@ func CheckDeliveryState(ctx context.Context, caller ContractCaller, endpoint com
 		return DeliveryNotExecutable, errors.New("endpoint address is required")
 	}
 	origin := originFromPacket(packet)
-	payloadHash, err := callEndpointHash(ctx, caller, endpoint, "inboundPayloadHash", blockNumber, packet.Receiver, packet.SrcEID, origin.Sender, origin.Nonce)
+	payloadHash, err := callEndpointHash(ctx, caller, endpoint, "inboundPayloadHash", anchor, packet.Receiver, packet.SrcEID, origin.Sender, origin.Nonce)
 	if err != nil {
 		return DeliveryNotExecutable, err
 	}
-	lazyInboundNonce, err := callUint64(ctx, caller, endpoint, "lazyInboundNonce", blockNumber, packet.Receiver, packet.SrcEID, origin.Sender)
+	lazyInboundNonce, err := callUint64(ctx, caller, endpoint, "lazyInboundNonce", anchor, packet.Receiver, packet.SrcEID, origin.Sender)
 	if err != nil {
 		return DeliveryNotExecutable, err
 	}
@@ -145,7 +150,7 @@ func CheckDeliveryState(ctx context.Context, caller ContractCaller, endpoint com
 	if payloadHash == emptyPayloadHash || payloadHash == nilPayloadHash {
 		return DeliveryNotExecutable, nil
 	}
-	inboundNonce, err := callUint64(ctx, caller, endpoint, "inboundNonce", blockNumber, packet.Receiver, packet.SrcEID, origin.Sender)
+	inboundNonce, err := callUint64(ctx, caller, endpoint, "inboundNonce", anchor, packet.Receiver, packet.SrcEID, origin.Sender)
 	if err != nil {
 		return DeliveryNotExecutable, err
 	}
@@ -174,12 +179,12 @@ func originFromPacket(packet db.PacketRecord) endpointOrigin {
 	}
 }
 
-func callUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32, blockNumber *big.Int) (ulnConfig, error) {
+func callUlnConfig(ctx context.Context, caller ContractCaller, receiveLib, receiver common.Address, srcEID uint32, anchor *rpcquorum.StateAnchor) (ulnConfig, error) {
 	data, err := receiveUlnViewABI.Pack("getUlnConfig", receiver, srcEID)
 	if err != nil {
 		return ulnConfig{}, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &receiveLib, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &receiveLib, Data: data}, anchor)
 	if err != nil {
 		return ulnConfig{}, err
 	}
@@ -225,8 +230,8 @@ func uint8Field(value reflect.Value, name string) uint8 {
 	return uint8(value.FieldByName(name).Uint())
 }
 
-func callBool(ctx context.Context, caller ContractCaller, contractABI abiLike, to common.Address, method string, blockNumber *big.Int, args ...any) (bool, error) {
-	values, err := callAndUnpack(ctx, caller, contractABI, to, method, blockNumber, args...)
+func callBool(ctx context.Context, caller ContractCaller, contractABI abiLike, to common.Address, method string, anchor *rpcquorum.StateAnchor, args ...any) (bool, error) {
+	values, err := callAndUnpack(ctx, caller, contractABI, to, method, anchor, args...)
 	if err != nil {
 		return false, err
 	}
@@ -237,8 +242,8 @@ func callBool(ctx context.Context, caller ContractCaller, contractABI abiLike, t
 	return value, nil
 }
 
-func callEndpointHash(ctx context.Context, caller ContractCaller, to common.Address, method string, blockNumber *big.Int, args ...any) (common.Hash, error) {
-	values, err := callAndUnpack(ctx, caller, endpointViewABI, to, method, blockNumber, args...)
+func callEndpointHash(ctx context.Context, caller ContractCaller, to common.Address, method string, anchor *rpcquorum.StateAnchor, args ...any) (common.Hash, error) {
+	values, err := callAndUnpack(ctx, caller, endpointViewABI, to, method, anchor, args...)
 	if err != nil {
 		return common.Hash{}, err
 	}
@@ -249,8 +254,8 @@ func callEndpointHash(ctx context.Context, caller ContractCaller, to common.Addr
 	return common.BytesToHash(value[:]), nil
 }
 
-func callUint64(ctx context.Context, caller ContractCaller, to common.Address, method string, blockNumber *big.Int, args ...any) (uint64, error) {
-	values, err := callAndUnpack(ctx, caller, endpointViewABI, to, method, blockNumber, args...)
+func callUint64(ctx context.Context, caller ContractCaller, to common.Address, method string, anchor *rpcquorum.StateAnchor, args ...any) (uint64, error) {
+	values, err := callAndUnpack(ctx, caller, endpointViewABI, to, method, anchor, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -266,12 +271,12 @@ type abiLike interface {
 	Unpack(name string, data []byte) ([]any, error)
 }
 
-func callAndUnpack(ctx context.Context, caller ContractCaller, contractABI abiLike, to common.Address, method string, blockNumber *big.Int, args ...any) ([]any, error) {
+func callAndUnpack(ctx context.Context, caller ContractCaller, contractABI abiLike, to common.Address, method string, anchor *rpcquorum.StateAnchor, args ...any) ([]any, error) {
 	data, err := contractABI.Pack(method, args...)
 	if err != nil {
 		return nil, err
 	}
-	result, err := caller.CallContract(ctx, ethereum.CallMsg{To: &to, Data: data}, blockNumber)
+	result, err := rpcquorum.CallAtAnchor(ctx, caller, ethereum.CallMsg{To: &to, Data: data}, anchor)
 	if err != nil {
 		return nil, err
 	}

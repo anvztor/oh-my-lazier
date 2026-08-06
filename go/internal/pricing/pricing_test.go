@@ -429,7 +429,7 @@ func TestReadPriceSnapshot(t *testing.T) {
 		t.Fatalf("priceSnapshot output Pack() error = %v", err)
 	}
 
-	got, err := readPriceSnapshot(context.Background(), staticEVMResponseReader{response: response}, common.HexToAddress("0x4444444444444444444444444444444444444444"), 40449)
+	got, err := readPriceSnapshot(context.Background(), staticEVMResponseReader{response: response}, common.HexToAddress("0x4444444444444444444444444444444444444444"), 40449, nil)
 	if err != nil {
 		t.Fatalf("readPriceSnapshot() error = %v", err)
 	}

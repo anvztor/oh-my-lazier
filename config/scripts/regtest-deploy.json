@@ -1,0 +1,10 @@
+{
+  "input": {
+    "tmpDir": "tmp/regtest",
+    "confirmations": "1",
+    "initialSupply": "1000000000000000000000000",
+    "dvnMode": "active"
+  },
+  "apply": true,
+  "confirmation": "approved"
+}

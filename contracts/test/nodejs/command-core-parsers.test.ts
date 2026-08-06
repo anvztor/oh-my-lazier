@@ -16,6 +16,8 @@ import {
   runConfigureLzRollbackCommand,
 } from "../../scripts/command-cores/configure-lz-rollback.js";
 import { parseLocalE2EDeployCommandInput } from "../../scripts/command-cores/e2e-local-deploy.js";
+import { parseRegtestDeployCommandInput } from "../../scripts/command-cores/regtest-deploy.js";
+import { parseRegtestSendCommandInput } from "../../scripts/command-cores/regtest-send.js";
 import { parseLocalE2ERunCommandInput } from "../../scripts/command-cores/e2e-local-run.js";
 import { parseInspectLzConfigCommandInput } from "../../scripts/command-cores/inspect-lz-config.js";
 import { parseOFTPathwayCommandInput } from "../../scripts/command-cores/oft-pathway.js";
@@ -117,12 +119,14 @@ test("LayerZero configure parsers preserve bigint values and reject loose input"
       sendUln: third,
       receiveUln: fourth,
       requiredDVNs: [fifth],
-      confirmations: "9007199254740993123",
+      sendConfirmations: "9007199254740993123",
+      receiveConfirmations: "12",
       expectedSigner: first,
     },
     "input"
   );
-  assert.equal(dvn.confirmations, 9_007_199_254_740_993_123n);
+  assert.equal(dvn.sendConfirmations, 9_007_199_254_740_993_123n);
+  assert.equal(dvn.receiveConfirmations, 12n);
   assert.deepEqual(dvn.requiredDVNs, [fifth]);
 
   assert.throws(
@@ -152,7 +156,8 @@ test("LayerZero configure parsers preserve bigint values and reject loose input"
           sendUln: third,
           receiveUln: fourth,
           requiredDVNs: `${fifth},${first}`,
-          confirmations: "12",
+          sendConfirmations: "12",
+          receiveConfirmations: "12",
           expectedSigner: first,
         },
         "input"
@@ -340,6 +345,81 @@ test("canary and price check parsers preserve optional evidence and decimal valu
         "input"
       ),
     /input contains unknown field: rpcUrl/
+  );
+});
+
+test("regtest command parsers are strict", () => {
+  assert.deepEqual(
+    parseRegtestDeployCommandInput({ tmpDir: "tmp/regtest" }, "input"),
+    {
+      tmpDir: "tmp/regtest",
+      confirmations: undefined,
+      initialSupply: undefined,
+      dvnMode: undefined,
+    }
+  );
+  assert.deepEqual(
+    parseRegtestDeployCommandInput(
+      {
+        tmpDir: "tmp/regtest",
+        confirmations: "2",
+        initialSupply: "1000000",
+        dvnMode: "shadow",
+      },
+      "input"
+    ),
+    {
+      tmpDir: "tmp/regtest",
+      confirmations: 2n,
+      initialSupply: 1_000_000n,
+      dvnMode: "shadow",
+    }
+  );
+  assert.throws(
+    () =>
+      parseRegtestDeployCommandInput(
+        { tmpDir: "tmp/regtest", dvnMode: "off" },
+        "input"
+      ),
+    /input\.dvnMode/
+  );
+  assert.deepEqual(
+    parseRegtestSendCommandInput(
+      {
+        tmpDir: "tmp/regtest",
+        direction: "ba",
+        amountLD: "1000000000000000000",
+        timeoutMs: "180000",
+      },
+      "input"
+    ),
+    {
+      tmpDir: "tmp/regtest",
+      direction: "ba",
+      amountLD: 1_000_000_000_000_000_000n,
+      timeoutMs: 180_000,
+    }
+  );
+  assert.throws(
+    () =>
+      parseRegtestDeployCommandInput(
+        { tmpDir: "tmp/regtest", deployerPrivateKey: "not-allowed" },
+        "input"
+      ),
+    /input contains unknown field: deployerPrivateKey/
+  );
+  assert.throws(
+    () =>
+      parseRegtestSendCommandInput(
+        {
+          tmpDir: "tmp/regtest",
+          direction: "sideways",
+          amountLD: "1",
+          timeoutMs: "1000",
+        },
+        "input"
+      ),
+    /input\.direction/
   );
 });
 

@@ -574,28 +574,28 @@ function localFeeModel() {
   };
 }
 
-function readKeystoreAddress(keystorePath: string): Address {
+/** Read the signer address recorded in a local geth-style keystore file. */
+export function readKeystoreAddress(keystorePath: string): Address {
   let value: unknown;
   try {
     value = JSON.parse(readFileSync(keystorePath, "utf8")) as unknown;
   } catch {
-    throw new Error(
-      `local E2E worker keystore could not be read: ${keystorePath}`
-    );
+    throw new Error(`local worker keystore could not be read: ${keystorePath}`);
   }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("local E2E worker keystore must be a JSON object");
+    throw new Error("local worker keystore must be a JSON object");
   }
   const rawAddress = (value as Record<string, unknown>).address;
   if (typeof rawAddress !== "string") {
-    throw new Error("local E2E worker keystore is missing address");
+    throw new Error("local worker keystore is missing address");
   }
   return getAddress(
     rawAddress.startsWith("0x") ? rawAddress : `0x${rawAddress}`
   );
 }
 
-function deployedAddress(value: unknown, key: string): Address {
+/** Extract one named contract address from an Ignition deploy() result. */
+export function deployedAddress(value: unknown, key: string): Address {
   if (typeof value !== "object" || value === null) {
     throw new Error("Ignition deployment did not return contract results");
   }
@@ -698,6 +698,12 @@ ${pathways
       price_feed: "${source.priceFeed}"
     destination_workers:
       open_dvn: "${destination.primaryOpenDVN}"
+    send_required_dvns:
+      - "${source.primaryOpenDVN}"
+      - "${source.secondaryOpenDVN}"
+    receive_required_dvns:
+      - "${destination.primaryOpenDVN}"
+      - "${destination.secondaryOpenDVN}"
     dvn:
       mode: active
     enabled: true

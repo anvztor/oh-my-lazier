@@ -201,6 +201,37 @@ test("normalizeProfile rejects Hardhat network and EID mismatches with custom La
   );
 });
 
+test("normalizeProfile rejects unequal chain confirmations", () => {
+  const input = baseProfile();
+  (input.chains[0] as Record<string, unknown>).confirmations = 6;
+
+  assert.throws(
+    () => normalizeProfile(input),
+    /profile\.chains confirmations must match for reciprocal pathways/
+  );
+});
+
+test("normalizeProfile rejects Hardhat networks without a chain binding", () => {
+  const input = baseProfile();
+  (input.chains[0] as Record<string, unknown>).network = "goatTestnet";
+
+  assert.throws(
+    () => normalizeProfile(input),
+    /profile\.chains\[0\]\.network goatTestnet has no chain_id\/eid binding in hardhatNetworks/
+  );
+});
+
+test("normalizeProfile validates the bscTestnet chain binding", () => {
+  const input = baseProfile();
+  const chain = input.chains[0] as Record<string, unknown>;
+  chain.network = "bscTestnet";
+
+  assert.throws(
+    () => normalizeProfile(input),
+    /profile\.chains\[0\]\.network bscTestnet uses chainId 97, but profile\.chains\[0\]\.chainId is 11155111/
+  );
+});
+
 test("normalizeProfile accepts opt-in LayerZero Labs DVN metadata", () => {
   const input = baseProfile();
   (input.chains[0] as Record<string, unknown>).includeLayerZeroLabsDVN = true;
@@ -450,6 +481,63 @@ test("normalizeProfile rejects malformed market-data BaseURLs without echoing th
   assert.doesNotMatch(
     caught.message,
     /pricing-user|pricing-password|pricing-secret|private-api-key/
+  );
+});
+
+test("normalizeProfile rejects base URLs that parse in JS but not in the Go worker", () => {
+  // Forms the WHATWG URL parser accepts (or silently repairs) but the Go
+  // worker's net/url validator rejects, so a rendered profile cannot pass here
+  // yet be refused at worker startup.
+  const rejected = [
+    "https:example.com",
+    "https:/example.com",
+    "https:\\\\example.com",
+    "https://exa\tmple.com/v1",
+    "https://example.com/v\n1",
+    "https://example.com\\foo",
+    "https://example.com/%zz",
+    "https://example.com/%",
+    "https://%65xample.com",
+    "https://example%2ecom",
+    "https:///example.com",
+    "https://user@/path",
+  ];
+  for (const baseURL of rejected) {
+    const input = baseProfile();
+    (input as Record<string, unknown>).pricing = {
+      coinGeckoBaseURL: baseURL,
+    };
+    assert.throws(
+      () => normalizeProfile(input),
+      /profile\.pricing\.coinGeckoBaseURL must be an absolute HTTPS URL without query or fragment/,
+      `expected ${JSON.stringify(baseURL)} to be rejected`,
+    );
+  }
+});
+
+test("normalizeProfile rejects enforced lzReceive gas outside [min, max]", () => {
+  const belowMin = baseProfile();
+  (belowMin.pathway as Record<string, unknown>).enforcedLzReceiveGas = "100000";
+  assert.throws(
+    () => normalizeProfile(belowMin),
+    /pathway\.enforcedLzReceiveGas must be within/,
+  );
+
+  const aboveMax = baseProfile();
+  (aboveMax.pathway as Record<string, unknown>).enforcedLzReceiveGas =
+    "2000000";
+  assert.throws(
+    () => normalizeProfile(aboveMax),
+    /pathway\.enforcedLzReceiveGas must be within/,
+  );
+
+  const zeroMax = baseProfile();
+  (zeroMax.pathway as Record<string, unknown>).minLzReceiveGas = "0";
+  (zeroMax.pathway as Record<string, unknown>).maxLzReceiveGas = "0";
+  (zeroMax.pathway as Record<string, unknown>).enforcedLzReceiveGas = "0";
+  assert.throws(
+    () => normalizeProfile(zeroMax),
+    /pathway\.maxLzReceiveGas must be positive/,
   );
 });
 
@@ -921,6 +1009,14 @@ test("renderWorkerConfig emits external OApps, active DVN signer, and worker con
     yaml,
     /destination_workers:\n      open_dvn: "0x2222222222222222222222222222222222222223"/
   );
+  assert.match(
+    yaml,
+    /send_required_dvns:\n      - "0x1111111111111111111111111111111111111113"\n      - "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"/
+  );
+  assert.match(
+    yaml,
+    /receive_required_dvns:\n      - "0x2222222222222222222222222222222222222223"\n      - "0x9999999999999999999999999999999999999999"/
+  );
   assert.match(yaml, /signer: "0x2222222222222222222222222222222222222222"/);
   assert.match(yaml, /pricing:\n  enabled: true/);
   assert.match(
@@ -929,6 +1025,8 @@ test("renderWorkerConfig emits external OApps, active DVN signer, and worker con
   );
   assert.match(yaml, /native_asset_id: eth/);
   assert.doesNotMatch(yaml, /primary_source:/);
+  assert.match(yaml, /min_update_deviation_bps: 50/);
+  assert.match(yaml, /heartbeat_seconds: 900/);
   assert.match(yaml, /source_request_timeout_seconds: 10/);
   assert.match(yaml, /start_block_number: 123456/);
   assert.match(yaml, /start_block_number: 654321/);

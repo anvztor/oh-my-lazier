@@ -371,7 +371,11 @@ func TestApplyExecutorDestinationLogsSkipsAlreadyAppliedEvents(t *testing.T) {
 	}
 }
 
-func TestApplyExecutorDestinationLogsMarksManualReviewCommitted(t *testing.T) {
+func TestApplyExecutorDestinationLogsKeepsManualReviewParked(t *testing.T) {
+	// A lagging indexer replaying an old PacketVerified event must not un-park
+	// a MANUAL_REVIEW job: that would bypass the delivery retry cap and could
+	// deliver a message the operator explicitly canceled. Parked keeps parked,
+	// and the historical event must not error out and wedge the cursor.
 	packet := testDestinationPacketRecord()
 	log := testPacketVerifiedLog(t, packet)
 	store := &fakeDestinationStore{
@@ -387,11 +391,11 @@ func TestApplyExecutorDestinationLogsMarksManualReviewCommitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyExecutorDestinationLogs() error = %v", err)
 	}
-	if applied != 1 {
-		t.Fatalf("applied = %d, want 1", applied)
+	if applied != 0 {
+		t.Fatalf("applied = %d, want 0 (parked keeps parked)", applied)
 	}
-	if store.committedGUID != packet.GUID {
-		t.Fatalf("committed guid = %s, want %s", store.committedGUID, packet.GUID)
+	if store.committedGUID != (common.Hash{}) {
+		t.Fatalf("committed guid = %s, want none", store.committedGUID)
 	}
 }
 

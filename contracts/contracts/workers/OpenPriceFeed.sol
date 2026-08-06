@@ -55,12 +55,15 @@ contract OpenPriceFeed is Ownable {
     }
 
     /// @notice Stores shared market price inputs for destination endpoints.
-    /// @dev Each destination snapshot's `updatedAt` must be non-decreasing.
-    /// A superseded entry (older than the stored snapshot) is skipped instead of
-    /// reverting: with multiple authorized submitters, one submitter can land a
-    /// newer snapshot for one destination while another submitter's batch is in
-    /// flight, and reverting would make that immutable batch calldata fail
-    /// forever, discarding its still-fresh entries for other destinations.
+    /// @dev Each destination snapshot's `updatedAt` must be strictly increasing.
+    /// A superseded entry (not newer than the stored snapshot, including an equal
+    /// timestamp) is skipped instead of reverting: with multiple authorized
+    /// submitters, one submitter can land a newer snapshot for one destination
+    /// while another submitter's batch is in flight, and reverting would make
+    /// that immutable batch calldata fail forever, discarding its still-fresh
+    /// entries for other destinations. Skipping equal timestamps keeps the first
+    /// landed write authoritative, so a same-second batch built from an older
+    /// market observation cannot overwrite a newer stored result.
     /// @param updates Destination endpoint price snapshots to store.
     function setPriceSnapshot(WorkerTypes.PriceSnapshotUpdate[] calldata updates) external onlySubmitter {
         if (updates.length == 0) revert WorkerErrors.InvalidPriceSnapshotBatch();
@@ -74,7 +77,7 @@ contract OpenPriceFeed is Ownable {
                 revert WorkerErrors.InvalidPriceSnapshot(update.dstEid);
             }
             uint64 storedUpdatedAt = priceSnapshot[update.dstEid].updatedAt;
-            if (snapshot.updatedAt < storedUpdatedAt) {
+            if (snapshot.updatedAt <= storedUpdatedAt) {
                 emit PriceSnapshotSkipped(update.dstEid, snapshot.updatedAt, storedUpdatedAt);
                 continue;
             }

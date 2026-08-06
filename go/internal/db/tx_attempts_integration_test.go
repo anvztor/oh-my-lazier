@@ -251,8 +251,14 @@ func (h *attemptHarness) enqueue() int64 {
 // signAttempt claims the row for signing and persists an original attempt.
 func (h *attemptHarness) signAttempt(id int64, nonce uint64, hash common.Hash) TxAttempt {
 	h.t.Helper()
+	return h.signAttemptOn(40161, id, nonce, hash)
+}
+
+// signAttemptOn is signAttempt for a row on an explicit chain.
+func (h *attemptHarness) signAttemptOn(chainEID uint32, id int64, nonce uint64, hash common.Hash) TxAttempt {
+	h.t.Helper()
 	token := uuid.New()
-	if _, err := h.store.ClaimOutboxForSigning(h.ctx, id, 40161, h.signerID, token, 30*time.Second); err != nil {
+	if _, err := h.store.ClaimOutboxForSigning(h.ctx, id, chainEID, h.signerID, token, 30*time.Second); err != nil {
 		h.t.Fatalf("ClaimOutboxForSigning(%d): %v", id, err)
 	}
 	attempt, err := h.store.InsertSignedAttempt(h.ctx, id, token, SignedAttempt{
@@ -271,8 +277,14 @@ func (h *attemptHarness) signAttempt(id int64, nonce uint64, hash common.Hash) T
 // attempt, and records the send result.
 func (h *attemptHarness) broadcastResult(attemptID int64, class string) {
 	h.t.Helper()
+	h.broadcastResultOn(40161, attemptID, class)
+}
+
+// broadcastResultOn is broadcastResult for a row on an explicit chain.
+func (h *attemptHarness) broadcastResultOn(chainEID uint32, attemptID int64, class string) {
+	h.t.Helper()
 	token := uuid.New()
-	claim, err := h.store.ClaimAttemptForBroadcast(h.ctx, 40161, h.signerID, token, 30*time.Second)
+	claim, err := h.store.ClaimAttemptForBroadcast(h.ctx, chainEID, h.signerID, token, 30*time.Second)
 	if err != nil {
 		h.t.Fatalf("ClaimAttemptForBroadcast: %v", err)
 	}
@@ -666,9 +678,11 @@ func TestFinalizeAttemptReceiptSwitchesActiveAndTerminalizes(t *testing.T) {
 
 func TestFinalizeAttemptReceiptFailedReceiptKeepsRetryMetadata(t *testing.T) {
 	h := newAttemptHarness(t, "0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a", 71)
-	id := h.enqueue()
-	attempt := h.signAttempt(id, 71, common.HexToHash("0xc1c1"))
-	h.broadcastResult(attempt.ID, SendErrorAccepted)
+
+	// A packet-scoped task keeps its retry window on a failed receipt.
+	_, id := seedScopedPacketRow(t, h, 71)
+	attempt := h.signAttemptOn(40449, id, 71, common.HexToHash("0xc1c1"))
+	h.broadcastResultOn(40449, attempt.ID, SendErrorAccepted)
 
 	facts := TxReceiptFacts{TxHash: attempt.TxHash, Status: 0, BlockNumber: 200, GasUsed: 21000, EffectiveGasPrice: big.NewInt(1_000_000_000), GasCostDstWei: new(big.Int).Mul(big.NewInt(21000), big.NewInt(1_000_000_000))}
 	if outcome, err := h.store.PrepareReceiptResolution(h.ctx, attempt.ID, facts); err != nil || outcome != ReceiptOutcomeFailed {
@@ -687,12 +701,33 @@ func TestFinalizeAttemptReceiptFailedReceiptKeepsRetryMetadata(t *testing.T) {
 	if after.ReceiptTxHash != attempt.TxHash {
 		t.Fatalf("receipt hash = %s, want %s", after.ReceiptTxHash, attempt.TxHash)
 	}
+
+	// A pricing row is terminal on a failed receipt: no retry window, because
+	// its calldata carries a time-bound observation the retry paths refuse.
+	pricingID := h.enqueue()
+	pricingAttempt := h.signAttempt(pricingID, 71, common.HexToHash("0xc1c2"))
+	h.broadcastResult(pricingAttempt.ID, SendErrorAccepted)
+	pricingFacts := TxReceiptFacts{TxHash: pricingAttempt.TxHash, Status: 0, BlockNumber: 201, GasUsed: 21000, EffectiveGasPrice: big.NewInt(1_000_000_000), GasCostDstWei: new(big.Int).Mul(big.NewInt(21000), big.NewInt(1_000_000_000))}
+	if outcome, err := h.store.PrepareReceiptResolution(h.ctx, pricingAttempt.ID, pricingFacts); err != nil || outcome != ReceiptOutcomeFailed {
+		t.Fatalf("PrepareReceiptResolution(pricing) = (%q, %v), want receipt_failed", outcome, err)
+	}
+	if outcome, err := h.store.FinalizeAttemptReceipt(h.ctx, pricingAttempt.ID, pricingFacts); err != nil || outcome != ReceiptOutcomeFailed {
+		t.Fatalf("FinalizeAttemptReceipt(pricing) = (%q, %v), want receipt_failed", outcome, err)
+	}
+	pricingAfter, err := h.store.GetOutboxTx(h.ctx, pricingID)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(pricing): %v", err)
+	}
+	if pricingAfter.Status != TxStatusFailed || pricingAfter.FailureKind != TxFailureReceiptFailed || pricingAfter.NextRetryAt != nil {
+		t.Fatalf("pricing failed receipt = %q/%q/%v, want terminal failed/receipt_failed without a retry window", pricingAfter.Status, pricingAfter.FailureKind, pricingAfter.NextRetryAt)
+	}
 }
 
 func TestMarkQueuedTxEstimateRevertFailedLosesRaces(t *testing.T) {
 	h := newAttemptHarness(t, "0x5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b", 81)
 
-	// A pristine queued row takes the deterministic failure.
+	// A pristine queued pricing row takes the deterministic failure but gets no
+	// retry window: its calldata carries a time-bound observation.
 	pristine := h.enqueue()
 	applied, err := h.store.MarkQueuedTxEstimateRevertFailed(h.ctx, pristine, errors.New("estimate gas reverted"))
 	if err != nil || !applied {
@@ -702,8 +737,22 @@ func TestMarkQueuedTxEstimateRevertFailedLosesRaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOutboxTx: %v", err)
 	}
-	if failed.Status != TxStatusFailed || failed.FailureKind != TxFailureEstimateGasRevert || failed.NextRetryAt == nil {
-		t.Fatalf("pristine row = %q/%q/%v, want retryable estimate failure", failed.Status, failed.FailureKind, failed.NextRetryAt)
+	if failed.Status != TxStatusFailed || failed.FailureKind != TxFailureEstimateGasRevert || failed.NextRetryAt != nil {
+		t.Fatalf("pristine pricing row = %q/%q/%v, want terminal estimate failure without a retry window", failed.Status, failed.FailureKind, failed.NextRetryAt)
+	}
+
+	// A packet-scoped task keeps the automatic retry window.
+	_, packetID := seedScopedPacketRow(t, h, 81)
+	applied, err = h.store.MarkQueuedTxEstimateRevertFailed(h.ctx, packetID, errors.New("estimate gas reverted"))
+	if err != nil || !applied {
+		t.Fatalf("MarkQueuedTxEstimateRevertFailed(packet) = (%t, %v), want applied", applied, err)
+	}
+	packetFailed, err := h.store.GetOutboxTx(h.ctx, packetID)
+	if err != nil {
+		t.Fatalf("GetOutboxTx(packet): %v", err)
+	}
+	if packetFailed.Status != TxStatusFailed || packetFailed.FailureKind != TxFailureEstimateGasRevert || packetFailed.NextRetryAt == nil {
+		t.Fatalf("packet row = %q/%q/%v, want retryable estimate failure", packetFailed.Status, packetFailed.FailureKind, packetFailed.NextRetryAt)
 	}
 
 	// A row another instance meanwhile claimed for signing must not be overwritten
@@ -1084,5 +1133,98 @@ func TestDeferReplacementAndReceiptRefreshKeepRowOutOfStaleWindow(t *testing.T) 
 	}
 	if !after.Equal(before) {
 		t.Fatalf("refresh touched a confirmed row: updated_at %v -> %v", before, after)
+	}
+}
+
+// TestOrphanedOutboxStatsDetectSendStateWithoutAttempt pins the invariant
+// detector for rows the 002 schema upgrade can strand: a send-state row whose
+// active attempt is gone is invisible to receipt polling and (when signed)
+// blocks the nonce lane, so the stats surface must report it.
+func TestOrphanedOutboxStatsDetectSendStateWithoutAttempt(t *testing.T) {
+	h := newAttemptHarness(t, "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e", 311)
+
+	orphaned := func(status string) (int64, uint64) {
+		h.t.Helper()
+		snapshot, err := h.store.Stats(h.ctx)
+		if err != nil {
+			h.t.Fatalf("Stats() error = %v", err)
+		}
+		for _, stat := range snapshot.TxOutboxOrphaned {
+			if stat.ChainEID == 40161 && stat.SignerID == h.signerID && stat.Status == status {
+				return stat.Count, stat.OldestAgeSeconds
+			}
+		}
+		return 0, 0
+	}
+
+	id := h.enqueue()
+	attempt := h.signAttempt(id, 311, common.HexToHash("0x7e31"))
+	if count, _ := orphaned(TxStatusSigned); count != 0 {
+		t.Fatalf("healthy signed row reported as orphaned (count = %d)", count)
+	}
+
+	// Reproduce what 002 leaves behind: the row keeps its send state and nonce
+	// while its only attempt is gone.
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox SET active_attempt_id = NULL, updated_at = now() - interval '30 minutes' WHERE id = $1
+	`, id); err != nil {
+		t.Fatalf("detach active attempt: %v", err)
+	}
+	if _, err := h.store.pool.Exec(h.ctx, "DELETE FROM tx_attempts WHERE id = $1", attempt.ID); err != nil {
+		t.Fatalf("delete attempt: %v", err)
+	}
+	count, age := orphaned(TxStatusSigned)
+	if count != 1 {
+		t.Fatalf("orphaned signed rows = %d, want 1", count)
+	}
+	if age < 1500 {
+		t.Fatalf("orphaned age = %ds, want the stuck age from updated_at", age)
+	}
+	// Receipt polling can no longer see it, which is exactly why the stats
+	// surface has to.
+	tasks, err := h.store.ListReceiptPollTasks(h.ctx, 40161, h.signerID, 10)
+	if err != nil {
+		t.Fatalf("ListReceiptPollTasks() error = %v", err)
+	}
+	for _, task := range tasks {
+		if task.Outbox.ID == id {
+			t.Fatal("an orphaned row must not appear in receipt polling")
+		}
+	}
+
+	// A held row without an attempt is legitimate (exhausted pre-sign budget)
+	// and must not be reported.
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox SET status = $1, held_reason = $2 WHERE id = $3
+	`, TxStatusHeld, HeldManual, id); err != nil {
+		t.Fatalf("park row as held: %v", err)
+	}
+	if count, _ := orphaned(TxStatusSigned); count != 0 {
+		t.Fatalf("held row without an attempt reported as orphaned (count = %d)", count)
+	}
+	if count, _ := orphaned(TxStatusHeld); count != 0 {
+		t.Fatalf("held status must never be counted (count = %d)", count)
+	}
+
+	// A retired chain's retained rows cannot be acted on: they are excluded so
+	// the metric matches the readiness escalation and cannot page forever.
+	if _, err := h.store.pool.Exec(h.ctx, `
+		UPDATE tx_outbox SET status = $1, held_reason = NULL WHERE id = $2
+	`, TxStatusSigned, id); err != nil {
+		t.Fatalf("restore signed status: %v", err)
+	}
+	if count, _ := orphaned(TxStatusSigned); count != 1 {
+		t.Fatalf("orphaned signed rows = %d, want 1 before disabling the chain", count)
+	}
+	if _, err := h.store.pool.Exec(h.ctx, "UPDATE chains SET enabled = false WHERE eid = 40161"); err != nil {
+		t.Fatalf("disable chain: %v", err)
+	}
+	h.t.Cleanup(func() {
+		if _, err := h.store.pool.Exec(context.Background(), "UPDATE chains SET enabled = true WHERE eid = 40161"); err != nil {
+			h.t.Errorf("restore chain: %v", err)
+		}
+	})
+	if count, _ := orphaned(TxStatusSigned); count != 0 {
+		t.Fatalf("disabled chain rows reported as orphaned (count = %d)", count)
 	}
 }

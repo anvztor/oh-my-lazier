@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -201,7 +202,7 @@ func (a *App) Run(ctx context.Context) error {
 	runtimeMetrics := metrics.NewRegistry()
 	pathways := registry.Pathways()
 	indexerStreams := indexer.StreamsForRoles(a.cfg.ExecutorEnabled(), a.cfg.DVNEnabled())
-	txTargets, err := a.txTargets(ctx, registry)
+	txTargets, err := a.txTargets(ctx, registry, store)
 	if err != nil {
 		return err
 	}
@@ -223,6 +224,7 @@ func (a *App) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		priceBot.WithMetrics(runtimeMetrics)
 		feeReconciler, err = feeaccounting.New(store, priceSources, feeaccounting.Settings{
 			PriceSelection: a.priceSelectionPolicy(),
 		}, a.logger)
@@ -563,7 +565,7 @@ func (a *App) dvnWorker(store *db.Store, registry *chain.Registry) (*dvn.Worker,
 	return dvn.NewWithSettings(store, registry, settings, a.logger), nil
 }
 
-func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.Target, error) {
+func (a *App) txTargets(ctx context.Context, registry *chain.Registry, store *db.Store) ([]txmgr.Target, error) {
 	type targetKey struct {
 		chainEID uint32
 		signerID string
@@ -585,7 +587,7 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 	}
 	for _, configuredChain := range registry.All() {
 		if a.cfg.ExecutorEnabled() {
-			executorPolicy, err := feePolicy(configuredChain.TxRoles.Executor.MaxFeePerGasWei, configuredChain.TxRoles.Executor.MaxPriorityFeePerGasWei)
+			executorPolicy, err := feePolicy(configuredChain.TxRoles.Executor.MaxFeePerGasWei, configuredChain.TxRoles.Executor.MaxPriorityFeePerGasWei, configuredChain.LegacyTransactions)
 			if err != nil {
 				return nil, fmt.Errorf("chain %s executor fee policy: %w", configuredChain.Name, err)
 			}
@@ -603,7 +605,7 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 			if err != nil {
 				return nil, err
 			}
-			pricingPolicy, err := feePolicy(pricingChain.TxPolicy.MaxFeePerGasWei, pricingChain.TxPolicy.MaxPriorityFeePerGasWei)
+			pricingPolicy, err := feePolicy(pricingChain.TxPolicy.MaxFeePerGasWei, pricingChain.TxPolicy.MaxPriorityFeePerGasWei, configuredChain.LegacyTransactions)
 			if err != nil {
 				return nil, fmt.Errorf("chain %s pricing fee policy: %w", configuredChain.Name, err)
 			}
@@ -612,6 +614,30 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 				return nil, fmt.Errorf("chain %s pricing min native balance: %w", configuredChain.Name, err)
 			}
 			addPolicy(configuredChain.EID, a.cfg.Pricing.Signer.Hex(), pricing.TxPurposeSetPriceSnapshot, pricingPolicy, minBalance)
+			// Rows enqueued by a previously configured pricing signer must keep
+			// converging after a rotation: they gate their feed until they
+			// resolve, and without a target nothing would ever sign, broadcast,
+			// or receipt-poll them. The rotation runbook keeps the old signer
+			// configured until its rows drain; fail fast when it was removed
+			// too early instead of gating the feed forever.
+			if store == nil {
+				// Targets built without a database (config-only tests) cannot
+				// check the outbox; Run always passes the connected store.
+				continue
+			}
+			legacySigners, err := store.ListPendingPricingSigners(ctx, configuredChain.EID)
+			if err != nil {
+				return nil, err
+			}
+			for _, legacy := range legacySigners {
+				if strings.EqualFold(legacy, a.cfg.Pricing.Signer.Hex()) {
+					continue
+				}
+				if !a.signerConfigured(legacy) {
+					return nil, fmt.Errorf("chain %s has pending pricing txs from previous signer %s; keep that signer configured until they drain or resolve the rows manually", configuredChain.Name, legacy)
+				}
+				addPolicy(configuredChain.EID, legacy, pricing.TxPurposeSetPriceSnapshot, pricingPolicy, minBalance)
+			}
 		}
 	}
 	if a.cfg.DVNEnabled() {
@@ -623,7 +649,7 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 			if err != nil {
 				return nil, err
 			}
-			dvnPolicy, err := feePolicy(dstChain.TxRoles.DVN.MaxFeePerGasWei, dstChain.TxRoles.DVN.MaxPriorityFeePerGasWei)
+			dvnPolicy, err := feePolicy(dstChain.TxRoles.DVN.MaxFeePerGasWei, dstChain.TxRoles.DVN.MaxPriorityFeePerGasWei, dstChain.LegacyTransactions)
 			if err != nil {
 				return nil, fmt.Errorf("chain %s dvn fee policy: %w", dstChain.Name, err)
 			}
@@ -668,6 +694,17 @@ func (a *App) txTargets(ctx context.Context, registry *chain.Registry) ([]txmgr.
 	return targets, nil
 }
 
+// signerConfigured reports whether a signer address is present in the loaded
+// signers configuration, compared case-insensitively on the hex form.
+func (a *App) signerConfigured(signerID string) bool {
+	for _, cfg := range a.cfg.Signers {
+		if strings.EqualFold(cfg.ID.Hex(), signerID) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) loadSigners(ctx context.Context) (map[string]signer.Signer, error) {
 	signers := make(map[string]signer.Signer, len(a.cfg.Signers))
 	for _, cfg := range a.cfg.Signers {
@@ -710,7 +747,7 @@ func loadKMSAWSConfig(ctx context.Context, cfg config.KMSSignerConfig) (aws.Conf
 	return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 }
 
-func feePolicy(maxFeePerGasWei, maxPriorityFeePerGasWei string) (txmgr.FeePolicy, error) {
+func feePolicy(maxFeePerGasWei, maxPriorityFeePerGasWei string, legacyTransactions bool) (txmgr.FeePolicy, error) {
 	maxFeePerGas, err := bigutil.ParseDecimal("max_fee_per_gas_wei", maxFeePerGasWei)
 	if err != nil {
 		return txmgr.FeePolicy{}, err
@@ -725,6 +762,7 @@ func feePolicy(maxFeePerGasWei, maxPriorityFeePerGasWei string) (txmgr.FeePolicy
 	return txmgr.FeePolicy{
 		ConfiguredMaxFeePerGas:         maxFeePerGas,
 		ConfiguredMaxPriorityFeePerGas: maxPriorityFeePerGas,
+		ForceLegacyTransactions:        legacyTransactions,
 	}, nil
 }
 
@@ -733,7 +771,9 @@ func validateRuntimeFeePolicies(ctx context.Context, configuredChain chain.Chain
 	if err != nil {
 		return fmt.Errorf("read latest header for chain %s: %w", configuredChain.Name, err)
 	}
-	if header == nil || header.BaseFee == nil {
+	if header == nil || header.BaseFee == nil || configuredChain.LegacyTransactions {
+		// A legacy-forced chain never quotes dynamic fees, so it does not
+		// need a priority fee cap even when the header carries a base fee.
 		return nil
 	}
 	for purpose, policy := range policies {
@@ -750,6 +790,7 @@ func cloneFeePolicies(policies map[string]txmgr.FeePolicy) map[string]txmgr.FeeP
 		out[purpose] = txmgr.FeePolicy{
 			ConfiguredMaxFeePerGas:         bigutil.Clone(policy.ConfiguredMaxFeePerGas),
 			ConfiguredMaxPriorityFeePerGas: bigutil.Clone(policy.ConfiguredMaxPriorityFeePerGas),
+			ForceLegacyTransactions:        policy.ForceLegacyTransactions,
 		}
 	}
 	return out
