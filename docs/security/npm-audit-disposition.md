@@ -48,7 +48,7 @@ total: 43
 - Independent vulnerable transitive packages are pinned through npm overrides:
   - `axios = 1.18.1`
   - `elliptic = 6.6.1`
-  - `undici = 6.27.0`
+  - `undici = 6.28.0`
   - `ws = 8.21.0`
 
 These changes remove all critical npm audit findings without changing pinned

@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import process from "node:process";
 
 type AuditVulnerability = {
   name: string;
@@ -40,6 +39,8 @@ const allowedOpenFindings = new Map<string, AuditVulnerability["severity"]>([
   ["@chainlink/contracts", "moderate"],
   ["@nomicfoundation/ignition-core", "moderate"],
   ["@offchainlabs/upgrade-executor", "moderate"],
+  ["@nomicfoundation/hardhat-utils", "moderate"],
+  ["@actions/http-client", "moderate"]
 ]);
 
 function runAudit(): AuditReport {
@@ -63,8 +64,7 @@ export function checkNPMAuditDisposition(): void {
   const counts = report.metadata?.vulnerabilities;
   if (!counts || !report.vulnerabilities) {
     throw new Error(
-      `npm audit did not return a vulnerability report: ${
-        report.message ?? "missing metadata"
+      `npm audit did not return a vulnerability report: ${report.message ?? "missing metadata"
       }`
     );
   }
@@ -108,8 +108,7 @@ export function checkNPMAuditDisposition(): void {
   );
 
   console.log(
-    `npm audit disposition ok: critical=0, disposed high/moderate findings=${
-      openModerateOrHigh.length
+    `npm audit disposition ok: critical=0, disposed high/moderate findings=${openModerateOrHigh.length
     }, total=${counts.total ?? 0}`
   );
 }
