@@ -135,3 +135,4 @@ Phase 1 is EVM-only.
 - [docs/runbooks/config-diff.md](docs/runbooks/config-diff.md): config review and on-chain config check workflow.
 - [docs/runbooks/key-management.md](docs/runbooks/key-management.md), [docs/runbooks/price-bot.md](docs/runbooks/price-bot.md), [docs/runbooks/rate-limit.md](docs/runbooks/rate-limit.md), [docs/runbooks/monitoring.md](docs/runbooks/monitoring.md): operator checklists.
 - [docs/security/security-review.md](docs/security/security-review.md) and [docs/security/npm-audit-disposition.md](docs/security/npm-audit-disposition.md): release-readiness security records.
+- [docs/runbooks/dvn-executor-migration.md](docs/runbooks/dvn-executor-migration.md): a general production-grade method for migrating the DVN/Executor workers.
